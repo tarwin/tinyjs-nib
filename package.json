@@ -6,14 +6,24 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5173 --strictPort",
     "build": "vite build",
-    "typecheck": "tsc -b",
+    "typecheck": "tsc -b && tsc -p tests",
     "test": "node --test 'tests/*.test.ts'",
+    "test:update": "node --test --test-update-snapshots 'tests/*.test.ts'",
     "smoke": "NIB_SMOKE=1 tinyjs dev",
-    "check": "pnpm typecheck && pnpm test"
+    "check": "pnpm typecheck && pnpm test",
+    "docs:dev": "vitepress dev guide",
+    "docs:build": "vitepress build guide"
   },
   "devDependencies": {
+    "@types/markdown-it-container": "4.0.1",
     "@types/node": "^24.19.2",
+    "esbuild": "^0.28.2",
+    "markdown-it-container": "4.0.0",
+    "medium-zoom": "1.1.0",
+    "rolldown": "1.2.16",
     "typescript": "^7.0.2",
-    "vite": "^8.3.5"
+    "vite": "^8.3.5",
+    "vitepress": "^1.6.4",
+    "vue": "3.5.44"
   }
 }

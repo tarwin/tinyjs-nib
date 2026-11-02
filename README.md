@@ -6,8 +6,9 @@
 
 **⬇ Download:** [apps.tarwin.art/nib](https://apps.tarwin.art/nib/) · or straight from the [latest release](https://github.com/tarwin/tinyjs-nib/releases/latest): macOS (Apple Silicon / Intel, signed & notarized), Windows, Linux (x86_64 / arm64). Built on [tinyjs](https://github.com/tarwin/tinyjsapp); releasing: [RELEASING.md](RELEASING.md).
 
-A tiny Markdown editor — one native window per document. Plain JavaScript,
-zero dependencies, including the Markdown renderer.
+A tiny Markdown editor — one native window per document. Written in
+TypeScript with no runtime dependencies, the Markdown renderer included; Vite
+and esbuild only build it.
 
 The main window is a little Welcome screen (recent files and folders, a
 dropzone, a draft-recovery card) that steps aside the moment you have a
@@ -25,7 +26,7 @@ them on the Dock icon, or type `nib notes.md` — one handler answers all five
 do the markdown-with-extras formats — `.mdx`, `.qmd`, `.Rmd`, `.mdc`, Markdoc's `.markdoc` / `.mdoc` — whose
 extra syntax simply shows as text. `.adoc` / `.asciidoc` opens too: the
 everyday AsciiDoc constructs are mapped line-for-line onto Markdown for the
-preview (`adoc.js`), read-only — the Editable toggle stays off there, because
+preview (`adoc.ts`), read-only — the Editable toggle stays off there, because
 serializing the preview back would write Markdown into an AsciiDoc file.
 
 **Preview ▸ Markdown Flavor** holds the extras over CommonMark, each with its own
@@ -39,7 +40,7 @@ ones), emoji shortcodes (`:tada:` → 🎉, the emojibase GitHub set, generated 
 `vendor/emoji-github.js` one file per preset), footnotes (`[^1]`), and
 **HTML** — the subset GitHub renders: `<div align="center">` around Markdown,
 `<details>`, `<kbd>`, `<sub>`, `<img width>`, `<picture>` for dark-mode logos,
-comments hidden. That HTML is never passed through: `md.js` rebuilds every tag
+comments hidden. That HTML is never passed through: `md.ts` rebuilds every tag
 from an allowlist, keeping only `align`, `width`, `alt`, `href`/`src` (scheme
 checked) and a few more, and of `style` only layout (grid, flex, gap,
 alignment, sizes, spacing; no `position`, colours, fonts, `url()` or negative
@@ -47,7 +48,7 @@ margins), so a two-column grid of cards lays out but no `on*`, `class` or
 `data-*` reaches the page, and a tag off the list stays text. Math,
 diagrams and the shortcode table lazy-load on first use, so a plain document
 never pays for them; in the editable preview, formulas, diagrams and blocks of
-HTML are atomic islands that round-trip through `unmd.js` untouched. Hovering
+HTML are atomic islands that round-trip through `unmd.ts` untouched. Hovering
 one in the editable preview outlines it and says what it is; a click selects
 its lines in the source pane (opening Split if the source is hidden), while a
 link inside it still follows. Preview themes (**Preview ▸ Theme**: Paper, Ink,
@@ -136,7 +137,7 @@ with the caret live in the preview — or over in the raw source, where every
 click is a caret — **⌥-click** does it. Holding ⌥ marks the links in both panes
 and gives the pointer a browser's hand over them, which in the source pane
 takes some doing: a textarea has nothing to hover. The coloured backdrop
-underneath does, though — `hl.js` wraps every link in a span carrying the
+underneath does, though — `hl.ts` wraps every link in a span carrying the
 target it already parsed — so the pointer is hit-tested against those boxes
 (the row found by binary search, because this runs on `mousemove`), and the
 same span tells the click what it landed on. A `.md` or a picture opens as a
@@ -158,7 +159,7 @@ Replace All back in one step.
 **Undo** (**⌘Z / ⌘⇧Z**) is Nib's own, because the textarea's native history
 can't survive this app: a tab switch, a Live-mode serialize, or a rename
 rewriting links each assign `ed.value` and wipe it, and the editable
-preview's edits never enter it at all. `undo.js` keeps one history **per
+preview's edits never enter it at all. `undo.ts` keeps one history **per
 tab**, built from diffs — the buffer against its last recorded state, common
 prefix and suffix trimmed, only the changed span kept — so a keystroke costs
 its characters, not a copy of the document. The recorder watches the buffer
@@ -277,7 +278,7 @@ sorted first:
   Markdown editor it usually is. Code without those goes in literally.
 - **Structured HTML** (a web page, Google Docs, Notion, Mail) has its
   inline styling turned into what it means (Docs' `font-weight:700` span
-  becomes `**bold**`) and is converted by `unmd.js`, in either pane.
+  becomes `**bold**`) and is converted by `unmd.ts`, in either pane.
 - **Word, Excel and Numbers** put a picture of the selection beside its
   text; the text wins, so a copied table doesn't arrive as a screenshot.
 
@@ -410,7 +411,7 @@ Fumadocs' `meta.json`, Nextra's `_meta` files, Rspress, Hugo's weights and
 `menu:` front matter, Just the Docs' `parent` / `nav_order`, Retype's
 `order`. One folder can hold several sites and a site several menus; the
 picker over the tree switches between them, and follows you to whichever menu
-has the page you open. `menus.js` turns them all into one shape, so everything
+has the page you open. `menus.ts` turns them all into one shape, so everything
 below works the same for every one of them.
 
 Menus written in code are read without running anything: the config is
@@ -444,7 +445,7 @@ row drops before it, the bottom after, the middle into a group), ⌘↑ / ⌘↓
 nudge it among its neighbours, drag a page up from *Not in any menu* to add
 it, ⌘⌫ or right-click to **Remove from Menu**, right-click for **Add This
 Page** beside an entry. Each edit is written straight
-into the menu's own file as **surgery, not a rewrite** (`menuedit.js`): in a
+into the menu's own file as **surgery, not a rewrite** (`menuedit.ts`): in a
 `SUMMARY.md`, `_sidebar.md` or `mkdocs.yml` nav only the lines of the entry
 move, re-indented to where they land; in a VitePress / Docusaurus / Starlight
 config only the entry's own source text moves, comma and all, so comments,
@@ -470,7 +471,7 @@ gets the `contents:` / `sections:` / `children:` key it needs, and a key left
 empty by the last child leaving is taken out (YAML would read it as null).
 
 Menus a site **builds from its folders** are edited where their order lives
-(`menutree.js`): in each page's front matter — `sidebar_position` for
+(`menutree.ts`): in each page's front matter — `sidebar_position` for
 Docusaurus' autogenerated sidebars (and a folder's `_category_` file),
 Starlight's `sidebar.order`, Hugo's `weight` (a section's `_index.md`), Just
 the Docs' `nav_order`, Retype's `order` (higher first, and `index.yml` for a
@@ -863,12 +864,12 @@ work from either side of the divider at once. And it serializes **only the
 blocks you edited**: every untouched block's source lines are spliced through
 byte-for-byte — hard-wrapped paragraphs stay wrapped, reference definitions
 stay put — so one word typed in the preview is a one-block diff, not a
-whole-file reflow (patchMarkdown in `unmd.js`; where byte-precision can't be
+whole-file reflow (patchMarkdown in `unmd.ts`; where byte-precision can't be
 proven — an edited footnote, a definition line inside the edited range — the
 whole document serializes the way it used to). A document you never edit is
 never serialized at all, whatever gets toggled or blurred.
 
-Keeping those two views in step is the hard part of the app, and `sync.js` is
+Keeping those two views in step is the hard part of the app, and `sync.ts` is
 where it lives. Every rendered block knows the source line it came from; on
 top of that, each block builds a lazy character map — the rendered text is
 almost a subsequence of its Markdown, so a two-pointer walk gives a monotone
@@ -891,7 +892,7 @@ block-to-block, never by ratio — and tabs are what make that necessary, since
 a closed panel has source lines but no box at all, so anything geometric has
 to climb to the nearest ancestor that's actually laid out.
 
-Fenced code is coloured in the preview too (`code.js`: js/ts, json, python,
+Fenced code is coloured in the preview too (`code.ts`: js/ts, json, python,
 shell, css, html, sql, yaml, and a shared C-family lexer for go/rust/c/java/
 swift) — classes only, so it survives export and print. The source pane is
 syntax-coloured, which a `<textarea>` can't do by itself —
@@ -951,7 +952,7 @@ The techniques on show:
 2. **The dirty-state dance** — `api.sync` + `onWindowClosed` + `tiny.store`
    drafts, as above. `Save` is a two-step with the page (dialogs are
    page-side: `tiny.win.saveFile()` picks the path, the backend writes it).
-3. **A safe hand-rolled renderer** — `md.js` covers the everyday Markdown set
+3. **A safe hand-rolled renderer** — `md.ts` covers the everyday Markdown set
    in ~300 lines, escapes *everything* (raw HTML is shown, never executed —
    the page holds an RPC channel with full system access; the HTML flavor
    option rebuilds an allowlisted subset tag by tag rather than trusting any
@@ -961,21 +962,21 @@ The techniques on show:
    which opens what Nib can show and lets the system have the rest. One
    extension rides along: `::: warning Title` … `:::` callouts, nestable,
    with `::: details` folding into a real `<details>`.
-4. **Two panes, one position** — `sync.js`, as above: a block index, a lazy
+4. **Two panes, one position** — `sync.ts`, as above: a block index, a lazy
    per-block character map, Custom Highlights and overlay carets for painting,
    and block-anchored scrolling. The rule throughout is that anything
    geometric must survive a subtree with no geometry.
-5. **Two layers pretending to be one editor** — `hl.js` paints the coloured
+5. **Two layers pretending to be one editor** — `hl.ts` paints the coloured
    backdrop and `doc.css` keeps its metrics identical to the textarea's; every
    rendered block carries the source line it came from, which is what lets the
    outline jump and the two panes point at each other.
-6. **A renderer that runs backwards** — `unmd.js` walks the preview DOM back
+6. **A renderer that runs backwards** — `unmd.ts` walks the preview DOM back
    into Markdown, which is what makes the editable preview possible: the
    textarea stays the document of record, written to from the other end.
-   `live.js` adds the input rules and the selection bubble on top, doing its
+   `live.ts` adds the input rules and the selection bubble on top, doing its
    own DOM surgery rather than trusting `execCommand('formatBlock')` — that
    one loses the caret exactly when you need it, on an empty line. And **/**
-   on an empty line opens a block menu (`slash.js` is the catalogue: tables,
+   on an empty line opens a block menu (`slash.ts` is the catalogue: tables,
    callouts, code, tabs, the flavour's extras…). A pick doesn't build DOM at
    all — the line becomes a token, the page serializes, the token's source
    line is swapped for the block's Markdown and everything re-renders — so an
@@ -1034,7 +1035,10 @@ first launch, for the same reason tinyjs won't do it automatically — an app
 that claims `.md` the moment you open it is an app you uninstall.
 
 ```sh
+pnpm install           # build tools: TypeScript, Vite, esbuild
 tinyjs dev             # run with hot reload — then Help ▸ Open Example Document
+pnpm check             # typecheck (strict) + tests
+pnpm smoke             # open every kind of window for real; fails if a page throws
 tinyjs build           # package dist/Nib.app
 tinyjs build --cli nib # …and dist/bin/nib, for the terminal
 ln -sf "$(pwd)/dist/bin/nib" /usr/local/bin/nib

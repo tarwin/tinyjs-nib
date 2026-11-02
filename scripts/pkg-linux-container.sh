@@ -6,7 +6,7 @@
 # host's glibc (amp 0.8–0.10 shipped broken that way).
 # Adapted from tinyjsapp-examples/shelf/pkg-linux-container.sh.
 #
-#   docker run --rm -v $PWD:/src:ro -v $OUT:/work -e TINYJS_TAG=v0.69.1 \
+#   docker run --rm -v $PWD:/src:ro -v $OUT:/work -e TINYJS_TAG=v0.70.1 \
 #     ubuntu:22.04 bash /src/scripts/pkg-linux-container.sh
 #
 # Output: /work/out/nib-<ver>-linux-<arch>.tar.gz
@@ -22,6 +22,14 @@ apt-get install -y -qq --no-install-recommends \
 
 ARCH=$(uname -m); case "$ARCH" in aarch64) ARCH=arm64;; esac
 
+# Node and pnpm are build tools only (Vite for the pages, esbuild for the
+# backend): nothing they produce is a native binary, so they can't raise the
+# glibc floor of what ships.
+NODE_ARCH=$ARCH; [ "$ARCH" = x86_64 ] && NODE_ARCH=x64
+curl -fsSL "https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-$NODE_ARCH.tar.xz" \
+  | tar -xJ -C /usr/local --strip-components=1
+npm install -g --silent "pnpm@$(node -p "require('/src/package.json').packageManager.split('@')[1]")"
+
 cd /work && rm -rf tinyjsapp app out && mkdir -p out
 git clone -q --depth 1 --branch "$TINYJS_TAG" https://github.com/tarwin/tinyjsapp.git
 (cd tinyjsapp && TINYJS_TJS_RELEASE="$TINYJS_TAG" ./setup.sh >/dev/null)
@@ -32,9 +40,12 @@ floor_ok() { # <binary>: glibc floor must stay <= 2.35 (Ubuntu 22.04)
 }
 floor_ok tinyjsapp/bin/tjs && floor_ok tinyjsapp/native/launcher-linux
 
-# Nib has no dependencies: a clean copy of the source is the whole app.
-mkdir app && (cd /src && tar --exclude=./dist --exclude=./.build --exclude=./release --exclude=./.git -cf - .) | tar -xf - -C app
+# A clean copy without the host's node_modules (their native bindings are
+# for the host platform) or its build output.
+mkdir app && (cd /src && tar --exclude=./node_modules --exclude=./web-dist --exclude=./dist \
+  --exclude=./.build --exclude=./release --exclude=./.git -cf - .) | tar -xf - -C app
 cd app
+pnpm install --frozen-lockfile --reporter=silent
 /work/tinyjsapp/tinyjs publish
 
 tb=$(ls dist/publish/*-linux-$ARCH.tar.gz)

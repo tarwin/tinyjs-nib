@@ -5,3 +5,5 @@ dist
 release
 node_modules
 web-dist
+guide/.vitepress/dist
+guide/.vitepress/cache

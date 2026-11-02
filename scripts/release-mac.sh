@@ -23,6 +23,7 @@ VER="$(field version)"
 NAME="$(field name)"
 TITLE="$(field title)"; TITLE="${TITLE:-$NAME}"
 OUT=release
+pnpm install --frozen-lockfile   # tinyjs build runs Vite (pages) and esbuild (backend)
 mkdir -p "$OUT"
 find "$OUT" -maxdepth 1 -name "$NAME-*" ! -name "$NAME-$VER-*" -delete
 for ARCH in $ARCHS; do

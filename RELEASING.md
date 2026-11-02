@@ -1,8 +1,9 @@
 # Releasing
 
-1. Bump `version` in `tinyjs.json`, commit, push to `main`.
+1. `pnpm check` and `pnpm smoke` pass. Bump `version` in `tinyjs.json`,
+   commit, push to `main`.
 2. Linux and Windows: run the **release** workflow (Actions → release → Run
-   workflow, or `gh workflow run release.yml -f tinyjs_tag=v0.69.1`). It
+   workflow, or `gh workflow run release.yml -f tinyjs_tag=v0.70.1`). It
    builds Linux x86_64 + arm64 in an ubuntu:22.04 container (glibc 2.35
    floor) and Windows x64 (smoke-tested), and uploads them to a **draft**
    release `v<version>`.
@@ -14,8 +15,9 @@
    gh release upload v<version> release/nib-<version>-macos-*
    ```
 
-   The script clears other versions' builds out of `release/` before it
-   starts, so only this version's four files are there.
+   The script runs `pnpm install` (tinyjs build needs Vite and esbuild) and
+   clears other versions' builds out of `release/` before it starts, so only
+   this version's four files are there.
 
 4. Write the release notes into the draft (they're shown in the app's update
    banner, on apps.tarwin.art/nib and in Shelf). Check the draft has all
