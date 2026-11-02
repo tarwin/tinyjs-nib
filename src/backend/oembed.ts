@@ -11,7 +11,39 @@
 // Cached by URL for the session: every keystroke re-renders the preview, and
 // the provider should hear about it once.
 
-const PROVIDERS = [
+interface Provider {
+  hosts: string[];
+  endpoint: string;
+}
+
+/** What the page gets back for a URL: an iframe src, a photo, a card, or an error. */
+export interface OembedAnswer {
+  error?: string;
+  iframe?: string;
+  image?: string;
+  card?: boolean;
+  thumb?: string | null;
+  width?: number | null;
+  height?: number | null;
+  title?: string | null;
+  author?: string | null;
+  provider?: string | null;
+}
+
+/** The provider's JSON, as far as this file reads it. */
+interface OembedResponse {
+  type?: string;
+  html?: string;
+  url?: string;
+  title?: unknown;
+  author_name?: unknown;
+  provider_name?: unknown;
+  width?: number | string;
+  height?: number | string;
+  thumbnail_url?: string;
+}
+
+const PROVIDERS: Provider[] = [
   { hosts: ['youtube.com', 'youtu.be'], endpoint: 'https://www.youtube.com/oembed' },
   { hosts: ['vimeo.com'], endpoint: 'https://vimeo.com/api/oembed.json' },
   { hosts: ['dailymotion.com'], endpoint: 'https://www.dailymotion.com/services/oembed' },
@@ -33,10 +65,10 @@ const PROVIDERS = [
   { hosts: ['kickstarter.com'], endpoint: 'https://www.kickstarter.com/services/oembed' },
 ];
 
-const cache = new Map();               // url -> the answer the page got
+const cache = new Map<string, OembedAnswer>();               // url -> the answer the page got
 
-function providerFor(url) {
-  let host;
+function providerFor(url: string): Provider | null {
+  let host: string;
   try { host = new URL(url).hostname.replace(/^www\./, ''); }
   catch { return null; }
   return PROVIDERS.find((p) => p.hosts.some((h) =>
@@ -45,7 +77,7 @@ function providerFor(url) {
 
 // The iframe src out of a provider's html — and null the moment a <script>
 // appears, which is the whole policy in one line.
-function iframeSrcOf(html) {
+function iframeSrcOf(html: string | undefined): string | null {
   if (!html || /<script\b/i.test(html)) return null;
   const m = /<iframe\b[^>]*\bsrc\s*=\s*"([^"]+)"/i.exec(html);
   if (!m) return null;
@@ -53,26 +85,26 @@ function iframeSrcOf(html) {
   return /^https:\/\//i.test(src) ? src : null;
 }
 
-export async function oembedGet(url) {
-  if (cache.has(url)) return cache.get(url);
-  const answer = await lookup(url).catch((e) => ({ error: e.message || String(e) }));
+export async function oembedGet(url: string): Promise<OembedAnswer> {
+  if (cache.has(url)) return cache.get(url)!;
+  const answer: OembedAnswer = await lookup(url).catch((e: Error) => ({ error: e.message || String(e) }));
   cache.set(url, answer);
   return answer;
 }
 
-async function lookup(url) {
+async function lookup(url: string): Promise<OembedAnswer> {
   const provider = providerFor(url);
   if (!provider) return { error: 'no oEmbed provider for this site' };
   const api = new URL(provider.endpoint);
   api.searchParams.set('format', 'json');
   api.searchParams.set('url', url);
 
-  const timeout = new Promise((_, rej) =>
+  const timeout = new Promise<never>((_, rej) =>
     setTimeout(() => rej(new Error('the provider took too long')), 10000));
   const res = await Promise.race([
     fetch(api.toString(), { headers: { Accept: 'application/json' } }), timeout]);
   if (!res.ok) return { error: 'the provider said ' + res.status };
-  const data = await res.json();
+  const data: OembedResponse = await res.json();
   if (!data || typeof data !== 'object') return { error: 'not an oEmbed answer' };
 
   // Vimeo's player chrome is asked off, the way the reference site does it.
@@ -104,5 +136,6 @@ async function lookup(url) {
   return { card: true, thumb: /^https:\/\//i.test(data.thumbnail_url || '') ? data.thumbnail_url : null, ...meta };
 }
 
-const str = (v) => (typeof v === 'string' ? v.slice(0, 300) : null);
-const num = (v) => (Number.isFinite(+v) && +v > 0 ? +v : null);
+const str = (v: unknown): string | null => (typeof v === 'string' ? v.slice(0, 300) : null);
+// v is whatever the provider's JSON had (a number, a numeric string, absent)
+const num = (v: any): number | null => (Number.isFinite(+v) && +v > 0 ? +v : null);

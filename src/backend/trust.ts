@@ -16,10 +16,35 @@
 
 import { Database } from 'tjs:sqlite';
 
-let db = null;
-let fallback = null;                       // a Map, if the file won't open
+/** What a trust check is about: one action, from one place. */
+export interface TrustSubject {
+  scope: string;
+  root?: string | null;
+  id: string;
+  hash?: string;
+  label?: string;
+  /** set for the global actions file, which needs no grant */
+  trusted?: boolean;
+}
 
-async function open(app) {
+/** One row of action_trust. */
+export interface TrustRecord {
+  key: string;
+  scope: string;
+  root: string;
+  id: string;
+  hash: string | undefined;
+  label: string | undefined;
+  summary: string;
+  at: number;
+}
+
+export type TrustState = 'trusted' | 'changed' | 'new';
+
+let db: Database | null = null;
+let fallback: Map<string, TrustRecord> | null = null;   // a Map, if the file won't open
+
+async function open(app: TinyApp): Promise<void> {
   if (db || fallback) return;
   try {
     const { data } = await app.paths();
@@ -36,18 +61,18 @@ async function open(app) {
   }
 }
 
-const keyOf = (a) => [a.scope, a.root || '', a.id].join('\n');
+const keyOf = (a: TrustSubject): string => [a.scope, a.root || '', a.id].join('\n');
 
-function row(a) {
+function row(a: TrustSubject): TrustRecord | null {
   if (fallback) return fallback.get(keyOf(a)) || null;
-  const st = db.prepare('SELECT * FROM action_trust WHERE key = ?');
+  const st = db!.prepare('SELECT * FROM action_trust WHERE key = ?');
   try { return st.all(keyOf(a))[0] || null; } finally { st.finalize(); }
 }
 
 // 'trusted' — approved, and it is still the thing that was approved
 // 'changed' — approved once, but the command has been edited since
 // 'new'     — never approved
-export async function trustState(app, a) {
+export async function trustState(app: TinyApp, a: TrustSubject): Promise<TrustState> {
   if (a.trusted) return 'trusted';         // the global file is yours by definition
   await open(app);
   const r = row(a);
@@ -55,31 +80,31 @@ export async function trustState(app, a) {
   return r.hash === a.hash ? 'trusted' : 'changed';
 }
 
-export async function grantTrust(app, a, summary) {
+export async function grantTrust(app: TinyApp, a: TrustSubject, summary?: string): Promise<boolean> {
   await open(app);
-  const rec = {
+  const rec: TrustRecord = {
     key: keyOf(a), scope: a.scope, root: a.root || '', id: a.id,
     hash: a.hash, label: a.label, summary: summary || '', at: Date.now(),
   };
   if (fallback) { fallback.set(rec.key, rec); return true; }
-  const st = db.prepare(`INSERT OR REPLACE INTO action_trust
+  const st = db!.prepare(`INSERT OR REPLACE INTO action_trust
     (key, scope, root, id, hash, label, summary, at) VALUES (?,?,?,?,?,?,?,?)`);
   try { st.run(rec.key, rec.scope, rec.root, rec.id, rec.hash, rec.label, rec.summary, rec.at); }
   finally { st.finalize(); }
   return true;
 }
 
-export async function revokeTrust(app, key) {
+export async function revokeTrust(app: TinyApp, key: string): Promise<boolean> {
   await open(app);
   if (fallback) return fallback.delete(key);
-  const st = db.prepare('DELETE FROM action_trust WHERE key = ?');
+  const st = db!.prepare('DELETE FROM action_trust WHERE key = ?');
   try { st.run(key); } finally { st.finalize(); }
   return true;
 }
 
 // Everything approved, newest first — for the sheet that answers "what have I
 // said yes to?", and for revoking it.
-export async function listTrust(app, root) {
+export async function listTrust(app: TinyApp, root?: string | null): Promise<TrustRecord[]> {
   await open(app);
   if (fallback) {
     return [...fallback.values()].filter((r) => !root || r.root === root)
@@ -88,6 +113,6 @@ export async function listTrust(app, root) {
   const sql = root
     ? 'SELECT * FROM action_trust WHERE root = ? ORDER BY at DESC'
     : 'SELECT * FROM action_trust ORDER BY at DESC';
-  const st = db.prepare(sql);
+  const st = db!.prepare(sql);
   try { return root ? st.all(root) : st.all(); } finally { st.finalize(); }
 }

@@ -6,15 +6,38 @@
 // applyText so ⌘Z takes it back. The settings half — providers, keys, limits
 // — is aipanel.ts, in the Settings window.
 
-const $ = (id) => document.getElementById(id);
+const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
-function setupAiAsk({ toast, applyText }) {
+/** What a document window hands the ask sheet. */
+export interface AiAskOptions {
+  toast: (text: string) => void;
+  /** replaces the whole document as one undo step */
+  applyText: (text: string) => void;
+}
+
+export interface AiAskHandle {
+  /** dismiss the sheet, answering no */
+  close: () => void;
+}
+
+/** The backend's 'ai-approve' event: one tool call waiting for a yes/no. */
+interface AiApproveRequest {
+  askId: string;
+  title?: string;
+  why?: string;
+  detail?: string;
+  /** a write carries the file's text before and after, for the diff */
+  before?: unknown;
+  after?: unknown;
+}
+
+function setupAiAsk({ toast, applyText }: AiAskOptions): AiAskHandle {
   // ------------------------------------------------------- the ask sheet
 
   const askShade = $('aiAskShade');
-  let asking = null;
+  let asking: AiApproveRequest | null = null;
 
-  function ask(req) {
+  function ask(req: AiApproveRequest) {
     asking = req;
     $('aiAskTitle').textContent = req.title || 'Allow this?';
     $('aiAskWhy').textContent = req.why || '';
@@ -34,7 +57,7 @@ function setupAiAsk({ toast, applyText }) {
     $('aiAskNo').focus();
   }
 
-  function answer(ok) {
+  function answer(ok: boolean) {
     const a = asking;
     asking = null;
     askShade.hidden = true;
@@ -46,7 +69,7 @@ function setupAiAsk({ toast, applyText }) {
 
   // Enough of a diff to decide by: the first lines that differ, from each
   // end in, so a one-line change in a long file reads as a one-line change.
-  function summarise(before, after) {
+  function summarise(before: unknown, after: unknown) {
     const a = String(before).split('\n');
     const b = String(after).split('\n');
     let head = 0;
@@ -58,7 +81,7 @@ function setupAiAsk({ toast, applyText }) {
     const came = b.slice(head, b.length - tail);
 
     const out = document.createDocumentFragment();
-    const line = (text, cls) => {
+    const line = (text: string, cls: string) => {
       const el = document.createElement('span');
       el.className = cls;
       el.textContent = text + '\n';
@@ -72,7 +95,7 @@ function setupAiAsk({ toast, applyText }) {
     // Capped, and the cap SAYS SO — a preview that quietly shows the first
     // forty lines of a two-hundred-line replacement is worse than no preview,
     // because you would approve it believing you had read it.
-    const show = (lines, mark, cls) => {
+    const show = (lines: string[], mark: string, cls: string) => {
       for (const l of lines.slice(0, 40)) line(mark + ' ' + l, cls);
       if (lines.length > 40) line(mark + ' …and ' + (lines.length - 40) + ' more lines', 'dsame');
     };
@@ -84,12 +107,12 @@ function setupAiAsk({ toast, applyText }) {
   // A model rewriting the open document goes through the editor's own
   // applyText — which records an undo step. That is the whole reason it
   // takes this route instead of being written to disk behind the page.
-  tiny.api.on('ai-apply', ({ text }) => {
+  tiny.api.on('ai-apply', ({ text }: { text?: unknown }) => {
     applyText(String(text ?? ''));
     toast('The document was rewritten — ⌘Z takes it back');
   });
 
-  addEventListener('keydown', (e) => {
+  addEventListener('keydown', (e: KeyboardEvent) => {
     if (e.key === 'Escape' && !askShade.hidden) answer(false);
   }, true);
 

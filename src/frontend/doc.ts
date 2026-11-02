@@ -11,26 +11,34 @@
 // was scrolled.
 
 import { setupActionEditor } from './actedit.ts';
+import type { ActionFileTab } from './actedit.ts';
 import { setupActions } from './actions.ts';
+import type { ActionContext } from './actions.ts';
 import { adocToMarkdown } from './adoc.ts';
 import { setupAiAsk } from './aiask.ts';
 import { nibApplyAppearance } from './appearance.ts';
 import { setupDiffView } from './diff.ts';
 import { emojiByCode, setEmojiByCode, setupEmoji } from './emoji.ts';
 import { relativeTo, setupFiles, setupPalette } from './files.ts';
+import type { HeadIndex, Heading, PaletteEntry, PinKind, ProjectFile, ProjectPayload, TreeNode as FileNode } from './files.ts';
 import { findMarkLine, setupFindBar, setupSearchPanel } from './find.ts';
+import type { FindHit, FindOptions } from './find.ts';
 import { highlightSource } from './hl.ts';
 import { jsonc } from './json.ts';
 import { nibIndent, setupLiveEditing } from './live.ts';
 import { renderMarkdown } from './md.ts';
+import type { RenderMarkdownOptions } from './md.ts';
 import { nibMoveLines } from './move.ts';
-import { setupSiteMenu } from './sitemenu.ts';
+import { setupSiteMenu, type SiteMenuOp } from './sitemenu.ts';
 import { nibSlashItems } from './slash.ts';
+import type { SlashItem } from './slash.ts';
 import { setupSpeech } from './speech.ts';
 import { createPeerSync } from './sync.ts';
 import { nibTable, setupTableGrips } from './tables.ts';
+import type { TableCell, TableEditResult, TableModel } from './tables.ts';
 import { MD_BASE_CSS, PAGE_WIDTH, THEMES } from './themes.ts';
 import { setupHistory } from './undo.ts';
+import type { HistoryResult } from './undo.ts';
 import { htmlToMarkdown, patchMarkdown } from './unmd.ts';
 import { checkForUpdatesUI, installCliUI, makeDefaultUI } from './updates.ts';
 import { setupZoom } from './zoom.ts';
@@ -47,12 +55,248 @@ import printCss from './print.css?inline';
   document.head.append(sheet);
 }
 
-const $ = (id) => document.getElementById(id);
-const ed = $('ed'), preview = $('preview'), previewPane = $('previewPane');
+const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
+const ed = $<HTMLTextAreaElement>('ed'), preview = $('preview'), previewPane = $('previewPane');
 
 // ------------------------------------------------------------------ state
 
-const boot = await tiny.api.call('boot');
+/** What kind of thing a tab holds — the backend's sheet kinds. */
+type SheetKind = 'doc' | 'image' | 'diff';
+
+/** A sheet as the backend sends it (api.boot, showSheet, the show-sheet push). */
+interface Sheet {
+  id: string;
+  path: string | null;
+  name: string;
+  kind?: SheetKind;
+  preview?: boolean;
+  text: string;
+  savedText: string;
+  restored?: boolean;
+  /** set when this is one of Nib's own JSON config files */
+  config?: unknown;
+}
+
+/** One entry of the window's tab strip. */
+interface TabInfo {
+  id: string;
+  name: string;
+  path: string | null;
+  kind?: SheetKind;
+  dirty?: boolean;
+  preview?: boolean;
+}
+
+/** The 'tabs' push, and boot.tabs. */
+interface TabsPayload {
+  tabs: TabInfo[];
+  active?: string;
+}
+
+/** The app-wide preferences the page reads (Preview ▸, Markdown Flavor, …). */
+interface Prefs {
+  width: string;
+  captions: boolean;
+  zoom: boolean;
+  center: boolean;
+  linkTabs: boolean;
+  hrBreaks: boolean;
+  allFiles: boolean;
+  linkPath: boolean;
+  linkSep: string;
+  linkFrom: string;
+  edWidth?: boolean;
+  findColor?: string;
+  hc?: boolean;
+  paged?: boolean;
+  alerts?: boolean;
+  emojiCodes?: boolean;
+  footnotes?: boolean;
+  math?: boolean;
+  mermaid?: boolean;
+  carousel?: boolean;
+  download?: boolean;
+  embed?: boolean;
+  pagelink?: boolean;
+  toc?: boolean;
+  html?: boolean;
+  [key: string]: unknown;
+}
+
+/** The 'goto' push: a search hit to land on, once its document is up. */
+interface GotoPush {
+  path?: string;
+  line: number;
+  col: number;
+  len?: number;
+}
+
+/** The 'goto-anchor' push: a #fragment to scroll to in a file being opened. */
+interface AnchorPush {
+  path?: string;
+  frag: string;
+}
+
+/** A row in the folder tree — or the folder itself, which has no row
+ *  (its menu hangs off the panel; see rootMenu). */
+type TreeNode = FileNode & { isRoot?: boolean };
+
+/** A row of the tree's context menu (drawCtx) — an item or a separator. */
+interface CtxItem {
+  label?: string;
+  fn?: () => unknown;
+  sep?: boolean;
+}
+
+
+/** oembedGet's answer: what an ::: embed island turns into. */
+interface OEmbed {
+  error?: string;
+  iframe?: string;
+  image?: string;
+  card?: boolean;
+  title?: string;
+  provider?: string;
+  author?: string;
+  width?: number;
+  height?: number;
+}
+
+/** A row of the problem bar: a JSON error, or a warning about the actions file. */
+interface Problem {
+  text: string;
+  line?: number;
+  col?: number;
+  bad?: boolean;
+}
+
+/** Format ▸ Image & Path Settings — per folder, or the app's own. */
+interface ImageSettings {
+  dest: string;           // 'beside' | 'sub' | 'root'
+  folder: string;
+  naming: string;         // 'heading' | 'stamp' | 'custom' | …
+  template?: string;
+  optimize: string;       // 'off' | 'same' | 'webp'
+  maxWidth: number;
+  quality?: number;
+  imageRoot?: string;
+  linkRoot?: string;
+}
+
+/** api.imageOptions: the settings, and whose they are. */
+interface ImageOptions {
+  settings: ImageSettings;
+  ask?: boolean;
+  project?: boolean;
+  inFolder?: boolean;
+  root: string | null;
+  scope: string | null;
+}
+
+/** api.saveImage's answer: where the picture landed. */
+interface SavedImage {
+  needsPath?: boolean;
+  name: string;
+  rel?: string;
+  path?: string;
+}
+
+/** optimizeImage's answer: the re-encoded bytes, and the sizes either side. */
+interface Reencoded {
+  data: string;
+  format: string;
+  was: number;
+  now: number;
+}
+
+/** The optimizer's running tally, toasted at the end. */
+interface OptStats {
+  done: number;
+  skipped: number;
+  was: number;
+  now: number;
+  renames: { from: string; to: string }[];
+}
+
+/** A file scanUnused / removeEntry found nothing linking to. */
+interface UnusedFile {
+  path: string;
+  rel: string;
+  kind?: string;
+  size: number;
+  where?: string[];
+  more?: number;
+}
+
+/** removeEntry's answer. */
+interface Removed {
+  error?: string;
+  name: string;
+  broken?: number;
+  gone?: string[];
+  orphans: UnusedFile[];
+}
+
+/** A link brokenLinks found landing on nothing. */
+interface BrokenLink {
+  path: string;
+  rel: string;
+  name: string;
+  line: number;
+  col: number;
+  len: number;
+  at: number;
+  to: string;
+  text: string;
+}
+
+/** A file to link, from the @-palette (a file, or a heading in one) or
+ *  from the tree's Insert Link Here (which has no rel). */
+interface MentionFile {
+  path: string;
+  rel?: string;
+  /** the file's own rel when the pick is one of its headings */
+  orel?: string;
+  name: string;
+  kind?: string;
+  head?: Heading;
+}
+
+/** updateRefs' answer: how many links moved, in how many documents. */
+interface RefsUpdated {
+  total: number;
+  changed: number;
+}
+
+/** closeSheet's answer: whether it closed, and the neighbour that takes over. */
+interface SheetClosed {
+  closed?: boolean;
+  sheet?: Sheet;
+}
+
+/** gitChanges' answer: the folder's files that differ from the last commit. */
+interface GitChanges {
+  repo?: boolean;
+  branch?: string;
+  files: { path: string; rel: string; status: string }[];
+}
+
+/** api.boot's answer. */
+interface Boot {
+  zoom: number;
+  theme: string;
+  view: string;
+  sheet: Sheet;
+  appearance?: string;
+  prefs?: Partial<Prefs>;
+  tabs?: TabsPayload;
+  paneW?: Record<string, number>;
+  outline?: boolean;
+  editable?: boolean;
+  project: ProjectPayload | null;
+}
+
+const boot = await tiny.api.call('boot') as Boot;
 setupZoom(boot.zoom);            // ⌘+ / ⌘− / ⌥⌘0 — the whole UI, every window
 let { theme, view } = boot;
 let sheetId = boot.sheet.id;
@@ -66,7 +310,7 @@ let previewing = !!boot.sheet.preview;
 let savedText = boot.sheet.savedText;
 let dirty = false;
 let docDir = path ? path.slice(0, path.lastIndexOf('/')) : null;
-const imgCache = new Map();          // src -> Promise<dataUri|null>
+const imgCache = new Map<string, Promise<string | null | undefined>>();          // src -> Promise<dataUri|null>
 const history = setupHistory();      // per-sheet undo/redo over buffer diffs
 // An .adoc sheet renders through adoc.ts's line-preserving mapping and is
 // never editable in the preview (the round-trip would write Markdown into
@@ -79,25 +323,25 @@ const isJson = () => /\.json$/i.test(path || '');
 const renderSrc = () =>
   (isAdoc() && adocToMarkdown ? adocToMarkdown(ed.value)
     : isJson() ? '````json\n' + ed.value + '\n````' : ed.value);
-const escRow = (s) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+const escRow = (s: string) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' } as Record<string, string>)[c]);
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|avif|heic|tiff?)$/i;
 // What the native pickers offer ({ types } filters, tinyjs 0.35) — mirrors
 // the backend's OPENABLE and IMAGES sets.
 const DOC_TYPES = ['md', 'markdown', 'mdown', 'mkdn', 'mkd', 'mdwn', 'mdtxt', 'mdtext',
   'mdx', 'qmd', 'rmd', 'mdc', 'markdoc', 'mdoc', 'adoc', 'asciidoc', 'txt', 'json'];
 const IMG_TYPES = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'avif', 'heic', 'tiff'];
-const baseName = (p) => String(p || '').split('/').pop();
+const baseName = (p: string | null | undefined) => String(p || '').split('/').pop()!;
 // A target as it has to be WRITTEN. A path with a space or a parenthesis in
 // it — `Screen Shot 2026.png`, `image (14).png` — only survives inside
 // <angle brackets>; anything else is written plainly.
-const mdTarget = (p) => (/[\s()<>]/.test(p) ? '<' + p + '>' : p);
-const plural = (n, word) => n + ' ' + word + (n === 1 ? '' : 's');
-const seen = new Map();              // sheetId -> { sel, edScroll, pvScroll }
+const mdTarget = (p: string) => (/[\s()<>]/.test(p) ? '<' + p + '>' : p);
+const plural = (n: number, word: string) => n + ' ' + word + (n === 1 ? '' : 's');
+const seen = new Map<string, { sel: [number, number]; edScroll: number; pvScroll: number }>();              // sheetId -> { sel, edScroll, pvScroll }
 // find.ts's two surfaces, built further down (they need the peer sync), and
 // the search hit that arrived before the document it belongs to
-let find = null;
-let pendingGoto = null;
-let pendingAnchor = null;
+let find: ReturnType<typeof setupFindBar> | null = null;
+let pendingGoto: GotoPush | null = null;
+let pendingAnchor: AnchorPush | null = null;
 
 ed.value = boot.sheet.text;
 history.open(sheetId, ed.value);     // the boot sheet skips loadSheet — its
@@ -112,7 +356,7 @@ ed.setSelectionRange(0, 0);          // open at the top, not the end
 let appearance = boot.appearance || 'system';
 // Resolving Light / Dark / Match System — and remembering the answer, so
 // the next window opens already knowing (appearance.ts).
-async function applyAppearance(a) {
+async function applyAppearance(a?: string | null) {
   appearance = a || 'system';
   await nibApplyAppearance(appearance);
 }
@@ -123,7 +367,7 @@ tiny.api.on('appearance', ({ appearance: a }) => applyAppearance(a));
 
 const themeStyle = document.createElement('style');
 document.head.appendChild(themeStyle);
-const themePick = $('themePick');
+const themePick = $<HTMLSelectElement>('themePick');
 for (const [id, t] of Object.entries(THEMES)) {
   themePick.add(new Option(t.label, id));
 }
@@ -138,10 +382,10 @@ paperProbe.hidden = true;
 document.body.appendChild(paperProbe);
 const paperBg = () => getComputedStyle(paperProbe).backgroundColor;
 
-function applyTheme(t) {
-  if (!THEMES[t]) return;
+function applyTheme(t: string) {
+  if (!THEMES[t as keyof typeof THEMES]) return;
   theme = t;
-  themeStyle.textContent = MD_BASE_CSS + THEMES[t].css;
+  themeStyle.textContent = MD_BASE_CSS + THEMES[t as keyof typeof THEMES].css;
   themePick.value = t;
   previewPane.style.background = paperBg();
   paintDesk();
@@ -184,7 +428,7 @@ function layoutSheets() {
   const art = preview.getBoundingClientRect();
   const dy = previewPane.scrollTop - pane.top;
   const left = art.left - pane.left + previewPane.scrollLeft;
-  const cuts = [];
+  const cuts: [number, number][] = [];
   let from = art.top;
   for (const b of preview.querySelectorAll('.pgbrk')) {
     const r = b.getBoundingClientRect();
@@ -193,10 +437,10 @@ function layoutSheets() {
     from = r.bottom;
   }
   cuts.push([from, art.bottom]);
-  while (sheetsEl.children.length > cuts.length) sheetsEl.lastChild.remove();
+  while (sheetsEl.children.length > cuts.length) sheetsEl.lastChild!.remove();
   while (sheetsEl.children.length < cuts.length) sheetsEl.appendChild(document.createElement('div'));
   cuts.forEach(([a, b], i) => {
-    const st = sheetsEl.children[i].style;
+    const st = (sheetsEl.children[i] as HTMLElement).style;
     st.top = Math.round(a + dy) + 'px';
     st.left = left + 'px';                   // unrounded: flush with the text column
     st.width = art.width + 'px';
@@ -211,7 +455,7 @@ new ResizeObserver(layoutSheetsSoon).observe(preview);
 // Find's highlight colours (Find ▸ Find Highlight). 'default' derives from
 // the accent, with more weight on a dark page so it still carries; the
 // named ones are deliberately loud, tuned to read on light AND dark.
-const FIND_COLORS = {
+const FIND_COLORS: Record<string, { hi: string; cur: string; fg: string }> = {
   yellow: { hi: 'rgba(255, 214, 10, .55)', cur: '#ffd60a', fg: '#000' },
   green:  { hi: 'rgba(50, 215, 75, .5)',   cur: '#28cd41', fg: '#000' },
   pink:   { hi: 'rgba(255, 55, 95, .45)',  cur: '#ff2d55', fg: '#fff' },
@@ -219,7 +463,7 @@ const FIND_COLORS = {
 };
 function paintFindColors() {
   const b = document.body.style;
-  const c = FIND_COLORS[prefs.findColor];
+  const c = FIND_COLORS[prefs.findColor!];
   if (c) {
     b.setProperty('--find-hi', c.hi);
     b.setProperty('--find-cur', c.cur);
@@ -245,23 +489,23 @@ tiny.api.on('doc-theme', ({ theme: t }) => applyTheme(t));
 // custom property on the article — which is why they survive Export as HTML
 // and Save as PDF for free: those take a clone of this very element.
 
-let prefs = {
+let prefs: Prefs = {
   width: 'normal', captions: false, zoom: false, center: false, linkTabs: false,
   hrBreaks: false, allFiles: false, linkPath: false, linkSep: 'chev', linkFrom: 'rel',
   ...(boot.prefs || {}),
 };
 
-function applyPrefs(p) {
+function applyPrefs(p: Partial<Prefs>) {
   const hrWas = !!prefs.hrBreaks;
   const allWas = !!prefs.allFiles;
-  const was = {};
+  const was: Record<string, boolean> = {};
   for (const k of ['alerts', 'emojiCodes', 'footnotes', 'math', 'mermaid',
     'carousel', 'download', 'embed', 'pagelink', 'toc', 'html']) was[k] = !!prefs[k];
   prefs = { ...prefs, ...p };
   preview.classList.toggle('cap', !!prefs.captions);
   preview.classList.toggle('zoom', !!prefs.zoom);
   preview.classList.toggle('mid', !!prefs.center);
-  const w = (PAGE_WIDTH[prefs.width] || PAGE_WIDTH.full)[1];
+  const w = (PAGE_WIDTH[prefs.width as keyof typeof PAGE_WIDTH] || PAGE_WIDTH.full)[1];
   document.body.style.setProperty('--pw', w);
   // what Page View's sheet wants to be: the page width, except Full
   // Width means paper-sized rather than edge-to-edge
@@ -303,12 +547,12 @@ const viewLocked = () => isJson();
 // `fresh` means a sheet is being loaded and the preview already holds its
 // DOM — the same promise applyEditable's own `fresh` makes, and for the same
 // reason: serializing here would write the outgoing document over this one.
-function paintView(fresh) {
+function paintView(fresh?: boolean) {
   const shown = viewLocked() ? 'edit' : view;
   document.body.dataset.view = shown;
   // [data-view] only: the ✎ Editable toggle lives inside the switcher too,
   // and its on/disabled states are applyEditable's to manage, not ours.
-  for (const b of document.querySelectorAll('#views button[data-view]')) {
+  for (const b of document.querySelectorAll<HTMLButtonElement>('#views button[data-view]')) {
     b.classList.toggle('on', b.dataset.view === shown);
     b.disabled = viewLocked();
   }
@@ -318,13 +562,13 @@ function paintView(fresh) {
   if (kind === 'doc') applyEditable(false, fresh);
 }
 
-function setView(v, persist) {
+function setView(v: string, persist?: boolean) {
   view = v;
   paintView();
   tiny.api.call('setView', { view: v, persist: !!persist });
 }
-for (const b of document.querySelectorAll('#views button[data-view]')) {
-  b.onclick = () => { if (!viewLocked()) setView(b.dataset.view, true); };
+for (const b of document.querySelectorAll<HTMLButtonElement>('#views button[data-view]')) {
+  b.onclick = () => { if (!viewLocked()) setView(b.dataset.view!, true); };
 }
 // re-assert on focus so the View menu's ticks follow the active window
 window.addEventListener('focus', () => {
@@ -342,9 +586,9 @@ window.addEventListener('focus', () => {
 // when only one document is open.
 
 const tabstrip = $('tabstrip');
-let tabs = (boot.tabs && boot.tabs.tabs) || [];
+let tabs: TabInfo[] = (boot.tabs && boot.tabs.tabs) || [];
 
-function paintTabs(payload) {
+function paintTabs(payload?: TabsPayload) {
   if (payload) {
     tabs = payload.tabs;
     if (payload.active) sheetId = payload.active;
@@ -376,8 +620,8 @@ function paintTabs(payload) {
 
     // drag to reorder, within this window only
     el.ondragstart = (e) => {
-      e.dataTransfer.setData('text/plain', t.id);
-      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer!.setData('text/plain', t.id);
+      e.dataTransfer!.effectAllowed = 'move';
       el.classList.add('drag');
       promote(t.id);              // arranging a tab is deciding to keep it
     };
@@ -390,7 +634,7 @@ function paintTabs(payload) {
     el.ondrop = (e) => {
       e.preventDefault();
       el.classList.remove('over');
-      const from = e.dataTransfer.getData('text/plain');
+      const from = e.dataTransfer!.getData('text/plain');
       if (!from || from === t.id) return;
       const order = tabs.map((x2) => x2.id).filter((id) => id !== from);
       order.splice(order.indexOf(t.id), 0, from);
@@ -405,7 +649,7 @@ tiny.api.on('tabs', (p) => paintTabs(p));
 // does it — a real edit, a double-click on the row or the tab, dragging it.
 // The backend is the authority on which sheets are previews, so this doesn't
 // consult the local tab list: during a load that list is a beat behind.
-function promote(id) {
+function promote(id?: string) {
   if (id && id !== sheetId) { tiny.api.call('promoteSheet', { id }); return; }
   if (!previewing) return;
   previewing = false;
@@ -423,7 +667,7 @@ tiny.api.on('sheet-path', (s) => {
   siteMenu.refresh();                          // a rename can mend or break an entry
   setDirty();                                  // the title carries the name
   if (kind === 'image') showImage(path);
-  if (kind === 'diff') diffView.show(path);
+  if (kind === 'diff') diffView.show(path!);
 });
 
 // Put a document on screen. Everything derived from "which document is this"
@@ -435,7 +679,7 @@ tiny.api.on('sheet-path', (s) => {
 // which is exactly how the outgoing document's caret went missing.
 let loadedId = boot.sheet.id;
 
-function loadSheet(s) {
+function loadSheet(s: Sheet) {
   if (loadedId && loadedId !== s.id && kind === 'doc') {
     seen.set(loadedId, {
       sel: [ed.selectionStart, ed.selectionEnd],
@@ -458,7 +702,7 @@ function loadSheet(s) {
   ed.value = s.text || '';
   history.open(s.id, ed.value);                // its own history, from here
   const was = seen.get(s.id);
-  ed.setSelectionRange(...(was ? was.sel : [0, 0]));
+  ed.setSelectionRange(...(was ? was.sel : [0, 0] as [number, number]));
   $('banner').hidden = !s.restored;
   hideProblems();                              // they belonged to the last tab
   if (s.restored && !path) $('btnRevert').hidden = true;
@@ -478,8 +722,8 @@ function loadSheet(s) {
   paintTabs();
   // Find follows the tab: a picture has nothing to search, and a document
   // has to be searched again — the offsets belonged to the last one.
-  if (kind !== 'doc') find.close();
-  else find.refresh();
+  if (kind !== 'doc') find!.close();
+  else find!.refresh();
   if (pendingGoto && pendingGoto.path === path) {
     const g = pendingGoto;
     pendingGoto = null;
@@ -506,7 +750,7 @@ function loadSheet(s) {
 // they just have nothing to edit. The bytes come from the backend as a data:
 // URI — the same route the preview's own images take, so WebKit is never
 // pointed at file:// itself.
-const imageShow = $('imageShow');
+const imageShow = $<HTMLImageElement>('imageShow');
 let imageToken = 0;
 
 function applyKind() {
@@ -517,15 +761,15 @@ function applyKind() {
   if (kind === 'image') showImage(path);
   else { imageShow.removeAttribute('src'); imageToken++; }
   // every arrival re-asks git — the file may have been saved since
-  if (kind === 'diff') diffView.show(path);
+  if (kind === 'diff') diffView.show(path!);
   paintView(true);
   layoutSheetsSoon();                          // no paper under a picture
 }
 
-const niceBytes = (n) => (n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB'
+const niceBytes = (n: number) => (n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB'
   : n >= 1024 ? Math.round(n / 1024) + ' KB' : n + ' bytes');
 
-async function showImage(p) {
+async function showImage(p: string | null) {
   const mine = ++imageToken;
   const meta = $('imageMeta');
   const old = $('imageMissing');
@@ -559,7 +803,7 @@ async function showImage(p) {
   imageShow.decode ? imageShow.decode().then(say, say) : (imageShow.onload = say);
 }
 
-const base = (p) => (p || '').split('/').pop();
+const base = (p: string | null) => (p || '').split('/').pop()!;
 
 // fit ⇄ 1:1, the only two zoom levels a viewer this size needs
 $('imageZoom').onclick = () => {
@@ -570,19 +814,19 @@ $('imageWrap').onclick = () => $('imageZoom').click();
 // A push can in principle land before this file has finished setting itself
 // up (loadSheet reaches for the tree and the backdrop, declared further
 // down), so anything early waits for the end of the boot sequence.
-let booted = false, pendingSheet = null;
-tiny.api.on('show-sheet', (s) => { if (booted) loadSheet(s); else pendingSheet = s; });
+let booted = false, pendingSheet: Sheet | null = null;
+tiny.api.on('show-sheet', (s: Sheet) => { if (booted) loadSheet(s); else pendingSheet = s; });
 
-async function showSheet(id) {
+async function showSheet(id: string) {
   if (id === sheetId) return;
   flushLive();
-  clearTimeout(syncTimer);
+  clearTimeout(syncTimer!);
   await syncNow();                             // the backend owns the text
-  const s = await tiny.api.call('showSheet', { id });
+  const s = await tiny.api.call('showSheet', { id }) as Sheet | null;
   if (s) loadSheet(s);
 }
 
-function stepTab(by) {
+function stepTab(by: number) {
   const i = tabs.findIndex((t) => t.id === sheetId);
   if (i < 0 || tabs.length < 2) return;
   showSheet(tabs[(i + by + tabs.length) % tabs.length].id);
@@ -605,8 +849,8 @@ async function pickFolder() {
 // recent lists); all this end does is report what came back — and then ask
 // the second question, which is what to do about the documents still
 // pointing at the old name.
-async function renameNode(node, name) {
-  const r = await tiny.api.call('renameEntry', { path: node.path, name });
+async function renameNode(node: TreeNode, name: string) {
+  const r = await tiny.api.call('renameEntry', { path: node.path, name }) as { error?: string; ok?: boolean; name: string; from?: string; path: string } | null;
   if (r && r.error) { toast(r.error); return; }
   if (!r || !r.ok) return;
   toast('Renamed to ' + r.name);
@@ -619,9 +863,9 @@ async function renameNode(node, name) {
 // because "no" is a real answer when the old name was the published one.
 //
 // Pictures count as much as documents: `![shot](old.png)` is the same link.
-async function offerRefs(from, to) {
+async function offerRefs(from: string, to: string) {
   if (!from || from === to) return;
-  let scan;
+  let scan: { total: number; files: { rel: string; count: number; dirty?: boolean }[] } | null;
   try { scan = await tiny.api.call('scanRefs', { from, to }); } catch { return; }
   if (!scan || !scan.total) return;
   const docs = scan.files.length;
@@ -637,7 +881,7 @@ async function offerRefs(from, to) {
       ok: 'Update Links', cancel: 'Leave Them',
     });
   if (!ok) return;
-  const r = await tiny.api.call('updateRefs', { from, to });
+  const r = await tiny.api.call('updateRefs', { from, to }) as RefsUpdated | null;
   if (r && r.changed) toast(`Updated ${plural(r.total, 'link')} in ${plural(r.changed, 'document')}`);
 }
 
@@ -645,11 +889,11 @@ const tree = setupFiles({
   nav: $('files'), title: $('filesTitle'), tree: $('tree'),
   // One click previews, a double-click (or ⌘⏎) keeps it — see openDoc in
   // the backend for what "preview" costs and buys.
-  onOpen: (node, opts) => {
+  onOpen: (node: TreeNode, opts?: { preview?: boolean }) => {
     // a file Nib can't open goes to the system's app, like a followed link
     if (node.kind === 'other') {
       return tiny.api.call('openLink', { href: node.path })
-        .then((r) => { if (r && r.note) toast(r.note); return r; });
+        .then((r: { note?: string } | null) => { if (r && r.note) toast(r.note); return r; });
     }
     return tiny.api.call('openPaths', { paths: [node.path], preview: !!(opts && opts.preview) });
   },
@@ -657,8 +901,8 @@ const tree = setupFiles({
   onShowAll: () => tiny.api.call('setPref', { key: 'allFiles', value: true }),
   onChoose: pickFolder,                       // the panel's own empty state
   onRename: renameNode,
-  onMenu: (node, x, y) => showTreeMenu(node, x, y),
-  onPin: (node, state) => tiny.api.call('setPin', { path: node.path, state }),
+  onMenu: (node: TreeNode, x: number, y: number) => showTreeMenu(node, x, y),
+  onPin: (node: TreeNode, state: PinKind | null) => tiny.api.call('setPin', { path: node.path, state }),
   onEscape: () => { if (editing()) preview.focus(); else ed.focus(); },
 });
 
@@ -667,38 +911,39 @@ const siteMenu = setupSiteMenu({
   box: $('menuInner'),
   fetch: () => tiny.api.call('siteMenus', {}),
   root: () => tree.root(),
-  onOpen: (p, preview) => tiny.api.call('openPaths', { paths: [p], preview }),
+  onOpen: (p: string, preview: boolean) => tiny.api.call('openPaths', { paths: [p], preview }),
   // Nib opens a SUMMARY.md or a docs.json at the entry; a config written
   // in TS / YAML / Python goes to whatever edits those on this machine
-  onOpenAt: (p, line) => (/\.(md|mdx|markdown|json|txt|adoc)$/i.test(p)
+  onOpenAt: (p: string, line: number) => (/\.(md|mdx|markdown|json|txt|adoc)$/i.test(p)
     ? tiny.api.call('openAt', { path: p, line, col: 0, len: 0, preview: false })
-    : tiny.api.call('openMenuSource', { path: p }).then((r) => { if (r && (r.note || r.error)) toast(r.note || r.error); })),
-  onExternal: (url) => tiny.api.call('openExternal', { url }),
+    : tiny.api.call('openMenuSource', { path: p }).then((r: { note?: string; error?: string } | null) => { if (r && (r.note || r.error)) toast((r.note || r.error)!); })),
+  onExternal: (url: string) => tiny.api.call('openExternal', { url }),
   onChange: () => paintFilesHead(),
   // edits go into the menu's own file; the answer is the menus re-read
-  onEdit: (key, op, label) => tiny.api.call('editSiteMenu', { key, op, label }),
+  onEdit: (key: string, op: SiteMenuOp, label: string) => tiny.api.call('editSiteMenu', { key, op, label }),
   onUndo: () => tiny.api.call('undoSiteMenu', {}),
   onRedo: () => tiny.api.call('redoSiteMenu', {}),
-  onFocus: (on) => tiny.api.call('setSiteMenuFocus', { on }),
+  onFocus: (on: boolean) => tiny.api.call('setSiteMenuFocus', { on }),
   onEscape: () => { if (editing()) preview.focus(); else ed.focus(); },
-  showMenu: (title, items, x, y) => drawCtx(title, items, x, y),
-  toast: (t) => toast(t),
+  showMenu: (title: string, items: CtxItem[], x: number, y: number) => drawCtx(title, items, x, y),
+  toast: (t: string) => toast(t),
 });
 
 // Both sidebars have a draggable width, remembered app-wide. --filw/--outw
 // still swing to 0 when a pane closes; the -open twins hold the real width
 // so the inner content keeps its shape through the fade.
 const PANE_DEF = { files: 232, outline: 218 };
-const clampPane = (w) =>
+type Pane = keyof typeof PANE_DEF;
+const clampPane = (w: number) =>
   Math.round(Math.min(Math.max(w, 120), Math.max(160, Math.min(600, innerWidth / 2))));
 const paneW = { ...PANE_DEF };
-for (const k of ['files', 'outline']) {
+for (const k of ['files', 'outline'] as Pane[]) {
   const w = boot.paneW && +boot.paneW[k];
   if (w) paneW[k] = clampPane(w);
   document.body.style.setProperty(k === 'files' ? '--filw-open' : '--outw-open', paneW[k] + 'px');
 }
 
-function setFiles(on) {
+function setFiles(on: boolean) {
   filesOn = !!on;
   document.body.toggleAttribute('data-files', filesOn);
   document.body.style.setProperty('--filw', filesOn ? paneW.files + 'px' : '0px');
@@ -713,7 +958,7 @@ $('btnFiles').onclick = () => setFiles(!filesOn);
 function paintFilesHead() {
   const has = tree.has();
   const pinned = has && Object.keys(tree.pins()).length > 0;
-  const tp = $('tgPins'), ta = $('tgAll');
+  const tp = $<HTMLButtonElement>('tgPins'), ta = $('tgAll');
   tp.hidden = ta.hidden = !has;
   // the Project | Changes bar is git's to grant: repo or nothing — and it
   // steps aside while Find in Folder has the sidebar
@@ -725,7 +970,7 @@ function paintFilesHead() {
   $('stMenu').hidden = !site;
   $('stChanges').hidden = !gitRepo;
   if (!site && !$('menuInner').hidden) showMenu(false);
-  $('stProject').classList.toggle('on', $('changesInner').hidden && $('menuInner').hidden);
+  $('stProject').classList.toggle('on', ($('changesInner').hidden && $('menuInner').hidden) as boolean);
   $('stMenu').classList.toggle('on', !$('menuInner').hidden);
   $('stChanges').classList.toggle('on', !$('changesInner').hidden);
   tp.disabled = !pinned;
@@ -738,16 +983,16 @@ function paintFilesHead() {
 $('tgPins').onclick = () => tiny.api.call('setPinsOn', { on: !tree.pinsOn() });
 // The folder itself has no row in the tree, so its menu hangs off the title
 // and the empty space under the last row: a right-click on the folder.
-const rootMenu = (e) => {
+const rootMenu = (e: MouseEvent) => {
   const root = tree.root();
   if (!root) return;
   e.preventDefault();
-  showTreeMenu({ dir: true, isRoot: true, path: root, name: root.split('/').pop() },
+  showTreeMenu({ dir: true, isRoot: true, path: root, name: root.split('/').pop()! },
     e.clientX, e.clientY);
 };
 // (rows stop their own right-click, so only the bare panel reaches here)
 $('filesInner').addEventListener('contextmenu', (e) => {
-  if (['filesInner', 'tree', 'filesHead', 'filesTitle'].includes(e.target.id)) rootMenu(e);
+  if (['filesInner', 'tree', 'filesHead', 'filesTitle'].includes((e.target as Element).id)) rootMenu(e);
 });
 $('tgAll').onclick = () => tiny.api.call('setPref', { key: 'allFiles', value: !prefs.allFiles });
 
@@ -757,8 +1002,8 @@ $('tgAll').onclick = () => tiny.api.call('setPref', { key: 'allFiles', value: !p
 // moves, the preview is drawn again with the image cache emptied; while the
 // caret is IN the preview a re-render would throw it away, so only the
 // pictures that failed get another try.
-let renderShape = null;
-function rerenderForFolder(p) {
+let renderShape: string | null = null;
+function rerenderForFolder(p: ProjectPayload | null) {
   const shape = p ? JSON.stringify([p.root, p.roots, (p.files || []).map((f) => f.path)]) : '';
   const was = renderShape;
   renderShape = shape;
@@ -773,7 +1018,7 @@ function rerenderForFolder(p) {
   render();
 }
 
-function applyProject(p) {
+function applyProject(p: ProjectPayload | null) {
   tree.set(p, path);
   rerenderForFolder(p);
   probeGit(p && p.root);
@@ -788,7 +1033,7 @@ function applyProject(p) {
   }
   paintFilesHead();
 }
-tiny.api.on('project', (p) => {
+tiny.api.on('project', (p: ProjectPayload | null) => {
   applyProject(p);
   refreshLinks();
   if (p) { siteMenu.showing(path); siteMenu.refresh(); } else { siteMenu.clear(); showMenu(false); }
@@ -804,17 +1049,17 @@ tiny.api.on('project-heads', (h) => tree.setHeads(h));
 // you're writing, which is the whole reason a Markdown editor wants a tree.
 
 const ctx = $('ctx');
-const REVEAL = { macos: 'Reveal in Finder', windows: 'Show in Explorer' };
+const REVEAL: Record<string, string> = { macos: 'Reveal in Finder', windows: 'Show in Explorer' };
 const revealLabel = () => REVEAL[tiny.system.os()] || 'Show in File Manager';
 
 function hideCtx() { ctx.hidden = true; ctx.textContent = ''; }
-addEventListener('mousedown', (e) => { if (!ctx.hidden && !ctx.contains(e.target)) hideCtx(); });
+addEventListener('mousedown', (e) => { if (!ctx.hidden && !ctx.contains(e.target as Node)) hideCtx(); });
 addEventListener('keydown', (e) => { if (e.key === 'Escape') hideCtx(); }, true);
 addEventListener('blur', hideCtx);
 
-async function showTreeMenu(node, x, y) {
-  const items = [];
-  const add = (label, fn) => items.push({ label, fn });
+async function showTreeMenu(node: TreeNode, x: number, y: number) {
+  const items: CtxItem[] = [];
+  const add = (label: string, fn: () => unknown) => items.push({ label, fn });
   if (!node.dir) {
     if (node.kind !== 'other') add(node.kind === 'image' ? 'Open Picture' : 'Open', () =>
       tiny.api.call('openPaths', { paths: [node.path] }));
@@ -834,11 +1079,11 @@ async function showTreeMenu(node, x, y) {
         () => tiny.api.call('setPin', { path: node.path, state: pinned ? null : 'all' }));
   }
   if (node.dir) {
-    const imgs = tree.files().filter((f) => f.kind === 'image'
+    const imgs = tree.files().filter((f: ProjectFile) => f.kind === 'image'
       && !OPT_EXCLUDE.test(f.path) && f.path.startsWith(node.path + '/'));
     if (imgs.length) {
       add('Optimize ' + (imgs.length === 1 ? 'the Picture' : imgs.length + ' Pictures') + ' Here…',
-          () => openOptimizer(imgs.map((f) => f.path)));
+          () => openOptimizer(imgs.map((f: ProjectFile) => f.path)));
     }
     add('Clean Up Unused Files Here…', () => openCleanup(node.path));
   }
@@ -867,7 +1112,7 @@ async function showTreeMenu(node, x, y) {
 }
 
 // The tree's context menu, drawn — shared with the ☰ Menu face's rows.
-function drawCtx(title, items, x, y) {
+function drawCtx(title: string, items: CtxItem[], x: number, y: number) {
   ctx.textContent = '';
   const head = document.createElement('div');
   head.className = 'chead';
@@ -877,8 +1122,8 @@ function drawCtx(title, items, x, y) {
     const el = document.createElement('div');
     if (it.sep) { el.className = 'csep'; ctx.appendChild(el); continue; }
     el.className = 'citem';
-    el.textContent = it.label;
-    el.onclick = () => { hideCtx(); it.fn(); };
+    el.textContent = it.label!;
+    el.onclick = () => { hideCtx(); it.fn!(); };
     ctx.appendChild(el);
   }
   // measured, then nudged back on screen — a menu opened near the bottom
@@ -904,7 +1149,7 @@ const palette = setupPalette({
 // pin sees every pinned folder of the right kind together; no pins at all
 // means the whole project. Docs and pictures resolve separately, so
 // assets/ can be pinned for pictures while notes/ is pinned for Markdown.
-function pinScopeFor(kind) {
+function pinScopeFor(kind: string) {
   if (!tree.pinsOn()) return null;            // parked by the master switch
   const pins = tree.pins();
   const dirs = Object.keys(pins).filter((d) => pins[d] === 'all' || pins[d] === kind);
@@ -917,15 +1162,15 @@ function pinScopeFor(kind) {
 // always says why it is short
 function pinView() {
   const docs = pinScopeFor('docs'), images = pinScopeFor('images');
-  if (!docs && !images) return { files: (fs) => fs, label: '' };
-  const root = tree.root();
-  const short = (s) => s.map((d) => d.slice(root.length + 1) + '/').join(', ');
-  const under = (scope, p) => !scope || scope.some((d) => p.startsWith(d + '/'));
+  if (!docs && !images) return { files: (fs: ProjectFile[]) => fs, label: '' };
+  const root = tree.root()!;
+  const short = (s: string[]) => s.map((d) => d.slice(root.length + 1) + '/').join(', ');
+  const under = (scope: string[] | null, p: string) => !scope || scope.some((d) => p.startsWith(d + '/'));
   const label = docs && images && String(docs) === String(images)
     ? '📌 ' + short(docs)
     : [docs && '📌 ' + short(docs), images && '🖼 ' + short(images)].filter(Boolean).join(' · ');
   return {
-    files: (fs) => fs.filter((f) => under(f.kind === 'image' ? images : docs, f.path)),
+    files: (fs: ProjectFile[]) => fs.filter((f) => under(f.kind === 'image' ? images : docs, f.path)),
     label,
   };
 }
@@ -935,9 +1180,9 @@ function pinView() {
 // with the > already typed). It opens with no folder too now, saying
 // plainly that file search has nothing to find there — because > still
 // has everything to offer.
-async function quickOpen(seed) {
+async function quickOpen(seed?: string) {
   const has = tree.has();
-  const pin = has ? pinView() : { files: (fs) => fs, label: '' };
+  const pin = has ? pinView() : { files: (fs: ProjectFile[]) => fs, label: '' };
   // fresh each open: the menu is the registry, and its enabled/checked
   // states are the moment's
   const commands = await tiny.api.call('commands').catch(() => null);
@@ -945,7 +1190,7 @@ async function quickOpen(seed) {
     // pictures open too now — they get a viewer instead of an editor; with
     // Show All Files on, the rest are searchable too and open system-side
     files: has
-      ? pin.files(tree.files().filter((f) => f.kind !== 'other' || prefs.allFiles))
+      ? pin.files(tree.files().filter((f: ProjectFile) => f.kind !== 'other' || prefs.allFiles))
       : [],
     heads: has ? tree.heads() : null,
     commands,
@@ -958,11 +1203,11 @@ async function quickOpen(seed) {
       ? (pin.label ? pin.label + ' · ' : '')
         + 'spaces match anywhere · ⇥ headings · > commands · ⏎ to open · esc to dismiss'
       : 'No folder is open — > lists every command',
-    pick: (f) => {
+    pick: (f: PaletteEntry) => {
       // a command runs like the menu click it stands for: this window's
       // half here, the backend's half through runCommand — both, exactly
       // as a real click fires both
-      if (f.cmd) { menuAct(f.cmd.id); tiny.api.call('runCommand', { id: f.cmd.id }); return; }
+      if (f.cmd) { menuAct(f.cmd.id!); tiny.api.call('runCommand', { id: f.cmd.id }); return; }
       // a heading lands ON the heading, the way a search hit does
       if (f.head) {
         tiny.api.call('openAt', {
@@ -971,7 +1216,7 @@ async function quickOpen(seed) {
       }
       if (f.path === path) return;
       if (f.kind === 'other') {
-        tiny.api.call('openLink', { href: f.path }).then((r) => { if (r && r.note) toast(r.note); });
+        tiny.api.call('openLink', { href: f.path }).then((r: { note?: string } | null) => { if (r && r.note) toast(r.note); });
         return;
       }
       tiny.api.call('openPaths', { paths: [f.path] });
@@ -983,9 +1228,9 @@ async function quickOpen(seed) {
 
 let outlineOn = !!boot.outline;
 const outlineBox = $('outlineInner');
-let olinks = [];
+let olinks: { link: HTMLElement; el: HTMLElement }[] = [];
 
-function setOutline(on, persist) {
+function setOutline(on: boolean, persist?: boolean) {
   outlineOn = on;
   document.body.toggleAttribute('data-outline', on);
   document.body.style.setProperty('--outw', on ? paneW.outline + 'px' : '0px');
@@ -1000,7 +1245,7 @@ $('btnOutline').onclick = () => setOutline(!outlineOn, true);
 // can move the preview and the editor's caret together.
 function buildOutline() {
   const keepScroll = outlineBox.scrollTop;
-  const heads = [...preview.querySelectorAll('h1, h2, h3, h4, h5, h6')];
+  const heads = [...preview.querySelectorAll<HTMLElement>('h1, h2, h3, h4, h5, h6')];
   outlineBox.textContent = '';
   olinks = [];
 
@@ -1027,8 +1272,8 @@ function buildOutline() {
       link.draggable = true;
       link.ondragstart = (e) => {
         dragHead = olinks.findIndex((o) => o.link === link);
-        e.dataTransfer.setData('text/plain', el.textContent);
-        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer!.setData('text/plain', el.textContent!);
+        e.dataTransfer!.effectAllowed = 'move';
         link.classList.add('drag');
       };
       link.ondragend = () => { dragHead = null; link.classList.remove('drag'); clearDrop(); };
@@ -1040,12 +1285,12 @@ function buildOutline() {
   markOutline();
 }
 
-function gotoHeading(el) {
+function gotoHeading(el: HTMLElement) {
   peer.reveal(el);                                 // it may be inside a tab
   lockSync(400);                                   // don't let scroll-sync fight us
   previewPane.scrollTop += el.getBoundingClientRect().top
     - previewPane.getBoundingClientRect().top - 8;
-  const ln = +el.dataset.line;
+  const ln = +el.dataset.line!;
   if (!isNaN(ln)) {
     const lines = ed.value.split('\n');
     const at = lines.slice(0, ln).reduce((n, l) => n + l.length + 1, 0);
@@ -1084,17 +1329,17 @@ previewPane.addEventListener('scroll', markOutline);
 // rest of the file is untouched and ⌘Z takes it back in one step.
 
 const sourceLines = () => !isAdoc() && !isJson() && kind === 'doc';
-const movable = (el) => sourceLines() && el.parentNode === preview && el.dataset.line != null;
-const lineOf = (el) => +el.dataset.line;
-let dragHead = null;                     // index into olinks while dragging
+const movable = (el: HTMLElement) => sourceLines() && el.parentNode === preview && el.dataset.line != null;
+const lineOf = (el: HTMLElement) => +el.dataset.line!;
+let dragHead: number | null = null;                     // index into olinks while dragging
 
 function clearDrop() {
   for (const { link } of olinks) link.classList.remove('dropbefore', 'dropafter');
 }
 
 // the outline slot under the pointer: before entry j (j may be the length)
-function dropSlot(e) {
-  const link = e.target.closest && e.target.closest('.olink');
+function dropSlot(e: DragEvent) {
+  const link = (e.target as Element).closest && (e.target as Element).closest('.olink');
   if (!link) return olinks.length;
   const j = olinks.findIndex((o) => o.link === link);
   const r = link.getBoundingClientRect();
@@ -1102,12 +1347,12 @@ function dropSlot(e) {
 }
 
 // a slot as a source line: the first movable heading at or after it
-function slotLine(j) {
+function slotLine(j: number) {
   for (let k = j; k < olinks.length; k++) if (movable(olinks[k].el)) return lineOf(olinks[k].el);
   return Infinity;
 }
 
-function sectionOf(k) {
+function sectionOf(k: number) {
   const el = olinks[k].el, level = +el.tagName[1];
   for (let n = k + 1; n < olinks.length; n++) {
     const o = olinks[n].el;
@@ -1119,14 +1364,14 @@ function sectionOf(k) {
 outlineBox.addEventListener('dragover', (e) => {
   if (dragHead == null) return;
   e.preventDefault();
-  e.dataTransfer.dropEffect = 'move';
+  e.dataTransfer!.dropEffect = 'move';
   clearDrop();
   const j = dropSlot(e);
   if (j < olinks.length) olinks[j].link.classList.add('dropbefore');
   else if (olinks.length) olinks[olinks.length - 1].link.classList.add('dropafter');
 });
 outlineBox.addEventListener('dragleave', (e) => {
-  if (!outlineBox.contains(e.relatedTarget)) clearDrop();
+  if (!outlineBox.contains(e.relatedTarget as Node | null)) clearDrop();
 });
 outlineBox.addEventListener('drop', (e) => {
   if (dragHead == null) return;
@@ -1145,13 +1390,13 @@ outlineBox.addEventListener('drop', (e) => {
   const [a, b] = sectionOf(k);
   const line = moveSource(a, b, slotLine(j));
   if (line == null) return;
-  const head = [...preview.children].find((el) => el.dataset.line == line);
+  const head = ([...preview.children] as HTMLElement[]).find((el) => (el.dataset.line as unknown) == line);
   if (head) gotoHeading(head);
 });
 
 // Rewrite the buffer with lines [a, b) moved before line t — its own undo
 // step — and re-render. → the line the run now starts on, or null.
-function moveSource(a, b, t) {
+function moveSource(a: number, b: number, t: number) {
   const r = nibMoveLines(ed.value, a, b, t);
   if (!r) return null;
   rewriteSource(r.text, r.line);
@@ -1160,7 +1405,7 @@ function moveSource(a, b, t) {
 
 // a structural rewrite of the whole buffer — its own undo step, the
 // editor's caret parked at the start of `line`, the preview re-rendered
-function rewriteSource(text, line) {
+function rewriteSource(text: string, line: number) {
   history.record(ed.value, true);
   ed.value = text;
   history.record(ed.value, true);
@@ -1170,7 +1415,7 @@ function rewriteSource(text, line) {
   render();
   setDirty();
   updateStatus();
-  clearTimeout(syncTimer);
+  clearTimeout(syncTimer!);
   syncTimer = setTimeout(syncNow, 400);
 }
 
@@ -1179,9 +1424,9 @@ function rewriteSource(text, line) {
 // position among the preview's top-level tables, because flushing a
 // pending Live edit re-renders and every element is new.
 // → { table: the re-rendered table, cell: [row, col] } or null
-function editTable(tableEl, mutate) {
+function editTable(tableEl: HTMLTableElement, mutate: (m: TableModel) => TableCell | null): TableEditResult | null {
   if (!sourceLines()) return null;
-  const tops = () => [...preview.children].filter((el) =>
+  const tops = () => ([...preview.children] as HTMLElement[]).filter((el) =>
     el.tagName === 'TABLE' && el.dataset.line != null);
   const idx = tops().indexOf(tableEl);
   if (idx < 0) return null;
@@ -1203,7 +1448,7 @@ function editTable(tableEl, mutate) {
     rewriteSource(lines.join('\n'), m.start);
     // the caret goes to the start of whatever took its place — or the
     // end of what came before, if the table was the last thing
-    const after = [...preview.children].find((el) =>
+    const after = ([...preview.children] as HTMLElement[]).find((el) =>
       el.dataset.line != null && +el.dataset.line >= m.start && !el.classList.contains('fm'));
     const target = after || preview.lastElementChild;
     preview.focus();
@@ -1211,14 +1456,14 @@ function editTable(tableEl, mutate) {
       const r = document.createRange();
       r.selectNodeContents(target);
       r.collapse(!!after);
-      const s = getSelection();
+      const s = getSelection()!;
       s.removeAllRanges();
       s.addRange(r);
     }
     return { table: null, cell };
   }
   rewriteSource(lines.join('\n'), m.start);
-  return { table: tops()[idx], cell };
+  return { table: tops()[idx] as HTMLTableElement, cell };
 }
 setupTableGrips({ preview, editing: () => editing(), edit: editTable });
 
@@ -1232,9 +1477,9 @@ preview.addEventListener('keydown', (e) => {
   if (!sel || !sel.rangeCount) return;
   let blk = sel.anchorNode;
   while (blk && blk.parentNode !== preview) blk = blk.parentNode;
-  const tops = () => [...preview.children].filter((el) =>
+  const tops = () => ([...preview.children] as HTMLElement[]).filter((el) =>
     el.dataset.line != null && !el.classList.contains('fm'));
-  const i = tops().indexOf(blk);
+  const i = tops().indexOf(blk as HTMLElement);
   if (i < 0) return;
   e.preventDefault();
   const up = e.key === 'ArrowUp';
@@ -1243,13 +1488,13 @@ preview.addEventListener('keydown', (e) => {
   // where the caret sits, as text offset into the block — the DOM is
   // about to be rebuilt, so nothing else would survive
   const pre = document.createRange();
-  pre.selectNodeContents(blk);
-  pre.setEnd(sel.anchorNode, sel.anchorOffset);
+  pre.selectNodeContents(blk!);
+  pre.setEnd(sel.anchorNode!, sel.anchorOffset);
   const off = pre.toString().length;
   const was = ed.value;
   flushLive();
   if (ed.value !== was) { render(); list = tops(); }
-  const end = (n) => (list[n] ? lineOf(list[n]) : Infinity);
+  const end = (n: number) => (list[n] ? lineOf(list[n]) : Infinity);
   // moving down is the next block moving up past this one
   const k = up ? i : i + 1;
   if (moveSource(lineOf(list[k]), end(k + 1), lineOf(list[k - 1])) == null) return;
@@ -1257,15 +1502,15 @@ preview.addEventListener('keydown', (e) => {
   if (!now) return;
   preview.focus();
   const walk = document.createTreeWalker(now, NodeFilter.SHOW_TEXT);
-  let n, seen = 0, last = null;
+  let n: Node | null, seen = 0, last: Node | null = null;
   while ((n = walk.nextNode())) {
     last = n;
-    if (seen + n.nodeValue.length >= off) break;
-    seen += n.nodeValue.length;
+    if (seen + n.nodeValue!.length >= off) break;
+    seen += n.nodeValue!.length;
   }
   const r = document.createRange();
   if (n) r.setStart(n, off - seen);
-  else if (last) r.setStart(last, last.nodeValue.length);
+  else if (last) r.setStart(last, last.nodeValue!.length);
   else r.setStart(now, 0);
   sel.removeAllRanges();
   sel.addRange(r);
@@ -1283,14 +1528,14 @@ preview.addEventListener('keydown', (e) => {
 // so a document without a formula or diagram never pays for them. Results
 // cache by source text: the keystroke-by-keystroke re-renders reuse them.
 
-const loadScript = (src) => new Promise((res) => {
+const loadScript = (src: string) => new Promise<boolean>((res) => {
   const s = document.createElement('script');
   s.src = src;
   s.onload = () => res(true);
   s.onerror = () => res(false);
   document.head.appendChild(s);
 });
-let temmlP = null;
+let temmlP: Promise<boolean> | null = null;
 const loadTemml = () => (temmlP ||= (() => {
   const l = document.createElement('link');
   l.rel = 'stylesheet';
@@ -1298,9 +1543,9 @@ const loadTemml = () => (temmlP ||= (() => {
   document.head.appendChild(l);
   return loadScript('vendor/temml.min.js');
 })());
-let mermaidP = null;
+let mermaidP: Promise<boolean> | null = null;
 const loadMermaid = () => (mermaidP ||= loadScript('vendor/mermaid.min.js'));
-let emojiP = null;
+let emojiP: Promise<boolean> | null = null;
 const loadEmojiCodes = () => (emojiP ||= loadScript('vendor/emoji-github.js').then((ok) => {
   if (ok && window.EMOJI_CODES_GITHUB) {
     // the preset is authoritative; the keyword map fills its gaps
@@ -1309,9 +1554,9 @@ const loadEmojiCodes = () => (emojiP ||= loadScript('vendor/emoji-github.js').th
   return ok;
 }));
 
-const mathCache = new Map();           // 'B|I' + tex  -> MathML
-const mmCache = new Map();             // diagram text -> SVG
-let mmThemeKey = null;                 // cache dies when the theme changes
+const mathCache = new Map<string, string>();           // 'B|I' + tex  -> MathML
+const mmCache = new Map<string, string>();             // diagram text -> SVG
+let mmThemeKey: string | null = null;                 // cache dies when the theme changes
 let mmSeq = 0;
 let decorateGen = 0;
 
@@ -1319,9 +1564,9 @@ let decorateGen = 0;
 // to — so Paper gets ink-on-paper diagrams and Night gets night ones.
 function mermaidVars() {
   const st = getComputedStyle(preview);
-  const num = (c) => (String(c).match(/[\d.]+/g) || [0, 0, 0]).slice(0, 3).map(Number);
+  const num = (c: string) => (String(c).match(/[\d.]+/g) || [0, 0, 0]).slice(0, 3).map(Number);
   const F = num(st.color), B = num(paperBg());
-  const mix = (k) => 'rgb(' + B.map((v, i2) => Math.round(v + (F[i2] - v) * k)).join(',') + ')';
+  const mix = (k: number) => 'rgb(' + B.map((v, i2) => Math.round(v + (F[i2] - v) * k)).join(',') + ')';
   return {
     background: 'rgb(' + B.join(',') + ')',
     primaryColor: mix(0.08), primaryTextColor: st.color, primaryBorderColor: mix(0.45),
@@ -1341,7 +1586,7 @@ async function decorate() {
     loadEmojiCodes().then((ok) => { if (ok && gen === decorateGen) render(); });
   }
 
-  const maths = [...preview.querySelectorAll('.math')];
+  const maths = [...preview.querySelectorAll<HTMLElement>('.math')];
   if (maths.length && prefs.math) {
     if (!window.temml) await loadTemml();
     if (gen !== decorateGen) return;
@@ -1350,7 +1595,7 @@ async function decorate() {
       const tex = el.dataset.text || '';
       const block = el.classList.contains('mblock');
       const key = (block ? 'B' : 'I') + '\u0000' + tex;
-      let html = mathCache.get(key);
+      let html: string | null | undefined = mathCache.get(key);
       if (html == null && window.temml) {
         try { html = window.temml.renderToString(tex, { displayMode: block }); }
         catch { html = null; }
@@ -1364,11 +1609,11 @@ async function decorate() {
   // ::: embed islands — the backend answers (and caches) the oEmbed
   // lookup; the page builds its own element around the answer. DOM built
   // by hand, never innerHTML: title and author are the provider's text.
-  const embeds = [...preview.querySelectorAll('.oemb:not(.oemb-done)')];
+  const embeds = [...preview.querySelectorAll<HTMLElement>('.oemb:not(.oemb-done)')];
   if (embeds.length && prefs.embed) {
     for (const el of embeds) {
       const url = el.dataset.url || '';
-      const r = await tiny.api.call('oembedGet', { url });
+      const r = await tiny.api.call('oembedGet', { url }) as OEmbed | null;
       if (gen !== decorateGen) return;
       if (!el.isConnected) continue;
       el.classList.add('oemb-done');
@@ -1408,7 +1653,7 @@ async function decorate() {
         const a = document.createElement('a');
         a.className = 'oemb-card';
         a.href = url;
-        const line = (cls, text) => {
+        const line = (cls: string, text?: string) => {
           if (!text) return;
           const d = document.createElement('div');
           d.className = cls;
@@ -1426,7 +1671,7 @@ async function decorate() {
     }
   }
 
-  const mms = [...preview.querySelectorAll('.mm')];
+  const mms = [...preview.querySelectorAll<HTMLElement>('.mm')];
   if (mms.length && prefs.mermaid) {
     if (!window.mermaid) await loadMermaid();
     if (gen !== decorateGen || !window.mermaid) return;
@@ -1442,7 +1687,7 @@ async function decorate() {
     for (const el of mms) {
       if (!el.isConnected) continue;
       const text = el.dataset.text || '';
-      let svg = mmCache.get(text);
+      let svg: string | null | undefined = mmCache.get(text);
       if (svg == null) {
         try {
           ({ svg } = await window.mermaid.render('mmsvg' + (++mmSeq), text));
@@ -1457,11 +1702,11 @@ async function decorate() {
   }
 }
 
-let renderTimer = null;
+let renderTimer: ReturnType<typeof setTimeout> | null = null;
 const edBack = $('edBack');
 // what the renderer needs to know each time — restamp MUST pass the same
 // set, or its shape comparison is against a different document
-const mdOpts = () => ({
+const mdOpts = (): RenderMarkdownOptions => ({
   hrBreaks: prefs.hrBreaks, alerts: prefs.alerts, emojiCodes: prefs.emojiCodes,
   footnotes: prefs.footnotes, math: prefs.math, mermaid: prefs.mermaid,
   carousel: prefs.carousel, download: prefs.download, embed: prefs.embed,
@@ -1497,19 +1742,19 @@ function paintSource() {
 }
 const scheduleRender = () => {
   if (inPreview()) return;             // the preview IS the editor right now
-  clearTimeout(renderTimer);
+  clearTimeout(renderTimer!);
   renderTimer = setTimeout(render, 90);
 };
 
 // Relative images resolve through the backend into data: URIs — the page
 // never touches file:// itself. Cached per path, one flight each.
 function inlineImages() {
-  for (const img of preview.querySelectorAll('img[data-src]')) {
-    const src = img.dataset.src;
+  for (const img of preview.querySelectorAll<HTMLImageElement>('img[data-src]')) {
+    const src = img.dataset.src!;
     if (!imgCache.has(src)) {
-      imgCache.set(src, tiny.api.call('imageData', { src, dir: docDir }).then((r) => r && r.data));
+      imgCache.set(src, tiny.api.call('imageData', { src, dir: docDir }).then((r: { data?: string } | null) => r && r.data));
     }
-    imgCache.get(src).then((data) => {
+    imgCache.get(src)!.then((data) => {
       if (data) img.src = data;
       else img.classList.add('missing');
     });
@@ -1532,7 +1777,7 @@ function inlineImages() {
 // caret. Holding ⌥ marks the links so you can see that it will.
 
 // A target as written in the document → what to do with it.
-async function followTarget(raw) {
+async function followTarget(raw: string | null | undefined) {
   const href = String(raw || '').trim();
   if (!href) return;
   if (href.startsWith('#')) {
@@ -1548,14 +1793,14 @@ async function followTarget(raw) {
   // Resolution belongs to the backend: only it knows the project, and what
   // that project says a leading `/` means (Format ▸ Image & Path Settings…).
   // The #fragment goes along — once the file is up, it scrolls to it.
-  const r = await tiny.api.call('openLink', { href: rel, dir: docDir, frag: frag || null });
+  const r = await tiny.api.call('openLink', { href: rel, dir: docDir, frag: frag || null }) as { missing?: boolean; error?: string; note?: string } | null;
   if (r && r.missing) toast('Not found: ' + baseName(rel));
   else if (r && r.error) toast(r.error);
   else if (r && r.note) toast(r.note);   // shown in Finder, not run — say so
 }
 
 preview.addEventListener('click', (e) => {
-  const a = e.target.closest('a');
+  const a = (e.target as Element).closest<HTMLAnchorElement>('a');
   if (!a) return;
   const href = a.getAttribute('href') || '';
   // A fragment navigation on this page is never what a click means: WebKit
@@ -1590,14 +1835,14 @@ addEventListener('scroll', () => {
 // autolink, bare url, reference definition
 const SOURCE_LINK = /!?\[(?:[^\][\\\n]|\\.)*\]\(\s*(?:<([^<>\n]*)>|([^()\s]*))[^)\n]*\)|<((?:https?|mailto):[^>\s]+)>|(?:^|\s)((?:https?:)\/\/[^\s<>)"']+)|^[ ]{0,3}\[[^\]\n]+\]:[ \t]*(?:<([^<>\n]*)>|(\S+))/g;
 
-function linkAt(text, at) {
+function linkAt(text: string, at: number) {
   const from = text.lastIndexOf('\n', at - 1) + 1;
   let to = text.indexOf('\n', at);
   if (to < 0) to = text.length;
   const line = text.slice(from, to);
   const col = at - from;
   SOURCE_LINK.lastIndex = 0;
-  let m;
+  let m: RegExpExecArray | null;
   while ((m = SOURCE_LINK.exec(line))) {
     const start = m.index + (m[0].length - m[0].trimStart().length);
     if (col >= start && col <= m.index + m[0].length) {
@@ -1615,8 +1860,8 @@ function linkAt(text, at) {
 //
 // Rows are binary-searched by their rectangle rather than walked, because a
 // long document has thousands of them and this runs on mousemove.
-function rowAtY(y) {
-  const rows = edBack.children;
+function rowAtY(y: number) {
+  const rows = edBack.children as HTMLCollectionOf<HTMLElement>;
   let lo = 0, hi = rows.length - 1;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
@@ -1628,10 +1873,10 @@ function rowAtY(y) {
   return null;
 }
 
-function linkSpanAt(x, y) {
+function linkSpanAt(x: number, y: number) {
   const row = rowAtY(y);
   if (!row) return null;
-  for (const a of row.querySelectorAll('.tk-a')) {
+  for (const a of row.querySelectorAll<HTMLElement>('.tk-a')) {
     for (const r of a.getClientRects()) {
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return a;
     }
@@ -1641,7 +1886,7 @@ function linkSpanAt(x, y) {
 
 // the pointer's last known place, so ⌥ pressed over a link it is already
 // sitting on lights up without waiting for the mouse to move
-let mouseAt = null;
+let mouseAt: { x: number; y: number } | null = null;
 function paintAltCursor() {
   const on = document.body.classList.contains('alt') && mouseAt
     && !!linkSpanAt(mouseAt.x, mouseAt.y);
@@ -1666,7 +1911,7 @@ ed.addEventListener('click', (e) => {
 // ⌥ down: show the links as links. Only a hint, but without it nobody finds
 // the modifier — and the class comes straight off again on keyup or blur, so
 // a window that lost focus mid-chord isn't left looking clickable.
-function setAlt(on) {
+function setAlt(on: boolean) {
   document.body.classList.toggle('alt', !!on);
   if (!on) ed.classList.remove('linkish');
   else paintAltCursor();
@@ -1680,16 +1925,16 @@ addEventListener('blur', () => setAlt(false));
 // document that repeats the same set doesn't have to be re-picked block by
 // block. Matching is by the label's own text, which is the only thing two
 // separate ::: tabs blocks have in common.
-function relinkTabs(radio) {
+function relinkTabs(radio: HTMLInputElement) {
   if (!prefs.linkTabs || !radio || !radio.id) return;
   const own = preview.querySelector(`label[for="${CSS.escape(radio.id)}"]`);
   const title = own && own.textContent.trim().toLowerCase();
   if (!title) return;
   for (const group of preview.querySelectorAll('.tabs')) {
     if (group.contains(radio)) continue;
-    for (const label of group.querySelectorAll(':scope > label')) {
+    for (const label of group.querySelectorAll<HTMLLabelElement>(':scope > label')) {
       if (label.textContent.trim().toLowerCase() !== title) continue;
-      const twin = label.htmlFor && document.getElementById(label.htmlFor);
+      const twin = label.htmlFor && document.getElementById(label.htmlFor) as HTMLInputElement | null;
       if (twin && !twin.checked) twin.checked = true;
       break;
     }
@@ -1699,13 +1944,13 @@ function relinkTabs(radio) {
 
 // task boxes are live: ticking one edits the matching source line
 preview.addEventListener('change', (e) => {
-  const radio = e.target.closest('input[type="radio"]');
+  const radio = (e.target as Element).closest<HTMLInputElement>('input[type="radio"]');
   if (radio) { relinkTabs(radio); return; }         // a tab was switched
   if (editing()) { queueSerialize(); return; }      // the box IS the source
-  const box = e.target.closest('input[data-line]');
+  const box = (e.target as Element).closest<HTMLInputElement>('input[data-line]');
   if (!box) return;
   const lines = ed.value.split('\n');
-  const ln = +box.dataset.line;
+  const ln = +box.dataset.line!;
   if (lines[ln] != null) {
     lines[ln] = lines[ln].replace(/\[( |x|X)\]/, box.checked ? '[x]' : '[ ]');
     ed.value = lines.join('\n');
@@ -1726,14 +1971,14 @@ const peer = createPeerSync({
 });
 
 let syncLock = 0;
-const lockSync = (ms) => { syncLock = Date.now() + ms; };
+const lockSync = (ms: number) => { syncLock = Date.now() + ms; };
 const locked = () => Date.now() < syncLock;
 
 // Whoever holds the caret drives — but a real selection in the preview wins
 // outright, because dragging over a plain (non-editable) preview doesn't
 // move focus off the textarea, and the editor would otherwise keep
 // insisting it's in charge.
-function pairCursors(scrollIntoView) {
+function pairCursors(scrollIntoView?: boolean) {
   const sel = window.getSelection();
   const inPv = sel && sel.rangeCount && preview.contains(sel.anchorNode);
   if (inPv && !sel.isCollapsed) { peer.fromPreview({ moveCaret: true }); return; }
@@ -1752,7 +1997,7 @@ function pairCursors(scrollIntoView) {
 // Put a source offset on screen in the editor pane. The textarea only
 // scrolls itself when it has focus, and while you're typing in the find
 // field it hasn't — so it's done by hand, off the backdrop's rows.
-function scrollSource(off) {
+function scrollSource(off: number) {
   const top = peer.rowTop(peer.lineOf(off));
   if (top == null) return;
   const y = top - ed.scrollTop;
@@ -1761,7 +2006,7 @@ function scrollSource(off) {
   edBack.scrollTop = ed.scrollTop;
 }
 
-const offsetOf = (line, col) => {
+const offsetOf = (line: number, col?: number) => {
   let i = 0;
   for (let k = 0; k < line; k++) {
     const nl = ed.value.indexOf('\n', i);
@@ -1775,7 +2020,7 @@ find = setupFindBar({
   bar: $('findbar'), ed, peer,
   scrollTo: scrollSource,
   onEdit: onInput,
-  onFolder: (query, opts) => openSearch({ query, opts }),
+  onFolder: (query: string, opts: FindOptions) => openSearch({ query, opts }),
 });
 
 // ⌘F with something selected looks for it, the way every editor does — but
@@ -1791,13 +2036,13 @@ const search = setupSearchPanel({
   panel: $('searchInner'),
   // a result opens the way a tree click does: one click previews it, a
   // double-click keeps it — and either way it lands ON the match
-  onOpen: (hit, { preview: pv }) => tiny.api.call('openAt', {
+  onOpen: (hit: FindHit & { path: string }, { preview: pv }: { preview: boolean }) => tiny.api.call('openAt', {
     path: hit.path, line: hit.line, col: hit.col, len: hit.len, preview: pv }),
   onClose: () => showSearch(false),
 });
 $('sfBack').onclick = () => showSearch(false);
 
-function showSearch(on) {
+function showSearch(on: boolean) {
   $('filesInner').hidden = !!on;
   $('searchInner').hidden = !on;
   if (on) $('changesInner').hidden = $('linksInner').hidden = $('menuInner').hidden = true;   // one face at a time
@@ -1807,7 +2052,7 @@ function showSearch(on) {
 }
 
 // ⌘⇧F, or "In Folder" in the bar: the same query, one scale up.
-function openSearch({ query, opts } = {}) {
+function openSearch({ query, opts }: { query?: string | null; opts?: FindOptions } = {}) {
   if (!tree.has()) { toast('Open a folder to search in it.'); return; }
   const seed = query != null ? query
     : (ed.selectionEnd > ed.selectionStart && !/\n/.test(ed.value.slice(ed.selectionStart, ed.selectionEnd))
@@ -1826,8 +2071,8 @@ function openSearch({ query, opts } = {}) {
 // no git, no button, no feature). A click opens the side-by-side window.
 
 let gitRepo = false;
-let gitRoot = null;                    // which folder the answer is about
-function probeGit(root) {
+let gitRoot: string | null = null;                    // which folder the answer is about
+function probeGit(root: string | null | undefined) {
   if (!root) { gitRepo = false; gitRoot = null; return; }
   if (root === gitRoot) return;
   gitRoot = root;
@@ -1838,7 +2083,7 @@ function probeGit(root) {
   });
 }
 
-function showChanges(on) {
+function showChanges(on: boolean) {
   $('filesInner').hidden = !!on;
   $('changesInner').hidden = !on;
   if (on) $('searchInner').hidden = $('linksInner').hidden = $('menuInner').hidden = true;    // one face at a time
@@ -1848,7 +2093,7 @@ function showChanges(on) {
 }
 
 async function refreshChanges() {
-  const r = await tiny.api.call('gitChanges', {});
+  const r = await tiny.api.call('gitChanges', {}) as GitChanges | null;
   gitRepo = !!(r && r.repo);
   const list = $('chList'), note = $('chNote');
   list.textContent = '';
@@ -1895,7 +2140,7 @@ $('stProject').onclick = () => { showChanges(false); showMenu(false); };
 // wherever the site keeps them (menus.ts) and drawn by sitemenu.ts. Asked
 // again when the folder changes, on save and when the window comes back —
 // a menu file edited elsewhere, or in another tab, shows up on its own.
-function showMenu(on) {
+function showMenu(on: boolean) {
   $('filesInner').hidden = !!on;
   $('menuInner').hidden = !on;
   if (on) $('searchInner').hidden = $('linksInner').hidden = $('changesInner').hidden = true;  // one face at a time
@@ -1923,14 +2168,14 @@ const diffView = setupDiffView({
 
 // A search hit arrives as a push right after the document it's in — which
 // may still be loading, so it waits for the sheet it belongs to.
-function applyGoto({ line, col, len }) {
+function applyGoto({ line, col, len }: GotoPush) {
   const off = offsetOf(line, col);
   ed.setSelectionRange(off, off + (len || 0));
   scrollSource(off);
   peer.fromEditor({ scrollIntoView: true });
   if (kind === 'doc' && !editing()) ed.focus();
 }
-tiny.api.on('goto', (g) => {
+tiny.api.on('goto', (g: GotoPush) => {
   if (g.path && g.path !== path) { pendingGoto = g; return; }
   applyGoto(g);
 });
@@ -1939,12 +2184,12 @@ tiny.api.on('goto', (g) => {
 // the @-palette, or clicked in another document. The heading may not be
 // rendered yet (a fresh sheet paints just after it shows), so one late
 // retry covers the gap; a slug that never matches simply stays put.
-function applyAnchor({ frag }, retried) {
-  const el = preview.querySelector('[id="' + CSS.escape(frag) + '"]');
+function applyAnchor({ frag }: AnchorPush, retried?: boolean) {
+  const el = preview.querySelector<HTMLElement>('[id="' + CSS.escape(frag) + '"]');
   if (el) { gotoHeading(el); return; }
   if (!retried) setTimeout(() => applyAnchor({ frag }, true), 350);
 }
-tiny.api.on('goto-anchor', (g) => {
+tiny.api.on('goto-anchor', (g: AnchorPush) => {
   if (g.path && g.path !== path) { pendingAnchor = g; return; }
   applyAnchor(g);
 });
@@ -1970,12 +2215,12 @@ tiny.api.on('sheet-text', ({ id, text, saved }) => {
   updateStatus();
   ed.scrollTop = top;
   edBack.scrollTop = top;
-  find.refresh();
+  find!.refresh();
 });
 
 // ------------------------------------------------------- dirty & syncing
 
-let syncTimer = null;
+let syncTimer: ReturnType<typeof setTimeout> | null = null;
 function setDirty() {
   dirty = kind === 'doc' && ed.value !== savedText;
   // A changed document is never a disposable tab. Hanging promotion off the
@@ -1996,7 +2241,7 @@ function onInput() {
   scheduleRender();
   setDirty();
   updateStatus();
-  clearTimeout(syncTimer);
+  clearTimeout(syncTimer!);
   syncTimer = setTimeout(syncNow, 400);
 }
 ed.addEventListener('input', onInput);
@@ -2010,7 +2255,7 @@ ed.addEventListener('input', onInput);
 // pane, Replace All, a ticked checkbox — without each having to say so.
 setInterval(() => { if (kind === 'doc') history.record(ed.value); }, 1000);
 
-function applyHistory(r) {
+function applyHistory(r: HistoryResult | null) {
   if (!r) return;
   const inPv = editing() && inPreview();
   ed.value = r.text;
@@ -2021,7 +2266,7 @@ function applyHistory(r) {
   render();                            // direct — scheduleRender defers to the preview
   setDirty();
   updateStatus();
-  clearTimeout(syncTimer);
+  clearTimeout(syncTimer!);
   syncTimer = setTimeout(syncNow, 400);
   // The caret lands where the edit happened (the diff knows), and the VIEW
   // follows it there — undoing an off-screen change that stays off-screen
@@ -2029,7 +2274,7 @@ function applyHistory(r) {
   const line = r.text.slice(0, r.caret).split('\n').length - 1;
   if (!inPv) {
     ed.focus();
-    const row = edBack.children[line];       // one div per source line (hl.ts)
+    const row = edBack.children[line] as HTMLElement | undefined;       // one div per source line (hl.ts)
     if (row) {
       ed.scrollTop = Math.max(0, row.offsetTop - ed.clientHeight * 0.4);
       edBack.scrollTop = ed.scrollTop;       // scroll-sync brings the preview along
@@ -2045,10 +2290,10 @@ function applyHistory(r) {
   // back highlighted; otherwise the caret is aimed by the text just after
   // it. When nothing matches — heavier markup, a change spanning blocks —
   // the old block-start landing stands.
-  let best = null;
-  for (const el of preview.querySelectorAll('[data-line]')) {
-    const l = +el.dataset.line;
-    if (l <= line && (!best || l >= +best.dataset.line)) best = el;
+  let best: HTMLElement | null = null;
+  for (const el of preview.querySelectorAll<HTMLElement>('[data-line]')) {
+    const l = +el.dataset.line!;
+    if (l <= line && (!best || l >= +best.dataset.line!)) best = el;
   }
   preview.focus();
   if (!best) return;
@@ -2056,21 +2301,21 @@ function applyHistory(r) {
 
   const hay = best.textContent;
   let blockAt = 0;                    // source offset where the block starts
-  for (let k = +best.dataset.line; k > 0; k--) {
+  for (let k = +best.dataset.line!; k > 0; k--) {
     const nl = r.text.indexOf('\n', blockAt);
     if (nl < 0) break;
     blockAt = nl + 1;
   }
-  const strip = (s) => s.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+  const strip = (s: string) => s.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
     .replace(/(\*\*|__|~~|[*_`])/g, '');
-  const near = (needle, want) => {
+  const near = (needle: string, want: number) => {
     let hit = -1;
     for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + 1)) {
       if (hit < 0 || Math.abs(i - want) < Math.abs(hit - want)) hit = i;
     }
     return hit;
   };
-  const spot = (needle, want) => {
+  const spot = (needle: string, want: number): [number, number] | null => {
     if (!needle) return null;
     let i = near(needle, want);
     if (i >= 0) return [i, i + needle.length];
@@ -2092,14 +2337,14 @@ function applyHistory(r) {
   const sel = window.getSelection();
   const rr = document.createRange();
   if (span) {
-    const point = (off) => {
-      const walk = document.createTreeWalker(best, NodeFilter.SHOW_TEXT);
-      let n, seen = 0;
+    const point = (off: number): [Node, number] => {
+      const walk = document.createTreeWalker(best!, NodeFilter.SHOW_TEXT);
+      let n: Node | null, seen = 0;
       while ((n = walk.nextNode())) {
-        if (seen + n.nodeValue.length >= off) return [n, off - seen];
-        seen += n.nodeValue.length;
+        if (seen + n.nodeValue!.length >= off) return [n, off - seen];
+        seen += n.nodeValue!.length;
       }
-      return n ? [n, n.nodeValue.length] : [best, 0];
+      return n ? [n, (n as Node).nodeValue!.length] : [best!, 0];
     };
     const [n1, o1] = point(span[0]), [n2, o2] = point(span[1]);
     rr.setStart(n1, o1);
@@ -2109,8 +2354,8 @@ function applyHistory(r) {
     rr.setStart(t || best, 0);
     rr.collapse(true);
   }
-  sel.removeAllRanges();
-  sel.addRange(rr);
+  sel!.removeAllRanges();
+  sel!.addRange(rr);
 }
 // flush only a PENDING Live edit before stepping — an unconditional
 // serialize would rewrite the buffer through unmd's normalization and
@@ -2125,12 +2370,12 @@ document.addEventListener('keydown', (e) => {
   const k = e.key.toLowerCase();
   if ((k !== 'z' && k !== 'y') || kind !== 'doc') return;
   const t = e.target;
-  if (t !== ed && t !== preview && t !== document.body && !preview.contains(t)) return;
+  if (t !== ed && t !== preview && t !== document.body && !preview.contains(t as Node | null)) return;
   e.preventDefault();
   if (k === 'y' || e.shiftKey) doRedo(); else doUndo();
 }, true);
 // the same two intents by any other route (Edit ▸ Undo arrives this way)
-const onHistIntent = (e) => {
+const onHistIntent = (e: InputEvent) => {
   if (e.inputType !== 'historyUndo' && e.inputType !== 'historyRedo') return;
   e.preventDefault();
   if (e.inputType === 'historyUndo') doUndo(); else doRedo();
@@ -2140,7 +2385,7 @@ preview.addEventListener('beforeinput', onHistIntent);
 
 window.addEventListener('blur', () => {
   flushLive();
-  clearTimeout(syncTimer);
+  clearTimeout(syncTimer!);
   syncNow();
 });
 
@@ -2163,9 +2408,9 @@ function updateStatus() {
   const col = ed.selectionStart - (upto.lastIndexOf('\n') + 1) + 1;
   $('caret').textContent = `Ln ${ln}, Col ${col}`;
 }
-let pairTimer = null;
+let pairTimer: ReturnType<typeof setTimeout> | null = null;
 const schedulePair = () => {
-  clearTimeout(pairTimer);
+  clearTimeout(pairTimer!);
   pairTimer = setTimeout(() => pairCursors(true), 40);
 };
 document.addEventListener('selectionchange', () => { updateStatus(); schedulePair(); });
@@ -2229,7 +2474,7 @@ async function jsonGate() {
 
 // The problem bar. One row per complaint, the bad ones in red; a row that
 // knows where it happened takes you there when you click it.
-function showProblems(list) {
+function showProblems(list: Problem[]) {
   const box = $('problemRows');
   box.textContent = '';
   for (const p of list) {
@@ -2238,7 +2483,7 @@ function showProblems(list) {
     row.textContent = (p.bad ? '✕ ' : '⚠ ') + p.text;
     if (p.line) {
       row.classList.add('jump');
-      row.onclick = () => goToLineCol(p.line, p.col || 1);
+      row.onclick = () => goToLineCol(p.line!, p.col || 1);
     }
     box.appendChild(row);
   }
@@ -2268,27 +2513,27 @@ function formatJsonNow() {
   toast('Formatted');
 }
 
-function goToLineCol(line, col) {
+function goToLineCol(line: number, col: number) {
   const lines = ed.value.split('\n');
   let at = 0;
   for (let i = 0; i < Math.min(line - 1, lines.length); i++) at += lines[i].length + 1;
   at += Math.max(0, col - 1);
   ed.focus();
   ed.setSelectionRange(at, at);
-  const row = edBack.children[line - 1];
+  const row = edBack.children[line - 1] as HTMLElement | undefined;
   if (row) ed.scrollTop = Math.max(0, row.offsetTop - ed.clientHeight * 0.4);
   updateStatus();
 }
 
-async function doSave(saveAs) {
+async function doSave(saveAs?: boolean) {
   flushLive();
   if (!(await jsonGate())) return false;
-  let pick = null;
+  let pick: string | null = null;
   if (saveAs || !path) {
     pick = await tiny.dialog.saveFile({ types: DOC_TYPES });
     if (!pick) return false;                       // user bailed
   }
-  const r = await tiny.api.call('saveDoc', { id: sheetId, text: ed.value, path: pick });
+  const r = await tiny.api.call('saveDoc', { id: sheetId, text: ed.value, path: pick }) as { ok: boolean; path: string; name: string; actionProblems?: string[] };
   if (!r.ok) return false;
   // The backend re-read the actions file it just wrote; anything it couldn't
   // make sense of comes back as a warning. Valid JSON, wrong shape.
@@ -2318,18 +2563,18 @@ async function doExport() {
   if (!pick) return;
   render();                                        // make sure it's current
   await Promise.all([...imgCache.values()]);       // and images are inlined
-  const art = preview.cloneNode(true);
+  const art = preview.cloneNode(true) as HTMLElement;
   art.removeAttribute('contenteditable');
   art.classList.remove('zoom');                    // nothing to click out there
   for (const box of art.querySelectorAll('input')) {
     box.setAttribute('disabled', '');              // static in the export
     box.removeAttribute('data-line');
   }
-  const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  const esc = (s: string) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' } as Record<string, string>)[c]);
   const bg = paperBg();
   // the clone carries the reading preferences as classes; the page width is
   // the only one that isn't, so it's written into the wrapper's max-width
-  const pw = (PAGE_WIDTH[prefs.width] || PAGE_WIDTH.full)[1];
+  const pw = (PAGE_WIDTH[prefs.width as keyof typeof PAGE_WIDTH] || PAGE_WIDTH.full)[1];
   // Tabs are pure CSS and stay that way; linking them is the one thing that
   // can't be, so an export made with Link Tabs on carries this and nothing
   // else. Off, the file has no script at all.
@@ -2357,7 +2602,7 @@ document.addEventListener('change', (e) => {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(name.replace(/\.(md|markdown|mdown|mkdn|mkd|mdwn|mdtxt|mdtext|mdx|qmd|rmd|mdc|markdoc|mdoc|adoc|asciidoc)$/i, ''))}</title>
 <style>body{margin:0;background:${bg};}main{max-width:${pw === 'none' ? '100%' : pw};margin:0 auto;padding:48px 28px;}
-${MD_BASE_CSS}${THEMES[theme].css}</style>
+${MD_BASE_CSS}${THEMES[theme as keyof typeof THEMES].css}</style>
 </head><body><main class="${art.className}">
 ${art.innerHTML}
 </main>${linkScript}</body></html>
@@ -2383,7 +2628,7 @@ async function doPdf() {
   if (!/\.pdf$/i.test(pick)) pick += '.pdf';
   render();
   await Promise.all([...imgCache.values()]);
-  const sheet = $('printCss');
+  const sheet = $<HTMLStyleElement>('printCss');
   sheet.media = 'all';
   // a single-page capture can't honor page breaks, so keep their dotted
   // markers visible rather than losing them silently — see print.css.
@@ -2399,7 +2644,7 @@ async function doPdf() {
     tiny.api.call('announce', { path: r && r.path ? r.path : pick, title: 'Nib — saved PDF' });
     toast('Saved ' + named);
   } catch (e) {
-    tiny.dialog.alert('Couldn’t save the PDF', String((e && e.message) || e));
+    tiny.dialog.alert('Couldn’t save the PDF', String((e && (e as Error).message) || e));
   } finally {
     sheet.media = 'print';
     document.body.classList.remove('pdfcap');
@@ -2412,9 +2657,9 @@ async function doPdf() {
 // ⌘W closes a TAB (the last one takes the window with it). The red ✗ can't
 // be intercepted — the backend drafts every dirty tab after the fact — so
 // this path is the one that gets the civilised three buttons.
-let closing = null;                                // the tab being closed
+let closing: string | null = null;                                // the tab being closed
 
-async function closeTab(id) {
+async function closeTab(id?: string) {
   const target = id || sheetId;
   if (target !== sheetId) await showSheet(target); // ask about what you can see
   flushLive();
@@ -2426,11 +2671,11 @@ async function closeTab(id) {
   $('btnSave').focus();
 }
 
-async function finishClose(opts) {
+async function finishClose(opts: { discard?: boolean }) {
   const id = closing || sheetId;
   closing = null;
   $('shade').hidden = true;
-  const r = await tiny.api.call('closeSheet', { id, ...opts });
+  const r = await tiny.api.call('closeSheet', { id, ...opts }) as SheetClosed | null;
   if (r && r.closed) history.drop(id);             // its undo story ends here
   if (r && r.sheet) loadSheet(r.sheet);            // the neighbour takes over
 }
@@ -2460,7 +2705,7 @@ $('btnRevert').onclick = async () => {
     ok: 'Revert', cancel: 'Cancel',
   });
   if (!sure) return;
-  const r = await tiny.api.call('revert', { id: sheetId });
+  const r = await tiny.api.call('revert', { id: sheetId }) as { text: string };
   ed.value = r.text;
   savedText = r.text;
   hideBanner();
@@ -2473,7 +2718,7 @@ if (boot.sheet.restored) {
 
 // ------------------------------------------------------------ formatting
 
-function wrapSelection(mark, endMark) {
+function wrapSelection(mark: string, endMark?: string) {
   if (inPreview()) {                               // the DOM is the document
     if (mark === '==') { live.toggleHighlight(); return; }
     document.execCommand(mark === '**' ? 'bold' : mark === '*' ? 'italic'
@@ -2481,7 +2726,7 @@ function wrapSelection(mark, endMark) {
     if (mark === '`') {
       const sel = String(window.getSelection() || '') || 'code';
       document.execCommand('insertHTML', false,
-        '<code>' + sel.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])) + '</code>');
+        '<code>' + sel.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' } as Record<string, string>)[c]) + '</code>');
     }
     queueSerialize();
     return;
@@ -2537,7 +2782,7 @@ const URLISH = /^(?:[a-z][a-z0-9+.-]*:\/\/|mailto:)[^\s]+$/i;
 const BADLABEL = /[\n[\]]/;
 
 // is [a,b) inside the (…) of a `](…)` on its own line?
-function inLinkTarget(v, a, b) {
+function inLinkTarget(v: string, a: number, b: number) {
   const bol = v.lastIndexOf('\n', Math.max(0, a - 1)) + 1;
   const open = v.lastIndexOf('](', a);
   if (open < bol) return false;                          // no link opened above us
@@ -2546,7 +2791,7 @@ function inLinkTarget(v, a, b) {
   return v.slice(b, nl < 0 ? v.length : nl).includes(')');
 }
 
-function pasteAsLink(e) {
+function pasteAsLink(e: ClipboardEvent) {
   const url = String((e.clipboardData && e.clipboardData.getData('text/plain')) || '').trim();
   if (!url || !URLISH.test(url) || isJson()) return;
 
@@ -2567,8 +2812,8 @@ function pasteAsLink(e) {
   if (!isAdoc() && inLinkTarget(v, a, b)) return;
   // a double-click usually takes the space after the word with it: whatever
   // whitespace the selection is padded with stays OUTSIDE the brackets
-  const lead = sel.match(/^\s*/)[0];
-  const tail = sel.match(/\s*$/)[0];
+  const lead = sel.match(/^\s*/)![0];
+  const tail = sel.match(/\s*$/)![0];
   const label = sel.slice(lead.length, sel.length - tail.length);
   // an .adoc sheet gets AsciiDoc's own spelling — the bare form for the
   // schemes it autolinks, the link: macro for the rest (both round-trip
@@ -2586,10 +2831,10 @@ function pasteAsLink(e) {
 // answered, so the question can name what it found ("YouTube — Big Buck
 // Bunny") instead of guessing. Declining is remembered for the session;
 // a URL that answers nothing never interrupts at all.
-const embedDeclined = new Set();
-async function offerEmbed(url) {
+const embedDeclined = new Set<string>();
+async function offerEmbed(url: string) {
   if (!prefs.embed || isJson() || isAdoc() || embedDeclined.has(url)) return;
-  const r = await tiny.api.call('oembedGet', { url });
+  const r = await tiny.api.call('oembedGet', { url }) as OEmbed | null;
   if (!r || r.error) return;
   // the paste may still be on its way into the source (the preview
   // serializes on idle), and the document may have moved on — the offer
@@ -2623,7 +2868,7 @@ async function offerEmbed(url) {
 
 // A paste that IS a bare URL, onto a collapsed caret (a selection is
 // pasteAsLink's business): let it land as text, then make the offer.
-function maybeOfferEmbed(e) {
+function maybeOfferEmbed(e: ClipboardEvent) {
   const url = String((e.clipboardData && e.clipboardData.getData('text/plain')) || '').trim();
   if (!/^https?:\/\/\S+$/i.test(url)) return;
   const collapsed = inPreview()
@@ -2656,8 +2901,8 @@ function maybeOfferEmbed(e) {
 // The source pane takes the same answer — only 3 changes anything there,
 // since a textarea already pastes text/plain. ⌥⇧⌘V pastes plain, always.
 const TABLE_DELIM = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$/;
-const cellCount = (l) => l.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').length;
-function looksLikeMarkdown(t) {
+const cellCount = (l: string) => l.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').length;
+function looksLikeMarkdown(t: string) {
   const lines = t.split('\n');
   for (let i = 0; i + 1 < lines.length; i++) {
     const head = lines[i], delim = lines[i + 1];
@@ -2674,7 +2919,7 @@ function looksLikeMarkdown(t) {
   return false;
 }
 // the looser test, for text a code editor vouched for
-function looksLikeMarkdownLoosely(t) {
+function looksLikeMarkdownLoosely(t: string) {
   if (looksLikeMarkdown(t)) return true;
   const lines = t.split('\n');
   if (lines.some((l) => /^ {0,3}#{1,6} \S/.test(l))) return true;
@@ -2692,7 +2937,7 @@ const MEANS = 'h1,h2,h3,h4,h5,h6,p,ul,ol,li,table,blockquote,pre,hr,a[href],img,
 // span — so before unmd sees it: styling that means bold/italic/struck
 // becomes the element that says so, styling that unsays it unwraps, and
 // the rest (scripts, styles, form bits, data: pictures) goes.
-function tidyPasted(root) {
+function tidyPasted(root: HTMLElement) {
   for (const el of root.querySelectorAll('script,style,meta,link,title,noscript,template,'
     + 'iframe,object,embed,button,select,textarea,input:not([type=checkbox]),'
     + 'br.Apple-interchange-newline')) el.remove();
@@ -2700,24 +2945,24 @@ function tidyPasted(root) {
     if (!/^https?:/i.test(img.getAttribute('src') || '')) img.remove();
   }
   for (const a of root.querySelectorAll('a[href]')) {
-    if (/^\s*javascript:/i.test(a.getAttribute('href'))) a.removeAttribute('href');
+    if (/^\s*javascript:/i.test(a.getAttribute('href')!)) a.removeAttribute('href');
   }
-  const unwrap = (el) => el.replaceWith(...el.childNodes);
-  const heavy = (w) => w === 'bold' || w === 'bolder' || +w >= 600;
-  for (const el of [...root.querySelectorAll('b,strong')]) {
+  const unwrap = (el: Element) => el.replaceWith(...el.childNodes);
+  const heavy = (w: string) => w === 'bold' || w === 'bolder' || +w >= 600;
+  for (const el of [...root.querySelectorAll<HTMLElement>('b,strong')]) {
     const w = el.style.fontWeight;
     if (w && !heavy(w)) unwrap(el);
   }
-  for (const el of [...root.querySelectorAll('span')]) {
+  for (const el of [...root.querySelectorAll<HTMLElement>('span')]) {
     const st = el.style;
     // bold already — a heading, a th, a bold parent — needs no ** of its own
     const inBold = el.parentElement && el.parentElement.closest('h1,h2,h3,h4,h5,h6,th,b,strong');
-    const wrap = (tag) => {
+    const wrap = (tag: string) => {
       const w = document.createElement(tag);
-      el.parentNode.insertBefore(w, el);
+      el.parentNode!.insertBefore(w, el);
       w.appendChild(el);
     };
-    if (!el.textContent.trim()) continue;
+    if (!el.textContent!.trim()) continue;
     if (heavy(st.fontWeight) && !inBold) wrap('strong');
     if (st.fontStyle === 'italic') wrap('em');
     if (/line-through/.test(st.textDecoration || st.textDecorationLine || '')) wrap('del');
@@ -2727,7 +2972,7 @@ function tidyPasted(root) {
 
 // What the clipboard means, as { md } (Markdown to splice), { text } (plain)
 // or null (not ours — a link paste, an image, an empty clipboard).
-function readPaste(dt) {
+function readPaste(dt: DataTransfer): { md?: string; text?: string } | null {
   const plain = String(dt.getData('text/plain') || '').replace(/\r\n?/g, '\n');
   const html = String(dt.getData('text/html') || '');
   if (plain && looksLikeMarkdown(plain)) return { md: plain };
@@ -2747,7 +2992,7 @@ function readPaste(dt) {
 // one line of inline Markdown lands IN the sentence; anything else is its
 // own block, splitting the paragraph the caret was in
 const BLOCKISH = /^(?: {0,3}#{1,6}\s|\s*[-*+]\s|\s*\d+[.)]\s| {0,3}>|```|~~~|\||-{3,}\s*$)/;
-const isInline = (md) => !md.trim().includes('\n') && !BLOCKISH.test(md.trim());
+const isInline = (md: string) => !md.trim().includes('\n') && !BLOCKISH.test(md.trim());
 
 // what's left of a line once the marker is cut out of it can be bare
 // scaffolding — an empty bullet, a lone `>` — which is no text worth keeping
@@ -2758,7 +3003,7 @@ const PASTE_MARK = 'nibpaste' + Math.random().toString(36).slice(2, 10);
 // preview serializes, and the marker is swapped for the Markdown in the
 // source — so the real parser draws it, and an untouched neighbour keeps
 // its source byte-for-byte (patchMarkdown).
-function spliceIntoPreview(md, sel, plain) {
+function spliceIntoPreview(md: string, sel: Selection, plain?: string) {
   flushLive();
   history.record(ed.value, true);                 // ⌘Z lands on before-the-paste
   document.execCommand('insertText', false, PASTE_MARK);
@@ -2767,7 +3012,7 @@ function spliceIntoPreview(md, sel, plain) {
   const i = v.indexOf(PASTE_MARK);
   if (i < 0) { render(); toast('Couldn’t paste Markdown here'); return; }
 
-  let next, end;
+  let next: string, end: number;
   if (isInline(md)) {
     // the space either side of a copied phrase is part of the phrase
     const piece = (/^\s/.test(plain || '') ? ' ' : '') + md.trim()
@@ -2797,15 +3042,15 @@ function spliceIntoPreview(md, sel, plain) {
   render();
   setDirty();
   updateStatus();
-  clearTimeout(syncTimer);
+  clearTimeout(syncTimer!);
   syncTimer = setTimeout(syncNow, 400);
 
   // the caret goes back to the end of what was pasted: inside the block it
   // landed in, just after the pasted text when it can be found again
   const endLine = next.slice(0, end).split('\n').length - 1;
-  let last = null;
-  for (const el of preview.querySelectorAll('[data-line]')) {
-    if (+el.dataset.line <= endLine && (!last || +el.dataset.line >= +last.dataset.line)) last = el;
+  let last: HTMLElement | null = null;
+  for (const el of preview.querySelectorAll<HTMLElement>('[data-line]')) {
+    if (+el.dataset.line! <= endLine && (!last || +el.dataset.line! >= +last.dataset.line!)) last = el;
   }
   preview.focus();
   if (!last) return;
@@ -2817,12 +3062,12 @@ function spliceIntoPreview(md, sel, plain) {
     const ahead = next.slice(end, next.indexOf('\n', end) < 0 ? next.length : next.indexOf('\n', end))
       .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/(\*\*|__|~~|[*_`])/g, '').trim();
     const walk = document.createTreeWalker(last, NodeFilter.SHOW_TEXT);
-    let n, seen = '', nodes = [];
+    let n: Node | null, seen = '', nodes: [Node, number][] = [];
     while ((n = walk.nextNode())) { nodes.push([n, seen.length]); seen += n.nodeValue; }
     const at = ahead ? seen.lastIndexOf(ahead.slice(0, 24)) : -1;
     if (at >= 0) {
-      const [node, base] = nodes.filter(([, b]) => b <= at).pop();
-      r.setStart(node, Math.min(at - base, node.nodeValue.length));
+      const [node, base] = nodes.filter(([, b]) => b <= at).pop()!;
+      r.setStart(node, Math.min(at - base, node.nodeValue!.length));
       r.collapse(true);
     }
   }
@@ -2832,7 +3077,7 @@ function spliceIntoPreview(md, sel, plain) {
 }
 
 // true when the paste was taken
-function smartPaste(e) {
+function smartPaste(e: ClipboardEvent) {
   if (kind !== 'doc' || isJson() || isAdoc() || !e.clipboardData) return false;
   const got = readPaste(e.clipboardData);
   if (!got) return false;
@@ -2851,27 +3096,27 @@ function smartPaste(e) {
 
   const sel = window.getSelection();
   const at = sel && sel.rangeCount ? sel.getRangeAt(0).startContainer : null;
-  const host = at && (at.nodeType === 1 ? at : at.parentElement);
+  const host = at && (at.nodeType === 1 ? at as Element : at.parentElement);
   if (!host) return false;
   e.preventDefault();
-  const plain = got.text != null ? got.text
-    : String(e.clipboardData.getData('text/plain') || '') || got.md;
+  const plain = (got.text != null ? got.text
+    : String(e.clipboardData.getData('text/plain') || '') || got.md)!;
   // inside code or an island it's literal; a table cell holds one line
   if (host.closest('pre, code, .math, .mm')) {
     // insertText splits a <pre> in two at every newline — a text node doesn't
-    const r = sel.getRangeAt(0);
+    const r = sel!.getRangeAt(0);
     r.deleteContents();
     const t = document.createTextNode(plain);
     r.insertNode(t);
     r.setStartAfter(t);
     r.collapse(true);
-    sel.removeAllRanges();
-    sel.addRange(r);
+    sel!.removeAllRanges();
+    sel!.addRange(r);
     queueSerialize();
   } else if (host.closest('table')) {
     document.execCommand('insertText', false, plain.replace(/\s*\n\s*/g, ' '));
   } else if (got.md) {
-    spliceIntoPreview(got.md, sel, String(e.clipboardData.getData('text/plain') || ''));
+    spliceIntoPreview(got.md, sel!, String(e.clipboardData.getData('text/plain') || ''));
     toast('Pasted as Markdown — ⌥⇧⌘V pastes plain text');
   } else {
     document.execCommand('insertText', false, got.text);
@@ -2912,11 +3157,11 @@ document.addEventListener('keydown', async (e) => {
 // A picked or dropped FILE keeps the name it already has; only a paste gets
 // a generated one, because a clipboard image has no name worth keeping.
 
-const isImage = (p) => IMAGE_EXT.test(p);
+const isImage = (p: string) => IMAGE_EXT.test(p);
 
 // -------------------------------------------------------- what it's called
 
-const slug = (s) => String(s || '')
+const slug = (s: string | null | undefined) => String(s || '')
   .replace(/`([^`]*)`/g, '$1')
   .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')       // a link in a heading
   .replace(/[*_~#]/g, '')
@@ -2924,7 +3169,7 @@ const slug = (s) => String(s || '')
   .replace(/^-+|-+$/g, '').slice(0, 48).replace(/-+$/, '');
 
 function stamp() {
-  const d = new Date(), p = (n) => String(n).padStart(2, '0');
+  const d = new Date(), p = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
 }
 
@@ -2939,9 +3184,9 @@ function stamp() {
 function headingAtCaret() {
   if (inPreview()) {
     const sel = window.getSelection();
-    let n = sel && sel.anchorNode;
+    let n: Node | null = sel && sel.anchorNode;
     while (n && n.parentNode !== preview) n = n.parentNode;
-    for (; n; n = n.previousElementSibling) {
+    for (; n; n = (n as Element).previousElementSibling) {
       if (/^H[1-6]$/.test(n.nodeName)) return n.textContent;
     }
     return '';
@@ -2966,7 +3211,7 @@ const docSlug = () => slug((name || 'image').replace(/\.(md|markdown|mdown|mkdn|
 function pinsAbove() {
   if (!docDir) return [];
   return Object.keys(tree.pins())
-    .filter((p) => docDir === p || docDir.startsWith(p + '/'))
+    .filter((p) => docDir === p || docDir!.startsWith(p + '/'))
     .sort((a, b) => a.length - b.length);
 }
 
@@ -2974,18 +3219,18 @@ function pinsAbove() {
 // (so a heading can't smuggle a slash in), unknown ones expand to nothing,
 // and the runs of dashes that empty variables leave behind collapse. What
 // was typed BETWEEN the braces is kept, lightly cleaned.
-function expandTemplate(tpl, orig) {
-  const d = new Date(), p2 = (n) => String(n).padStart(2, '0');
+function expandTemplate(tpl: string, orig?: string) {
+  const d = new Date(), p2 = (n: number) => String(n).padStart(2, '0');
   const root = tree.root();
   // {dir} counts up from the document but stops at the folder: a template
   // shouldn't be able to name your home directory. Outside a folder the
   // document's own path is all there is.
   const inRoot = root && docDir && (docDir === root || docDir.startsWith(root + '/'));
   const dirs = !docDir ? []
-    : inRoot ? [baseName(root), ...(docDir === root ? [] : docDir.slice(root.length + 1).split('/'))]
+    : inRoot ? [baseName(root), ...(docDir === root ? [] : docDir.slice(root!.length + 1).split('/'))]
     : docDir.split('/').filter(Boolean);
   const above = pinsAbove();
-  const val = (key) => {
+  const val = (key: string) => {
     if (key === 'doc') return docSlug();
     if (key === 'heading') return slug(headingAtCaret());
     if (key === 'name') return slug(orig || '');
@@ -2999,8 +3244,8 @@ function expandTemplate(tpl, orig) {
     if (key === 'pintop') return slug(baseName(above[0] || ''));
     if (key === 'pinpath') {
       const pin = above[above.length - 1];
-      return pin && docDir.length > pin.length
-        ? slug(docDir.slice(pin.length + 1).replace(/\//g, ' ')) : '';
+      return pin && docDir!.length > pin.length
+        ? slug(docDir!.slice(pin.length + 1).replace(/\//g, ' ')) : '';
     }
     let m = key.match(/^dir(\d*)$/);
     if (m) return slug(dirs[dirs.length - (+m[1] || 1)] || '');
@@ -3008,13 +3253,13 @@ function expandTemplate(tpl, orig) {
     if (m) return slug(baseName(above[+m[1] - 1] || ''));
     return '';
   };
-  return tpl.replace(/\{(\w+)\}/g, (_, k) => val(k))
+  return tpl.replace(/\{(\w+)\}/g, (_, k: string) => val(k))
     .replace(/[^\w .()-]+/g, '-')
     .replace(/-{2,}/g, '-').replace(/^[-.\s]+|[-\s]+$/g, '')
     .slice(0, 80);
 }
 
-function imageStem(s, orig) {
+function imageStem(s: ImageSettings, orig?: string) {
   if (s.naming === 'custom' && s.template) {
     return expandTemplate(s.template, orig) || docSlug() + '-image';
   }
@@ -3040,7 +3285,7 @@ function imageStem(s, orig) {
 // if the re-encode comes out BIGGER than what came in — already-tight JPEGs
 // and small PNGs both manage it — the original file wins.
 
-let webpOk = null;
+let webpOk: boolean | null = null;
 function canWebp() {
   if (webpOk === null) {
     const c = document.createElement('canvas');
@@ -3050,19 +3295,19 @@ function canWebp() {
   return webpOk;
 }
 
-const loadImage = (src) => new Promise((res) => {
+const loadImage = (src: string) => new Promise<HTMLImageElement | null>((res) => {
   const im = new Image();
   im.onload = () => res(im);
   im.onerror = () => res(null);
   im.src = src;
 });
 
-const b64Bytes = (s) => Math.round((s.length * 3) / 4) - (s.endsWith('==') ? 2 : s.endsWith('=') ? 1 : 0);
+const b64Bytes = (s: string) => Math.round((s.length * 3) / 4) - (s.endsWith('==') ? 2 : s.endsWith('=') ? 1 : 0);
 
 // `force` is the optimizer's flavor of "keep the format": on add, same
 // format + no resize means nothing was asked for; in the optimizer it means
 // recompress in place, and only the is-it-actually-smaller guard remains.
-async function optimizeImage(src, s, pre, force) {
+async function optimizeImage(src: string, s: Pick<ImageSettings, 'optimize' | 'maxWidth' | 'quality'>, pre?: { data?: string } | null, force?: boolean) {
   if (s.optimize === 'off') return null;
   const e = (src.match(/\.([^.]+)$/) || ['', ''])[1].toLowerCase();
   if (e === 'svg' || e === 'gif') return null;
@@ -3082,7 +3327,7 @@ async function optimizeImage(src, s, pre, force) {
     : e === 'png' ? 'image/png'
     : e === 'webp' && canWebp() ? 'image/webp'
     : 'image/jpeg';
-  const format = { 'image/webp': 'webp', 'image/png': 'png', 'image/jpeg': 'jpg' }[type];
+  const format = ({ 'image/webp': 'webp', 'image/png': 'png', 'image/jpeg': 'jpg' } as Record<string, string>)[type];
   if (!force && scale === 1 && s.optimize === 'same' && format === e) return null;   // nothing to do
 
   const w = Math.max(1, Math.round(img.naturalWidth * scale));
@@ -3090,7 +3335,7 @@ async function optimizeImage(src, s, pre, force) {
   const c = document.createElement('canvas');
   c.width = w;
   c.height = h;
-  const cx = c.getContext('2d');
+  const cx = c.getContext('2d')!;
   if (type === 'image/jpeg') {                     // a jpeg has no alpha to keep
     cx.fillStyle = '#fff';
     cx.fillRect(0, 0, w, h);
@@ -3099,7 +3344,7 @@ async function optimizeImage(src, s, pre, force) {
   const url = c.toDataURL(type, (s.quality || 82) / 100);
   if (!url.startsWith('data:' + type)) return null;
   const data = url.slice(url.indexOf(',') + 1);
-  const was = b64Bytes(got.data.slice(got.data.indexOf(',') + 1));
+  const was = b64Bytes(got.data!.slice(got.data!.indexOf(',') + 1));
   const now = b64Bytes(data);
   if (now >= was && scale === 1) return null;      // the original was already better
   return { data, format, was, now };
@@ -3109,8 +3354,8 @@ async function optimizeImage(src, s, pre, force) {
 
 // The backend numbers the name and writes the bytes; what comes back is the
 // path relative to THIS document, which is what goes in the link.
-async function addImageFile(payload) {
-  let r;
+async function addImageFile(payload: Record<string, unknown>): Promise<SavedImage | null> {
+  let r: SavedImage;
   try {
     r = await tiny.api.call('saveImage', { id: sheetId, ...payload });
   } catch {
@@ -3128,7 +3373,7 @@ async function addImageFile(payload) {
 // Settings applied, optimized if they say so, written by the backend —
 // shared with the picture bar's Replace, which wants everything about this
 // except the inserting.
-async function placeImage(src, { rename = false } = {}) {
+async function placeImage(src: string, { rename = false }: { rename?: boolean } = {}) {
   const s = await imageSettings();                 // asks, once per folder
   if (!s) return null;
   const opt = await optimizeImage(src, s);
@@ -3147,7 +3392,7 @@ async function placeImage(src, { rename = false } = {}) {
   return r ? { ...r, opt } : null;
 }
 
-async function importImage(src, opts) {
+async function importImage(src: string, opts?: { rename?: boolean }) {
   const r = await placeImage(src, opts);
   if (!r) return;
   const opt = r.opt;
@@ -3173,23 +3418,23 @@ async function importImage(src, opts) {
 // otherwise arrive as a screenshot of itself. Text wins when it comes with
 // HTML that holds text — not for a Finder copy (a file and its name, no
 // HTML), nor a browser's Copy Image (HTML that is only the <img>).
-function textOverPicture(dt) {
+function textOverPicture(dt: DataTransfer) {
   if (!String(dt.getData('text/plain') || '').trim()) return false;
   const html = String(dt.getData('text/html') || '');
   if (!html) return false;                          // a Finder copy: file + its name
   const body = new DOMParser().parseFromString(html, 'text/html').body;
-  return !(body.querySelector('img') && !body.textContent.trim());
+  return !(body.querySelector('img') && !body.textContent!.trim());
 }
 
 // ⌘V with a picture on the pasteboard. The native clipboard is the source
 // of truth (tiny.clipboard hands back a real png path); clipboardData is
 // only consulted to decide whether this paste is ours to take.
-function onPaste(e) {
+function onPaste(e: ClipboardEvent) {
   const dt = e.clipboardData;
   const imageish = dt && (
     (dt.files && dt.files.length) ||
     [...(dt.items || [])].some((i) => i.kind === 'file' && /^image\//.test(i.type)));
-  if (!imageish || textOverPicture(dt)) {           // text: Markdown, HTML, plain, a link
+  if (!imageish || textOverPicture(dt!)) {           // text: Markdown, HTML, plain, a link
     pasteAsLink(e);                                 // (URL over a selection — first)
     if (e.defaultPrevented) return;
     smartPaste(e);
@@ -3222,26 +3467,26 @@ async function pickImage() {
 // a folder that nagged twice would be worse than one that guessed.
 
 const imgshade = $('imgshade');
-let imgDone = null;                                // resolve of the open sheet
-let imgRoot = null;                                // the project the sample is drawn against
-let imgScope = null;                               // the folder being marked as asked
+let imgDone: ((s: ImageSettings | null) => void) | null = null;                                // resolve of the open sheet
+let imgRoot: string | null = null;                                // the project the sample is drawn against
+let imgScope: string | null = null;                               // the folder being marked as asked
 
-const cleanRoot = (v) => String(v || '').replace(/\\/g, '/').split('/')
+const cleanRoot = (v: string) => String(v || '').replace(/\\/g, '/').split('/')
   .filter((p) => p && p !== '.' && p !== '..').join('/');
 
-const imgForm = () => ({
-  dest: $('imgDest').value,
-  folder: $('imgFolder').value.trim() || 'images',
-  naming: $('imgNaming').value,
-  template: $('imgTpl').value.replace(/[/\\:]+/g, '-').trim().slice(0, 80),
-  optimize: $('imgOptimize').value,
-  maxWidth: Math.max(0, Math.min(8000, parseInt($('imgMax').value, 10) || 0)),
-  imageRoot: cleanRoot($('imgRootImg').value),
-  linkRoot: cleanRoot($('imgRootLink').value),
+const imgForm = (): ImageSettings => ({
+  dest: $<HTMLSelectElement>('imgDest').value,
+  folder: $<HTMLInputElement>('imgFolder').value.trim() || 'images',
+  naming: $<HTMLSelectElement>('imgNaming').value,
+  template: $<HTMLInputElement>('imgTpl').value.replace(/[/\\:]+/g, '-').trim().slice(0, 80),
+  optimize: $<HTMLSelectElement>('imgOptimize').value,
+  maxWidth: Math.max(0, Math.min(8000, parseInt($<HTMLInputElement>('imgMax').value, 10) || 0)),
+  imageRoot: cleanRoot($<HTMLInputElement>('imgRootImg').value),
+  linkRoot: cleanRoot($<HTMLInputElement>('imgRootLink').value),
 });
 
 // The line that does the explaining: the exact path the next paste writes.
-function paintImgSample(root) {
+function paintImgSample(root: string | null) {
   const s = imgForm();
   $('imgFolderRow').hidden = s.dest === 'beside';
   $('imgTplRow').hidden = s.naming !== 'custom';
@@ -3272,29 +3517,29 @@ function paintImgSample(root) {
   $('imgdlgNote').textContent = notes.join(' ');
 }
 
-function openImageSettings(info, first) {
+function openImageSettings(info: ImageOptions, first: boolean) {
   const s = info.settings;
-  $('imgDest').value = s.dest;
-  $('imgFolder').value = s.folder;
-  $('imgNaming').value = s.naming;
-  $('imgTpl').value = s.template || '';
-  $('imgOptimize').value = s.optimize;
-  $('imgMax').value = s.maxWidth;
-  $('imgRootImg').value = s.imageRoot || '';
-  $('imgRootLink').value = s.linkRoot || '';
+  $<HTMLSelectElement>('imgDest').value = s.dest;
+  $<HTMLInputElement>('imgFolder').value = s.folder;
+  $<HTMLSelectElement>('imgNaming').value = s.naming;
+  $<HTMLInputElement>('imgTpl').value = s.template || '';
+  $<HTMLSelectElement>('imgOptimize').value = s.optimize;
+  $<HTMLInputElement>('imgMax').value = s.maxWidth as unknown as string;
+  $<HTMLInputElement>('imgRootImg').value = s.imageRoot || '';
+  $<HTMLInputElement>('imgRootLink').value = s.linkRoot || '';
   // Both of these are questions about a FOLDER, so with none open there is
   // nothing to answer — a `/` is a path on the disk and the settings are the
   // app's own.
   $('imgRoots').hidden = !info.project;
   $('imgProjRow').hidden = !info.project;
-  $('imgProj').checked = info.inFolder !== false;
+  $<HTMLInputElement>('imgProj').checked = info.inFolder !== false;
   // "at the project root" needs a project — without one it's the same place
   // as "next to the document", which would be a lie in a menu.
-  $('imgDest').options[2].disabled = !info.project;
-  if (!info.project && s.dest === 'root') $('imgDest').value = 'beside';
+  $<HTMLSelectElement>('imgDest').options[2].disabled = !info.project;
+  if (!info.project && s.dest === 'root') $<HTMLSelectElement>('imgDest').value = 'beside';
   // Don't offer a format this build can't write — on macOS today that's
   // WebP, and the option quietly means JPEG.
-  $('imgOptimize').options[1].textContent = canWebp() ? 'Convert to WebP' : 'Convert to JPEG';
+  $<HTMLSelectElement>('imgOptimize').options[1].textContent = canWebp() ? 'Convert to WebP' : 'Convert to JPEG';
   $('imgdlgTitle').textContent = first
     ? 'Where should pictures go?'
     : 'Images & Paths';
@@ -3306,8 +3551,8 @@ function openImageSettings(info, first) {
   $('imgSave').textContent = first ? 'Use These' : 'Save';
   paintImgSample(info.root);
   imgshade.hidden = false;
-  $('imgDest').focus();
-  return new Promise((res) => { imgDone = res; });
+  $<HTMLSelectElement>('imgDest').focus();
+  return new Promise<ImageSettings | null>((res) => { imgDone = res; });
 }
 
 for (const id of ['imgDest', 'imgFolder', 'imgNaming', 'imgTpl', 'imgOptimize', 'imgMax',
@@ -3320,23 +3565,23 @@ for (const id of ['imgDest', 'imgFolder', 'imgNaming', 'imgTpl', 'imgOptimize', 
 // File ▸ Save Settings in Folder, where you actually meet it: the sheet says
 // these belong to the folder, so this is where you get to disagree. It takes
 // effect at once — Save then writes wherever this now points.
-$('imgProj').addEventListener('change', async () => {
-  await tiny.api.call('setProjectSettings', { on: $('imgProj').checked });
-  const info = await tiny.api.call('imageOptions');
+$<HTMLInputElement>('imgProj').addEventListener('change', async () => {
+  await tiny.api.call('setProjectSettings', { on: $<HTMLInputElement>('imgProj').checked });
+  const info = await tiny.api.call('imageOptions') as ImageOptions | null;
   if (info && info.settings) {                     // the other scope's answer
-    $('imgDest').value = info.settings.dest;
-    $('imgFolder').value = info.settings.folder;
-    $('imgNaming').value = info.settings.naming;
-    $('imgTpl').value = info.settings.template || '';
-    $('imgOptimize').value = info.settings.optimize;
-    $('imgMax').value = info.settings.maxWidth;
-    $('imgRootImg').value = info.settings.imageRoot || '';
-    $('imgRootLink').value = info.settings.linkRoot || '';
+    $<HTMLSelectElement>('imgDest').value = info.settings.dest;
+    $<HTMLInputElement>('imgFolder').value = info.settings.folder;
+    $<HTMLSelectElement>('imgNaming').value = info.settings.naming;
+    $<HTMLInputElement>('imgTpl').value = info.settings.template || '';
+    $<HTMLSelectElement>('imgOptimize').value = info.settings.optimize;
+    $<HTMLInputElement>('imgMax').value = info.settings.maxWidth as unknown as string;
+    $<HTMLInputElement>('imgRootImg').value = info.settings.imageRoot || '';
+    $<HTMLInputElement>('imgRootLink').value = info.settings.linkRoot || '';
     paintImgSample(imgRoot);
   }
 });
 
-async function closeImgSheet(save, scope) {
+async function closeImgSheet(save: boolean, scope: string | null) {
   if (imgshade.hidden) return;
   imgshade.hidden = true;
   const settings = save ? imgForm() : null;
@@ -3348,7 +3593,7 @@ async function closeImgSheet(save, scope) {
 }
 
 async function showImageSettings() {
-  const info = await tiny.api.call('imageOptions');
+  const info = await tiny.api.call('imageOptions') as ImageOptions | null;
   if (!info) return;
   imgRoot = info.root;
   imgScope = info.scope;
@@ -3360,14 +3605,14 @@ $('imgSave').onclick = () => closeImgSheet(true, imgScope);
 document.addEventListener('keydown', (e) => {
   if (imgshade.hidden) return;
   if (e.key === 'Escape') { e.preventDefault(); closeImgSheet(false, imgScope); }
-  else if (e.key === 'Enter' && e.target.tagName !== 'SELECT') {
+  else if (e.key === 'Enter' && (e.target as Element).tagName !== 'SELECT') {
     e.preventDefault();
     closeImgSheet(true, imgScope);
   }
 });
 
 async function imageSettings() {
-  const info = await tiny.api.call('imageOptions');
+  const info = await tiny.api.call('imageOptions') as ImageOptions | null;
   if (!info) return null;
   if (!info.ask) return info.settings;
   imgRoot = info.root;
@@ -3390,44 +3635,44 @@ async function imageSettings() {
 
 const optshade = $('optshade');
 const OPT_EXCLUDE = /\.(svg|gif)$/i;               // same rule as on-add
-let optQueue = [];                                 // paths still to look at
-let optSrc = null;                                 // the one on the bench
-let optPre = null;                                 // its original bytes (data URI)
-let optOut = null;                                 // the current re-encode
+let optQueue: string[] = [];                       // paths still to look at
+let optSrc: string | null = null;                  // the one on the bench
+let optPre: { data: string } | null = null;        // its original bytes (data URI)
+let optOut: Reencoded | null = null;               // the current re-encode
 let optOutUri = '';
 let optTick = 0;                                   // stale-recompute guard
 let optTimer = 0;
-let optStats = null;
+let optStats: OptStats | null = null;
 
 const optSettings = () => ({
-  optimize: $('optFmt').value,                     // 'same' | 'webp'
-  maxWidth: Math.max(0, Math.min(8000, parseInt($('optMax').value, 10) || 0)),
-  quality: Math.max(30, Math.min(100, parseInt($('optQ').value, 10) || 82)),
+  optimize: $<HTMLSelectElement>('optFmt').value,                     // 'same' | 'webp'
+  maxWidth: Math.max(0, Math.min(8000, parseInt($<HTMLInputElement>('optMax').value, 10) || 0)),
+  quality: Math.max(30, Math.min(100, parseInt($<HTMLInputElement>('optQ').value, 10) || 82)),
 });
 
-const optLabel = (p) => {
+const optLabel = (p: string) => {
   const root = tree.root();
   return root && p.startsWith(root + '/') ? p.slice(root.length + 1) : baseName(p);
 };
 
 async function optRecompute() {
   const tok = ++optTick;
-  $('optQv').textContent = $('optQ').value;
+  $('optQv').textContent = $<HTMLInputElement>('optQ').value;
   $('optdlgResult').textContent = 'Re-encoding…';
-  $('optOne').disabled = true;
-  const out = await optimizeImage(optSrc, optSettings(), optPre, true);
+  $<HTMLButtonElement>('optOne').disabled = true;
+  const out = await optimizeImage(optSrc!, optSettings(), optPre, true);
   if (tok !== optTick || optshade.hidden) return;  // superseded by another tweak
   optOut = out;
   if (out) {
     optOutUri = 'data:image/' + (out.format === 'jpg' ? 'jpeg' : out.format) + ';base64,' + out.data;
-    $('optImg').src = optOutUri;
+    $<HTMLImageElement>('optImg').src = optOutUri;
     const pct = Math.round((1 - out.now / out.was) * 100);
     $('optdlgResult').textContent = niceBytes(out.was) + ' → ' + niceBytes(out.now)
       + (pct > 0 ? '  (−' + pct + '%)' : '');
-    $('optOne').disabled = false;
+    $<HTMLButtonElement>('optOne').disabled = false;
   } else {
     optOutUri = '';
-    $('optImg').src = optPre ? optPre.data : '';
+    $<HTMLImageElement>('optImg').src = optPre ? optPre.data : '';
     $('optdlgResult').textContent = 'The original is already smaller than this re-encode — nothing to do.';
   }
 }
@@ -3440,12 +3685,12 @@ const optKick = () => { clearTimeout(optTimer); optTimer = setTimeout(optRecompu
 let optCutAt = 50;
 let optDragging = false;
 function optPaintCut() {
-  $('optOrig').style.clipPath = 'inset(0 ' + (100 - optCutAt) + '% 0 0)';
+  $<HTMLImageElement>('optOrig').style.clipPath = 'inset(0 ' + (100 - optCutAt) + '% 0 0)';
   $('optCut').style.left = optCutAt + '%';
-  $('optTagL').style.opacity = optCutAt < 14 ? 0 : 1;
-  $('optTagR').style.opacity = optCutAt > 86 ? 0 : 1;
+  $('optTagL').style.opacity = (optCutAt < 14 ? 0 : 1) as unknown as string;
+  $('optTagR').style.opacity = (optCutAt > 86 ? 0 : 1) as unknown as string;
 }
-function optCutFrom(e) {
+function optCutFrom(e: PointerEvent) {
   const r = $('optWrap').getBoundingClientRect();
   if (!r.width) return;
   optCutAt = Math.max(2, Math.min(98, ((e.clientX - r.left) / r.width) * 100));
@@ -3460,22 +3705,22 @@ addEventListener('pointermove', (e) => { if (optDragging) optCutFrom(e); });
 addEventListener('pointerup', () => { optDragging = false; });
 
 async function optShow() {
-  optSrc = optQueue.shift();
+  optSrc = optQueue.shift()!;
   optOut = null;
   optOutUri = '';
   const left = optQueue.length;
   $('optdlgWhich').textContent = optLabel(optSrc) + (left ? '  ·  ' + left + ' more after this' : '');
-  $('optSkip').hidden = $('optAll').hidden = !left;
+  $<HTMLButtonElement>('optSkip').hidden = $<HTMLButtonElement>('optAll').hidden = !left;
   $('optdlgResult').textContent = 'Loading…';
-  $('optImg').removeAttribute('src');
-  $('optOrig').removeAttribute('src');
-  let pre = null;
+  $<HTMLImageElement>('optImg').removeAttribute('src');
+  $<HTMLImageElement>('optOrig').removeAttribute('src');
+  let pre: { data?: string } | null = null;
   try { pre = await tiny.api.call('imageData', { src: optSrc }); } catch { /* gone */ }
   if (optshade.hidden) return;
-  if (!pre || !pre.data) { optStats.skipped++; optNext(); return; }
-  optPre = pre;
-  $('optImg').src = pre.data;
-  $('optOrig').src = pre.data;
+  if (!pre || !pre.data) { optStats!.skipped++; optNext(); return; }
+  optPre = pre as { data: string };
+  $<HTMLImageElement>('optImg').src = pre.data;
+  $<HTMLImageElement>('optOrig').src = pre.data;
   optPaintCut();
   optRecompute();
 }
@@ -3485,14 +3730,14 @@ function optNext() {
   else optFinish();
 }
 
-async function optApplyTo(path, out) {
-  let r = null;
+async function optApplyTo(path: string, out: Reencoded) {
+  let r: { ok?: boolean; from?: string; path?: string } | null = null;
   try { r = await tiny.api.call('optimizeWrite', { path, data: out.data, format: out.format }); } catch { /* fall through */ }
-  if (!r || !r.ok) { optStats.skipped++; return; }
-  optStats.done++;
-  optStats.was += out.was;
-  optStats.now += out.now;
-  if (r.from) optStats.renames.push({ from: r.from, to: r.path });
+  if (!r || !r.ok) { optStats!.skipped++; return; }
+  optStats!.done++;
+  optStats!.was += out.was;
+  optStats!.now += out.now;
+  if (r.from) optStats!.renames.push({ from: r.from, to: r.path! });
 }
 
 // Closing is finishing: whatever was already optimized stays optimized, so
@@ -3502,7 +3747,7 @@ async function optFinish() {
   optshade.hidden = true;
   clearTimeout(optTimer);
   optTick++;
-  const s = optStats;
+  const s = optStats!;
   if (s.done) {
     toast('Optimized ' + plural(s.done, 'picture') + ' — ' + niceBytes(s.was) + ' → ' + niceBytes(s.now)
       + (s.skipped ? ', ' + s.skipped + ' skipped' : ''));
@@ -3516,25 +3761,25 @@ async function optFinish() {
 }
 
 $('optCancel').onclick = () => optFinish();
-$('optSkip').onclick = () => { optStats.skipped++; optNext(); };
-$('optOne').onclick = async () => {
+$<HTMLButtonElement>('optSkip').onclick = () => { optStats!.skipped++; optNext(); };
+$<HTMLButtonElement>('optOne').onclick = async () => {
   if (!optOut) return;
-  $('optOne').disabled = true;
-  await optApplyTo(optSrc, optOut);
+  $<HTMLButtonElement>('optOne').disabled = true;
+  await optApplyTo(optSrc!, optOut);
   optNext();
 };
-$('optAll').onclick = async () => {
+$<HTMLButtonElement>('optAll').onclick = async () => {
   const s = optSettings();
-  $('optOne').disabled = $('optAll').disabled = $('optSkip').disabled = true;
-  if (optOut) await optApplyTo(optSrc, optOut);
-  else optStats.skipped++;
+  $<HTMLButtonElement>('optOne').disabled = $<HTMLButtonElement>('optAll').disabled = $<HTMLButtonElement>('optSkip').disabled = true;
+  if (optOut) await optApplyTo(optSrc!, optOut);
+  else optStats!.skipped++;
   while (optQueue.length && !optshade.hidden) {
-    const p = optQueue.shift();
+    const p = optQueue.shift()!;
     $('optdlgWhich').textContent = 'Optimizing ' + optLabel(p) + '…  ·  ' + optQueue.length + ' to go';
     const out = await optimizeImage(p, s, null, true);
     if (!optStats) return;                         // Escape closed it mid-encode
     if (out) await optApplyTo(p, out);
-    else optStats.skipped++;
+    else optStats!.skipped++;
   }
   optFinish();
 };
@@ -3543,17 +3788,17 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { e.preventDefault(); optFinish(); }
 });
 
-async function openOptimizer(paths) {
-  const info = await tiny.api.call('imageOptions'); // seeds the controls, no asking
-  const s = (info && info.settings) || {};
+async function openOptimizer(paths: string[]) {
+  const info = await tiny.api.call('imageOptions') as ImageOptions | null; // seeds the controls, no asking
+  const s: Partial<ImageSettings> = (info && info.settings) || {};
   optQueue = paths.filter((p) => !OPT_EXCLUDE.test(p));
   if (!optQueue.length) { toast('Nothing to optimize — SVG and GIF are left alone'); return; }
   optStats = { done: 0, skipped: 0, was: 0, now: 0, renames: [] };
-  $('optFmt').options[1].textContent = canWebp() ? 'WebP' : 'JPEG';
-  $('optFmt').value = s.optimize === 'webp' ? 'webp' : 'same';
-  $('optQ').value = s.quality || 82;
-  $('optMax').value = s.maxWidth || 0;
-  $('optOne').disabled = $('optAll').disabled = $('optSkip').disabled = false;
+  $<HTMLSelectElement>('optFmt').options[1].textContent = canWebp() ? 'WebP' : 'JPEG';
+  $<HTMLSelectElement>('optFmt').value = s.optimize === 'webp' ? 'webp' : 'same';
+  $<HTMLInputElement>('optQ').value = (s.quality || 82) as unknown as string;
+  $<HTMLInputElement>('optMax').value = (s.maxWidth || 0) as unknown as string;
+  $<HTMLButtonElement>('optOne').disabled = $<HTMLButtonElement>('optAll').disabled = $<HTMLButtonElement>('optSkip').disabled = false;
   $('optdlgTitle').textContent = optQueue.length > 1 ? 'Optimize Pictures' : 'Optimize Picture';
   optshade.hidden = false;
   optShow();
@@ -3572,15 +3817,15 @@ for (const id of ['optFmt', 'optQ', 'optMax']) {
 const cleanshade = $('cleanshade');
 let cleanBusy = false;
 const cleanClose = () => { if (!cleanBusy) cleanshade.hidden = true; };
-const cleanTicked = () => [...$('cleanList').querySelectorAll('input:checked')].map((i) => i.value);
+const cleanTicked = () => [...$('cleanList').querySelectorAll<HTMLInputElement>('input:checked')].map((i) => i.value);
 function cleanCount() {
   const n = cleanTicked().length;
   // a dialog that only lists broken links has nothing to trash
-  $('cleanGo').hidden = !$('cleanList').querySelector('input');
-  $('cleanGo').disabled = !n || cleanBusy;
-  $('cleanGo').textContent = n ? 'Move ' + plural(n, 'File') + ' to Trash' : 'Move to Trash';
+  $<HTMLButtonElement>('cleanGo').hidden = !$('cleanList').querySelector('input');
+  $<HTMLButtonElement>('cleanGo').disabled = !n || cleanBusy;
+  $<HTMLButtonElement>('cleanGo').textContent = n ? 'Move ' + plural(n, 'File') + ' to Trash' : 'Move to Trash';
 }
-function cleanHeading(title, n) {
+function cleanHeading(title: string, n: number) {
   const head = document.createElement('div');
   head.className = 'clhead';
   const t = document.createElement('span');
@@ -3591,7 +3836,7 @@ function cleanHeading(title, n) {
   $('cleanList').appendChild(head);
   return head;
 }
-function cleanSection(title, rows, ticked) {
+function cleanSection(title: string, rows: UnusedFile[], ticked: boolean) {
   if (!rows.length) return;
   const list = $('cleanList');
   const head = cleanHeading(title, rows.length);
@@ -3600,7 +3845,7 @@ function cleanSection(title, rows, ticked) {
   const none = document.createElement('button');
   none.textContent = 'None';
   head.append(all, none);
-  const boxes = [];
+  const boxes: HTMLInputElement[] = [];
   for (const r of rows) {
     const row = document.createElement('label');
     row.className = 'clrow';
@@ -3637,9 +3882,9 @@ function cleanSection(title, rows, ticked) {
   none.onclick = () => { for (const b of boxes) b.checked = false; cleanCount(); };
 }
 
-async function openCleanup(dir) {
+async function openCleanup(dir: string) {
   if (!tree.has()) return;
-  let r;
+  let r: { rel?: string; truncated?: boolean; unused: UnusedFile[]; named: UnusedFile[]; checked: number } | null;
   try { r = await tiny.api.call('scanUnused', { dir }); } catch { r = null; }
   if (!r) { toast('Couldn’t look through that folder'); return; }
   const where = r.rel ? r.rel + '/' : 'this folder';
@@ -3659,17 +3904,17 @@ async function openCleanup(dir) {
     + (r.named.length ? ', and ' + r.named.length + ' only mentioned by name' : '')
     + ' — of ' + r.checked + ' checked.';
   $('cleandlgNote').textContent = CLEAN_NOTE;
-  $('cleanCancel').textContent = 'Cancel';
+  $<HTMLButtonElement>('cleanCancel').textContent = 'Cancel';
   $('cleanList').textContent = '';
   cleanSection('Not linked anywhere', r.unused, true);
   cleanSection('Not linked, but named somewhere — check first', r.named, false);
   cleanShow();
 }
 const CLEAN_NOTE = $('cleandlgNote').textContent;
-const cleanTotal = (rows) => niceBytes(rows.reduce((n, x) => n + x.size, 0));
+const cleanTotal = (rows: UnusedFile[]) => niceBytes(rows.reduce((n, x) => n + x.size, 0));
 function cleanShow() {
   cleanBusy = false;
-  $('cleanCancel').disabled = false;
+  $<HTMLButtonElement>('cleanCancel').disabled = false;
   cleanCount();
   cleanshade.hidden = false;
 }
@@ -3681,15 +3926,15 @@ function cleanShow() {
 // pointing into what went. It asks again as you type, save and come back
 // to the window, so a row leaves when its link is fixed (or the file comes
 // back from the Trash). Several Removes in a row add up rather than replace.
-let blGone = null;             // null: the whole folder; else the removed paths
+let blGone: string[] | null = null;             // null: the whole folder; else the removed paths
 let blLabel = '';
-let blTimer = null;
-let blCursor = null;
+let blTimer: ReturnType<typeof setTimeout> | null = null;
+let blCursor: string | null = null;
 let blAsk = 0;                 // only the newest answer is drawn — a rescan's
                                // refresh can land after the one Remove asked for
 const blShowing = () => !$('linksInner').hidden;
 
-function showLinks(on) {
+function showLinks(on: boolean) {
   $('filesInner').hidden = !!on;
   $('linksInner').hidden = !on;
   if (on) $('searchInner').hidden = $('changesInner').hidden = $('menuInner').hidden = true;  // one face at a time
@@ -3697,7 +3942,7 @@ function showLinks(on) {
   if (!on && document.activeElement && $('linksInner').contains(document.activeElement)) ed.focus();
   paintFilesHead();
 }
-function openLinks({ gone = null, label = '' } = {}) {
+function openLinks({ gone = null, label = '' }: { gone?: string[] | null; label?: string } = {}) {
   if (!tree.has()) { toast('Open a folder to check its links.'); return; }
   if (gone && blShowing() && blGone) {
     blGone = [...new Set([...blGone, ...gone])];
@@ -3712,7 +3957,7 @@ function openLinks({ gone = null, label = '' } = {}) {
 async function refreshLinks() {
   if (!blShowing()) return;
   const ask = ++blAsk;
-  let r;
+  let r: { links: BrokenLink[]; truncated?: boolean } | null;
   try { r = await tiny.api.call('brokenLinks', { gone: blGone }); } catch { r = null; }
   if (!blShowing() || ask !== blAsk) return;
   const list = $('blResults'), note = $('blNote');
@@ -3729,7 +3974,7 @@ async function refreshLinks() {
       : where + (links.length === 1 ? ' points' : ' point') + ' at nothing.')
     + (r.truncated ? ' Showing the first ' + links.length + '.' : '')
     + (links.length ? ' Click one to fix it.' : '');
-  let rel = null;
+  let rel: string | null = null;
   for (const l of links) {
     if (l.rel !== rel) {
       rel = l.rel;
@@ -3741,10 +3986,10 @@ async function refreshLinks() {
       nm.textContent = l.name;
       const dir = document.createElement('span');
       dir.className = 'sfDir';
-      dir.textContent = rel.slice(0, Math.max(0, rel.length - l.name.length - 1));
+      dir.textContent = rel!.slice(0, Math.max(0, rel!.length - l.name.length - 1));
       const cnt = document.createElement('span');
       cnt.className = 'sfN';
-      cnt.textContent = n;
+      cnt.textContent = n as unknown as string;
       head.append(nm, dir, cnt);
       list.appendChild(head);
     }
@@ -3754,7 +3999,7 @@ async function refreshLinks() {
     row.title = '→ ' + l.to;
     row.innerHTML = '<span class="sfLn">' + (l.line + 1) + '</span><span class="sfTxt">'
       + findMarkLine(l.text, l.at, l.len) + '</span>';
-    const go = (preview) => tiny.api.call('openAt', {
+    const go = (preview: boolean) => tiny.api.call('openAt', {
       path: l.path, line: l.line, col: l.col, len: l.len, preview });
     row.onclick = () => { blCursor = key; for (const c of list.querySelectorAll('.cur')) c.classList.remove('cur'); row.classList.add('cur'); go(true); };
     row.ondblclick = () => go(false);
@@ -3765,7 +4010,7 @@ async function refreshLinks() {
 // so sync this one first, then ask
 const linksSoon = () => {
   if (!blShowing()) return;
-  clearTimeout(blTimer);
+  clearTimeout(blTimer!);
   blTimer = setTimeout(async () => { await syncNow(); refreshLinks(); }, 700);
 };
 $('blBack').onclick = () => showLinks(false);
@@ -3776,8 +4021,8 @@ window.addEventListener('focus', () => refreshLinks());
 // The tree's Remove…: confirm, trash, then show what it left behind — the
 // links it broke in the sidebar (non-modal: they're work, and they stay
 // while you do it) and, as the one question, the files only it linked.
-async function removeNode(node) {
-  const inside = node.dir ? tree.files().filter((f) => f.path.startsWith(node.path + '/')).length : 0;
+async function removeNode(node: TreeNode) {
+  const inside = node.dir ? tree.files().filter((f: ProjectFile) => f.path.startsWith(node.path + '/')).length : 0;
   const ok = await tiny.dialog.confirm('Move “' + node.name + '” to the Trash?', {
     detail: node.dir
       ? (inside ? 'The folder and the ' + plural(inside, 'file') + ' in it go to the Trash.' : 'The folder goes to the Trash.')
@@ -3785,7 +4030,7 @@ async function removeNode(node) {
     ok: 'Move to Trash', cancel: 'Cancel',
   });
   if (!ok) return;
-  let r;
+  let r: Removed | null;
   try { r = await tiny.api.call('removeEntry', { path: node.path }); } catch { r = null; }
   if (!r || r.error) { toast((r && r.error) || 'Couldn’t remove that'); return; }
   toast('Moved “' + r.name + '” to the Trash'
@@ -3796,31 +4041,31 @@ async function removeNode(node) {
 
 // A tab whose file Remove just trashed — closed without a question (Remove
 // refuses while a tab has unsaved changes, so there is nothing to lose)
-tiny.api.on('sheet-removed', async ({ id }) => {
-  const r = await tiny.api.call('closeSheet', { id, discard: true });
+tiny.api.on('sheet-removed', async ({ id }: { id: string }) => {
+  const r = await tiny.api.call('closeSheet', { id, discard: true }) as SheetClosed | null;
   if (r && r.closed) history.drop(id);
   if (r && r.sheet && id === sheetId) loadSheet(r.sheet);
 });
 
-function showRemoved(r) {
+function showRemoved(r: Removed) {
   const name = '“' + r.name + '”';
   $('cleandlgTitle').textContent = 'Moved ' + name + ' to the Trash';
   $('cleandlgWhich').textContent = 'It was the only thing linking to '
     + plural(r.orphans.length, 'file') + ' (' + cleanTotal(r.orphans) + ').';
   $('cleandlgNote').textContent = 'Nothing left in the folder links to or names the ticked files. '
     + 'They go to the Trash — or keep them.';
-  $('cleanCancel').textContent = 'Keep Them';
+  $<HTMLButtonElement>('cleanCancel').textContent = 'Keep Them';
   $('cleanList').textContent = '';
   cleanSection('Only ' + name + ' used these', r.orphans, true);
   cleanShow();
 }
-$('cleanCancel').onclick = cleanClose;
-$('cleanGo').onclick = async () => {
+$<HTMLButtonElement>('cleanCancel').onclick = cleanClose;
+$<HTMLButtonElement>('cleanGo').onclick = async () => {
   const paths = cleanTicked();
   if (!paths.length || cleanBusy) return;
   cleanBusy = true;
-  $('cleanGo').disabled = $('cleanCancel').disabled = true;
-  let r = null;
+  $<HTMLButtonElement>('cleanGo').disabled = $<HTMLButtonElement>('cleanCancel').disabled = true;
+  let r: { done: number; failed: string[] } | null = null;
   try { r = await tiny.api.call('trashFiles', { paths }); } catch { /* reported below */ }
   cleanBusy = false;
   cleanClose();
@@ -3836,11 +4081,11 @@ document.addEventListener('keydown', (e) => {
 
 // The batch's version of offerRefs: several pictures changed name in one
 // pass, so the question is asked once, over the sum.
-async function offerRefsMany(pairs) {
+async function offerRefsMany(pairs: { from: string; to: string }[]) {
   if (!pairs || !pairs.length) return;
   if (pairs.length === 1) return offerRefs(pairs[0].from, pairs[0].to);
   let total = 0;
-  const live = [];
+  const live: { from: string; to: string }[] = [];
   for (const p of pairs) {
     try {
       const scan = await tiny.api.call('scanRefs', { from: p.from, to: p.to });
@@ -3857,7 +4102,7 @@ async function offerRefsMany(pairs) {
   let links = 0, docs = 0;
   for (const p of live) {
     try {
-      const r = await tiny.api.call('updateRefs', { from: p.from, to: p.to });
+      const r = await tiny.api.call('updateRefs', { from: p.from, to: p.to }) as RefsUpdated | null;
       if (r) { links += r.total; docs += r.changed; }
     } catch { /* skip this one */ }
   }
@@ -3875,12 +4120,12 @@ async function offerRefsMany(pairs) {
 const lightbox = $('lightbox');
 function hideLightbox() {
   lightbox.hidden = true;
-  $('lightboxImg').removeAttribute('src');
+  $<HTMLImageElement>('lightboxImg').removeAttribute('src');
 }
-function showLightbox(img) {
+function showLightbox(img: HTMLImageElement) {
   const src = img.currentSrc || img.getAttribute('src');
   if (!src) return;                                // still resolving, or missing
-  $('lightboxImg').src = src;
+  $<HTMLImageElement>('lightboxImg').src = src;
   $('lightboxCap').textContent = img.getAttribute('alt') || '';
   lightbox.hidden = false;
 }
@@ -3890,7 +4135,7 @@ document.addEventListener('keydown', (e) => {
 });
 preview.addEventListener('click', (e) => {
   if (editing()) return;
-  const img = e.target.closest('img');
+  const img = (e.target as Element).closest('img');
   if (!img) return;
   selectImageMd(img);                  // the split's source pane follows the pick
   if (prefs.zoom) showLightbox(img);
@@ -3899,7 +4144,7 @@ preview.addEventListener('click', (e) => {
 // md.ts wraps every image that has alt text in the .fig span the caption is
 // drawn from — this is the same thing for pictures inserted or retitled
 // since the last render, so captions never lag behind the alt text.
-function refigure(img) {
+function refigure(img: HTMLImageElement) {
   const alt = img.getAttribute('alt') || '';
   const fig = img.parentElement && img.parentElement.classList.contains('fig')
     ? img.parentElement : null;
@@ -3920,23 +4165,23 @@ function refigure(img) {
 // picture out from under the click, and the focus belongs to the preview
 // (or the image bar's alt field). Duplicated images resolve by distance
 // from the block the click landed in, the way undo's landing does.
-function selectImageMd(img) {
+function selectImageMd(img: HTMLImageElement) {
   if (kind !== 'doc') return;
   const src = img.dataset.src || img.getAttribute('src') || '';
   if (!src || src.startsWith('data:')) return;
   const v = ed.value;
-  const block = img.closest('[data-line]');
+  const block = img.closest<HTMLElement>('[data-line]');
   let want = 0;
   if (block) {
-    for (let k = +block.dataset.line; k > 0; k--) {
+    for (let k = +block.dataset.line!; k > 0; k--) {
       const nl = v.indexOf('\n', want);
       if (nl < 0) break;
       want = nl + 1;
     }
   }
-  let hit = null;
+  let hit: RegExpExecArray | null = null;
   const re = /!\[[^\]]*\]\(\s*(?:<([^>]*)>|([^)\s]+))[^)]*\)/g;
-  for (let m; (m = re.exec(v)); ) {
+  for (let m: RegExpExecArray | null; (m = re.exec(v)); ) {
     if ((m[1] || m[2]) !== src) continue;
     if (!hit || Math.abs(m.index - want) < Math.abs(hit.index - want)) hit = m;
   }
@@ -3944,8 +4189,8 @@ function selectImageMd(img) {
 }
 
 const imagePop = $('imagePop');
-const altField = $('imageAlt');
-let picked = null;
+const altField = $<HTMLInputElement>('imageAlt');
+let picked: HTMLImageElement | null = null;
 
 function hideImagePop() {
   imagePop.hidden = true;
@@ -3953,7 +4198,7 @@ function hideImagePop() {
   picked = null;
 }
 
-function showImagePop(img, focusAlt) {
+function showImagePop(img: HTMLImageElement, focusAlt?: boolean) {
   if (picked && picked !== img) picked.classList.remove('picked');
   picked = img;
   img.classList.add('picked');
@@ -3973,12 +4218,12 @@ function showImagePop(img, focusAlt) {
 // with the cursor already in the alt field, since that IS the caption.
 preview.addEventListener('click', (e) => {
   if (!editing()) return;
-  if (e.target.closest(ISLAND)) return;              // a picture in an island: see below
-  const img = e.target.closest('img');
-  const fig = e.target.closest('.fig');
+  if ((e.target as Element).closest(ISLAND)) return;              // a picture in an island: see below
+  const img = (e.target as Element).closest('img');
+  const fig = (e.target as Element).closest('.fig');
   if (!img && !fig) { hideImagePop(); return; }
   e.preventDefault();
-  const it = img || fig.querySelector('img');
+  const it = (img || fig!.querySelector('img'))!;
   showImagePop(it, !img);
   selectImageMd(it);
   live.hideBubble();
@@ -3993,29 +4238,29 @@ preview.addEventListener('click', (e) => {
 const ISLAND = '.rawhtml:not(.hcom), .mblock, .mm, .toc, .oemb, .footnotes';
 preview.addEventListener('click', (e) => {
   if (!editing() || e.altKey) return;               // ⌥-click already followed a link
-  let isl = e.target.closest(ISLAND);
+  let isl = (e.target as Element).closest<HTMLElement>(ISLAND);
   if (!isl) return;
   for (let p = isl.parentElement; p && p !== preview; p = p.parentElement) {
     if (p.matches(ISLAND)) isl = p;                 // the outermost one
   }
-  const a = e.target.closest('a[href]');
+  const a = (e.target as Element).closest('a[href]');
   if (a && isl.contains(a)) { e.preventDefault(); followTarget(a.getAttribute('href')); return; }
-  if (e.target.closest('summary')) return;
+  if ((e.target as Element).closest('summary')) return;
   // the footnotes section has no line of its own; each note does
-  const at = isl.dataset.line != null ? isl : e.target.closest('[data-line]');
+  const at = isl.dataset.line != null ? isl : (e.target as Element).closest<HTMLElement>('[data-line]');
   if (!at || !isl.contains(at)) return;
   e.preventDefault();
-  revealSource(+at.dataset.line);
+  revealSource(+at.dataset.line!);
 });
 
 // Select source lines [line, the next block's line) — blank tail trimmed —
 // and bring the source pane to them.
-function revealSource(line) {
+function revealSource(line: number) {
   if (isNaN(line)) return;
   const lines = ed.value.split('\n');
   let next = lines.length;
-  for (const el of preview.querySelectorAll('[data-line]')) {
-    const l = +el.dataset.line;
+  for (const el of preview.querySelectorAll<HTMLElement>('[data-line]')) {
+    const l = +el.dataset.line!;
     if (l > line && l < next) next = l;
   }
   let end = next - 1;
@@ -4025,7 +4270,7 @@ function revealSource(line) {
   if (view === 'preview') setView('split');
   ed.focus();
   ed.setSelectionRange(from, to);
-  const row = edBack.children[line];                 // one div per source line (hl.ts)
+  const row = edBack.children[line] as HTMLElement | undefined;                 // one div per source line (hl.ts)
   if (row) {
     ed.scrollTop = Math.max(0, row.offsetTop - ed.clientHeight * 0.3);
     edBack.scrollTop = ed.scrollTop;
@@ -4036,7 +4281,7 @@ function revealSource(line) {
 // Mousedown inside the bar must not steal the caret from the preview — the
 // alt field is the exception, it's a real input and needs the focus.
 imagePop.addEventListener('mousedown', (e) => {
-  if (!e.target.closest('input')) e.preventDefault();
+  if (!(e.target as Element).closest('input')) e.preventDefault();
 });
 
 // Alt text, live: every keystroke updates the picture and the caption under
@@ -4057,7 +4302,7 @@ altField.addEventListener('keydown', (e) => {
 });
 
 imagePop.addEventListener('click', async (e) => {
-  const b = e.target.closest('button');
+  const b = (e.target as Element).closest('button');
   if (!b || !picked) return;
   const img = picked;
 
@@ -4089,7 +4334,7 @@ imagePop.addEventListener('click', async (e) => {
 });
 
 document.addEventListener('mousedown', (e) => {
-  if (!imagePop.hidden && !imagePop.contains(e.target) && !e.target.closest('#preview img')) {
+  if (!imagePop.hidden && !imagePop.contains(e.target as Node) && !(e.target as Element).closest('#preview img')) {
     hideImagePop();
   }
 });
@@ -4112,11 +4357,11 @@ const inPreview = () =>
 // sheet (loadSheet calls with it) — so switching editable off must neither
 // serialize (it would write this sheet's DOM over its own source — or an
 // AsciiDoc file's) nor render again.
-function applyEditable(persist, fresh) {
+function applyEditable(persist?: boolean, fresh?: boolean) {
   const enabled = view !== 'edit' && !isAdoc() && !isJson();  // both render one-way
   const want = editableOn && enabled;
-  $('btnEditable').disabled = !enabled;
-  $('btnEditable').classList.toggle('on', want);
+  $<HTMLButtonElement>('btnEditable').disabled = !enabled;
+  $<HTMLButtonElement>('btnEditable').classList.toggle('on', want);
   document.body.toggleAttribute('data-editable', want);
 
   if (want !== editing()) {
@@ -4145,12 +4390,12 @@ function toggleEditable() {
   if (editableOn) preview.focus();
   else ed.focus();
 }
-$('btnEditable').onclick = toggleEditable;
+$<HTMLButtonElement>('btnEditable').onclick = toggleEditable;
 
-let liveTimer = null;
+let liveTimer: ReturnType<typeof setTimeout> | null = null;
 let livePending = false;             // a Live edit is queued but not yet serialized
 const queueSerialize = () => {
-  clearTimeout(liveTimer);
+  clearTimeout(liveTimer!);
   livePending = true;
   liveTimer = setTimeout(serializeLive, 260);
 };
@@ -4182,7 +4427,7 @@ function restamp() {
   // holds MathML / SVG (whose foreignObject divs would match), the fresh
   // one holds the code fallback — same document, different innards. A
   // toc's list is the same story: its length is the headings', not its own.
-  const grab = (root) => [...root.querySelectorAll(STAMPED)].filter((el) => {
+  const grab = (root: HTMLElement) => [...root.querySelectorAll<HTMLElement>(STAMPED)].filter((el) => {
     const isl = el.closest('.mm, .math, .toc');
     return !isl || isl === el;
   });
@@ -4201,7 +4446,7 @@ function restamp() {
 }
 
 function serializeLive() {
-  clearTimeout(liveTimer);
+  clearTimeout(liveTimer!);
   livePending = false;
   if (!editing()) return;
   // Patch, don't rewrite: blocks the user didn't touch keep their source
@@ -4224,7 +4469,7 @@ function serializeLive() {
   // had none, so the selectionchange that followed it painted nothing and
   // the source pane sat unhighlighted until the caret next moved
   pairCursors();
-  clearTimeout(syncTimer);
+  clearTimeout(syncTimer!);
   syncTimer = setTimeout(syncNow, 400);
 }
 // Anything that needs the source to be current right now — but ONLY when
@@ -4263,7 +4508,7 @@ const live = setupLiveEditing({
 // focus while it's open — so the preview's range is stashed on the way out
 // and put back on the way in. The textarea remembers its own selection.
 
-let savedRange = null;
+let savedRange: Range | null = null;
 preview.addEventListener('blur', () => {
   const sel = window.getSelection();
   if (sel && sel.rangeCount && preview.contains(sel.anchorNode)) {
@@ -4278,7 +4523,7 @@ preview.addEventListener('focus', () => { lastSurface = 'preview'; });
 // something that rewrites your file should still need a ⌘S. Two callers now:
 // an action whose output is "replace", and a model's edit_document, which
 // takes this route precisely so ⌘Z can take it back.
-function applyWholeText(text) {
+function applyWholeText(text: string) {
   if (kind !== 'doc') return;
   const at = Math.min(ed.selectionStart, text.length);
   const top = ed.scrollTop;
@@ -4288,15 +4533,15 @@ function applyWholeText(text) {
   onInput();
   ed.scrollTop = top;
   edBack.scrollTop = top;
-  find.refresh();
+  find!.refresh();
 }
 
-function insertText(text, opts) {
+function insertText(text: string, opts?: { select?: boolean }) {
   const select = !!(opts && opts.select);
   if (editing() && lastSurface === 'preview') {
     preview.focus();
     if (savedRange) {
-      const sel = window.getSelection();
+      const sel = window.getSelection()!;
       sel.removeAllRanges();
       sel.addRange(savedRange);
     }
@@ -4317,7 +4562,7 @@ function insertText(text, opts) {
 // across highlight spans. (A multi-line answer split into new BLOCKS has
 // no text node for its newlines — the walk then reaches a hair further
 // left than the insertion; the common one-line answer is exact.)
-function selectBack(n) {
+function selectBack(n: number) {
   const sel = window.getSelection();
   if (!n || !sel || !sel.rangeCount) return;
   const caret = sel.getRangeAt(0);
@@ -4326,7 +4571,7 @@ function selectBack(n) {
     node = node.childNodes[off - 1];
     while (node && node.nodeType !== 3 && node.lastChild) node = node.lastChild;
     if (!node || node.nodeType !== 3) return;
-    off = node.nodeValue.length;
+    off = node.nodeValue!.length;
   }
   const endNode = node, endOff = off;
   const walker = document.createTreeWalker(preview, NodeFilter.SHOW_TEXT);
@@ -4337,7 +4582,7 @@ function selectBack(n) {
     const prev = walker.previousNode();
     if (!prev) { off = 0; break; }
     node = prev;
-    off = node.nodeValue.length;
+    off = node.nodeValue!.length;
   }
   const r = document.createRange();
   r.setStart(node, Math.max(0, off - left));
@@ -4365,37 +4610,37 @@ const emoji = setupEmoji({
 // of a dozen ../, which is both unreadable and one move away from breaking.
 // Markdown markers don't belong in a link's TEXT — `**Big** plans` names
 // the heading, "Big plans" labels the link.
-const cleanHead = (s) => String(s)
+const cleanHead = (s: string) => String(s)
   .replace(/\[([^\]]*)\]\([^))]*\)/g, '$1').replace(/[*_`~]/g, '').trim();
 // What a file answers to: its frontmatter title, else its first largest
 // heading (the heading index), else its filename — the old label, now the
 // fallback. A picked heading brings its own text and a #fragment.
-const titleOf = (f) => {
-  const hx = tree.heads()[f.orel || f.rel];
+const titleOf = (f: MentionFile) => {
+  const hx: HeadIndex | undefined = tree.heads()[(f.orel || f.rel)!];
   if (!hx) return null;
   if (hx.title) return hx.title;
   if (!hx.heads.length) return null;
   const top = Math.min(...hx.heads.map((h) => h.level));
-  return cleanHead(hx.heads.find((h) => h.level === top).text) || null;
+  return cleanHead(hx.heads.find((h) => h.level === top)!.text) || null;
 };
 // Format ▸ Link Options: a heading link can carry the whole trail above it
 // — H1 › H2 › SMS — joined by the separator of your choice. The trail is
 // read out of the heading index: walk back from the picked heading, keeping
 // each nearest-shallower heading until a top-level one closes it.
-const SEP = { chev: ' › ', gt: ' > ', slash: ' / ', dash: ' — ', colon: ': ' };
+const SEP: Record<string, string> = { chev: ' › ', gt: ' > ', slash: ' / ', dash: ' — ', colon: ': ' };
 const sepOf = () => SEP[prefs.linkSep] || SEP.chev;
-const headTrail = (f) => {
-  const hx = tree.heads()[f.orel || f.rel];
-  const i = hx ? hx.heads.findIndex((h) => h.slug === f.head.slug) : -1;
-  if (i < 0) return [f.head];
-  const trail = [hx.heads[i]];
-  let lvl = hx.heads[i].level;
+const headTrail = (f: MentionFile) => {
+  const hx: HeadIndex | undefined = tree.heads()[(f.orel || f.rel)!];
+  const i = hx ? hx.heads.findIndex((h) => h.slug === f.head!.slug) : -1;
+  if (i < 0) return [f.head!];
+  const trail = [hx!.heads[i]];
+  let lvl = hx!.heads[i].level;
   for (let j = i - 1; j >= 0 && lvl > 1; j--) {
-    if (hx.heads[j].level < lvl) { trail.unshift(hx.heads[j]); lvl = hx.heads[j].level; }
+    if (hx!.heads[j].level < lvl) { trail.unshift(hx!.heads[j]); lvl = hx!.heads[j].level; }
   }
   return trail;
 };
-const headLabel = (f) => (prefs.linkPath ? headTrail(f) : [f.head])
+const headLabel = (f: MentionFile) => (prefs.linkPath ? headTrail(f) : [f.head!])
   .map((h) => cleanHead(h.text)).filter(Boolean).join(sepOf());
 // How the path is written (Format ▸ Link Options): relative to the document
 // (the default), /from the folder's configured root, or /from the closest
@@ -4403,24 +4648,24 @@ const headLabel = (f) => (prefs.linkPath ? headTrail(f) : [f.head])
 // everything in en/ writes /sms/index.md for en/sms/index.md. Either /-mode
 // falls back to relative when the document or the target lives outside its
 // base, so a link is never written that couldn't resolve.
-const linkTarget = (f, image) => {
+const linkTarget = (f: MentionFile, image: boolean) => {
   const root = tree.root();
   const inside = docDir && root && (docDir === root || docDir.startsWith(root + '/'));
   if (!inside) return f.path;
   if (prefs.linkFrom === 'pin') {
     const pin = Object.keys(tree.pins())
-      .filter((d) => docDir === d || docDir.startsWith(d + '/'))
+      .filter((d) => docDir === d || docDir!.startsWith(d + '/'))
       .sort((a, b) => b.length - a.length)
       .find((d) => f.path.startsWith(d + '/'));
     if (pin) return '/' + f.path.slice(pin.length + 1);
   } else if (prefs.linkFrom === 'root') {
-    const r = tree.roots();
+    const r: { link: string; image: string } = tree.roots();
     const base = root + ((image ? r.image : r.link) ? '/' + (image ? r.image : r.link) : '');
     if (f.path.startsWith(base + '/')) return '/' + f.path.slice(base.length + 1);
   }
-  return relativeTo(docDir, f.path);
+  return relativeTo(docDir!, f.path);
 };
-const linkFor = (f) => {
+const linkFor = (f: MentionFile) => {
   const image = f.kind === 'image';
   const rel = linkTarget(f, image);
   const label = (f.head && headLabel(f))
@@ -4431,7 +4676,7 @@ const linkFor = (f) => {
 
 // in the textarea: put the markdown at `from`, swallowing the @ if one is
 // there (the menu route inserts at a caret with nothing to replace)
-function mentionIntoSource(from, f, replace = 1) {
+function mentionIntoSource(from: number, f: MentionFile, replace = 1) {
   const { rel, label, image, frag } = linkFor(f);
   const md = (image ? '!' : '') + `[${label}](${mdTarget(rel + (frag ? '#' + frag : ''))})`;
   ed.focus();
@@ -4442,13 +4687,13 @@ function mentionIntoSource(from, f, replace = 1) {
 // In the editable preview: put the caret back where it was — the palette's
 // own input took the focus, and without restoring the range WebKit inserts
 // at the top of the document — drop the @ behind it, then insert.
-function mentionIntoPreview(f, saved) {
+function mentionIntoPreview(f: MentionFile, saved?: Range) {
   const { rel, label, image, frag } = linkFor(f);
   const target = rel + (frag ? '#' + frag : '');
   // preventScroll: a bare focus() scrolls the pane to wherever WebKit last
   // remembered a selection — nowhere near the @ being replaced
   preview.focus({ preventScroll: true });
-  const sel = window.getSelection();
+  const sel = window.getSelection()!;
   const put = saved || savedRange;
   if (put) {
     sel.removeAllRanges();
@@ -4457,7 +4702,7 @@ function mentionIntoPreview(f, saved) {
   if (!sel.rangeCount) return;
   const r = sel.getRangeAt(0);
   if (r.startContainer.nodeType === 3 && r.startOffset > 0
-      && r.startContainer.nodeValue[r.startOffset - 1] === '@') {
+      && r.startContainer.nodeValue![r.startOffset - 1] === '@') {
     r.setStart(r.startContainer, r.startOffset - 1);
     r.deleteContents();
   }
@@ -4465,14 +4710,14 @@ function mentionIntoPreview(f, saved) {
   // trailing when it went in); with the link after it it's mid-line, so make
   // it an ordinary space rather than write U+00A0 into the file.
   const t = r.startContainer;
-  if (t.nodeType === 3 && r.startOffset > 0 && t.nodeValue[r.startOffset - 1] === '\u00A0') {
-    t.replaceData(r.startOffset - 1, 1, ' ');
+  if (t.nodeType === 3 && r.startOffset > 0 && t.nodeValue![r.startOffset - 1] === '\u00A0') {
+    (t as Text).replaceData(r.startOffset - 1, 1, ' ');
   }
   // Plain Range surgery, NOT execCommand('insertHTML'): WebKit's replace-
   // selection cleanup deletes "insignificant" whitespace around the caret,
   // and the space before the @ counts once the @ is gone — links used to
   // eat it. insertNode touches nothing around the insertion point.
-  let node;
+  let node: HTMLElement;
   if (image) {
     node = document.createElement('span');
     node.className = 'fig';
@@ -4494,7 +4739,7 @@ function mentionIntoPreview(f, saved) {
   // it, where the label's trim() quietly eats it.
   const tail = document.createTextNode('​');
   node.after(tail);
-  r.setStart(tail, tail.nodeValue.length);
+  r.setStart(tail, tail.nodeValue!.length);
   r.collapse(true);
   sel.removeAllRanges();
   sel.addRange(r);
@@ -4508,7 +4753,7 @@ function mentionIntoPreview(f, saved) {
 // what esc means here — "keep typing", as the hint promises — so it puts
 // the focus and the caret back where the @ was typed. Only for esc: a
 // click-away went somewhere else on purpose.
-function mentionPalette({ at, into, back }) {
+function mentionPalette({ at, into, back }: { at: DOMRect | null; into: (f: PaletteEntry) => void; back?: () => void }) {
   if (!tree.has()) return;
   const pin = pinView();
   palette.open({
@@ -4519,15 +4764,15 @@ function mentionPalette({ at, into, back }) {
       + '⏎ links it · ⇥ a heading in it · esc keeps typing',
     at,
     pick: into,
-    cancel: (byKey) => { if (byKey && back) back(); },
+    cancel: (byKey?: boolean) => { if (byKey && back) back(); },
   });
 }
 
-function mentionFromSource(from) {
+function mentionFromSource(from: number) {
   const rect = peer.caretRect(from);
   mentionPalette({
     at: rect || null,
-    into: (f) => mentionIntoSource(from, f),
+    into: (f: PaletteEntry) => mentionIntoSource(from, f as MentionFile),
     back: () => { ed.focus(); ed.setSelectionRange(from + 1, from + 1); },
   });
 }
@@ -4544,10 +4789,10 @@ function mentionFromPreview() {
   }
   mentionPalette({
     at: rect.height ? rect : null,
-    into: (f) => mentionIntoPreview(f, here),
+    into: (f: PaletteEntry) => mentionIntoPreview(f as MentionFile, here),
     back: () => {
       preview.focus();
-      const s = window.getSelection();
+      const s = window.getSelection()!;
       s.removeAllRanges();
       s.addRange(here);
     },
@@ -4556,22 +4801,22 @@ function mentionFromPreview() {
 
 // An @ only summons the picker at the start of a word — otherwise typing an
 // email address would open it mid-word, which is worse than useless.
-const typedAt = (e) => e.data && e.data.endsWith('@')
+const typedAt = (e: InputEvent) => e.data && e.data.endsWith('@')
   && (!e.inputType || e.inputType.startsWith('insertText'));
 // …meaning: not straight after a word. Punctuation is fine, an email is not.
-const opensMention = (before) => !before || !/[\w.+-]$/.test(before);
+const opensMention = (before: string | null) => !before || !/[\w.+-]$/.test(before);
 
 ed.addEventListener('input', (e) => {
-  if (!typedAt(e) || !tree.has()) return;
+  if (!typedAt(e as InputEvent) || !tree.has()) return;
   const at = ed.selectionStart - 1;
   if (opensMention(ed.value.slice(Math.max(0, at - 1), at))) mentionFromSource(at);
 });
 preview.addEventListener('input', (e) => {
-  if (!typedAt(e) || !tree.has() || !editing()) return;
+  if (!typedAt(e as InputEvent) || !tree.has() || !editing()) return;
   const sel = window.getSelection();
   const n = sel && sel.anchorNode;
-  const before = n && n.nodeType === 3 && sel.anchorOffset >= 2
-    ? n.nodeValue.slice(sel.anchorOffset - 2, sel.anchorOffset - 1) : '';
+  const before = n && n.nodeType === 3 && sel!.anchorOffset >= 2
+    ? n.nodeValue!.slice(sel.anchorOffset - 2, sel.anchorOffset - 1) : '';
   if (opensMention(before)) mentionFromPreview();
 });
 
@@ -4589,31 +4834,31 @@ const SLASH_TOKEN = 'nibslashblockhere';     // letters: its own paragraph, verb
 
 // the paragraph (or table cell) the caret is in, if all it holds is the
 // "/" just typed
-const onlySlash = (el) => el.textContent.replace(/[​ ]/g, '').trim() === '/';
+const onlySlash = (el: Node) => el.textContent!.replace(/[​ ]/g, '').trim() === '/';
 function slashLine() {
   const sel = window.getSelection();
   if (!sel || !sel.rangeCount || !sel.isCollapsed) return null;
   let n = sel.anchorNode;
-  while (n && n !== preview && !(n.nodeType === 1 && /^(P|TD|TH)$/.test(n.tagName))) n = n.parentNode;
-  if (n === preview) return bareSlash(sel.anchorNode);
-  if (!n || n.closest('.cb-t, .toc, .dlc')) return null;
-  return onlySlash(n) ? n : null;
+  while (n && n !== preview && !(n.nodeType === 1 && /^(P|TD|TH)$/.test((n as Element).tagName))) n = n.parentNode;
+  if (n === preview) return bareSlash(sel.anchorNode!);
+  if (!n || (n as Element).closest('.cb-t, .toc, .dlc')) return null;
+  return onlySlash(n) ? n as HTMLElement : null;
 }
 
 // An empty document has no paragraph to type into: WebKit puts the first
 // character straight into the article (or a bare <div>). A "/" there is
 // given the paragraph it would have had, and the caret put back after it.
-function bareSlash(node) {
-  let top = node;
+function bareSlash(node: Node) {
+  let top: Node | null = node;
   while (top && top.parentNode !== preview) top = top.parentNode;
-  if (!top || !(top.nodeType === 3 || top.tagName === 'DIV') || !onlySlash(top)) return null;
+  if (!top || !(top.nodeType === 3 || (top as Element).tagName === 'DIV') || !onlySlash(top)) return null;
   const p = document.createElement('p');
   p.textContent = '/';
-  top.replaceWith(p);
+  (top as ChildNode).replaceWith(p);
   const r = document.createRange();
-  r.setStart(p.firstChild, 1);
+  r.setStart(p.firstChild!, 1);
   r.collapse(true);
-  const s = window.getSelection();
+  const s = window.getSelection()!;
   s.removeAllRanges();
   s.addRange(r);
   return p;
@@ -4621,16 +4866,16 @@ function bareSlash(node) {
 
 // what a table cell can hold: inline things only — a block in a cell
 // isn't Markdown
-const INLINE_INSERTS = new Set(['image', 'link', 'emoji']);
+const INLINE_INSERTS = new Set<string | undefined>(['image', 'link', 'emoji']);
 
 preview.addEventListener('input', (e) => {
-  if (!editing() || e.data !== '/') return;
+  if (!editing() || (e as InputEvent).data !== '/') return;
   const line = slashLine();
   if (line) openSlash(line);
 });
 
-function openSlash(line) {
-  const sel = window.getSelection();
+function openSlash(line: HTMLElement) {
+  const sel = window.getSelection()!;
   const here = sel.getRangeAt(0).cloneRange();
   let rect = here.getBoundingClientRect();
   if (!rect.height) rect = line.getBoundingClientRect();
@@ -4647,11 +4892,11 @@ function openSlash(line) {
     hintText: '↑↓ to choose · ⏎ inserts · esc keeps the /',
     emptyText: 'Nothing by that name to insert',
     at: rect.height ? rect : null,
-    pick: (f) => slashInsert(line, f.slash),
-    cancel: (byKey) => {
+    pick: (f: PaletteEntry) => slashInsert(line, f.slash!),
+    cancel: (byKey?: boolean) => {
       if (!byKey) return;
       preview.focus({ preventScroll: true });
-      const s = window.getSelection();
+      const s = window.getSelection()!;
       s.removeAllRanges();
       s.addRange(here);
     },
@@ -4659,7 +4904,7 @@ function openSlash(line) {
 }
 
 // an empty paragraph with the caret in it — what the pickers insert at
-function caretInto(p) {
+function caretInto(p: HTMLElement) {
   p.textContent = '';
   // a cell holds a caret empty; a <br> there would come back as a break
   if (!/^(TD|TH)$/.test(p.tagName)) p.appendChild(document.createElement('br'));
@@ -4667,7 +4912,7 @@ function caretInto(p) {
   const r = document.createRange();
   r.setStart(p, 0);
   r.collapse(true);
-  const s = window.getSelection();
+  const s = window.getSelection()!;
   s.removeAllRanges();
   s.addRange(r);
   savedRange = r.cloneRange();
@@ -4676,24 +4921,24 @@ function caretInto(p) {
 
 // Select an element's text, first character to last, skipping anything
 // that isn't words (a task box, the ZWSP perches live editing leaves).
-function selectText(el) {
+function selectText(el: Node) {
   const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT,
-    { acceptNode: (t) => (t.nodeValue.replace(/​/g, '').trim()
+    { acceptNode: (t) => (t.nodeValue!.replace(/​/g, '').trim()
       ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT) });
   const first = walk.nextNode();
   if (!first) return false;
   let last = first;
   for (let t = walk.nextNode(); t; t = walk.nextNode()) last = t;
   const r = document.createRange();
-  r.setStart(first, first.nodeValue.search(/\S/));
-  r.setEnd(last, last.nodeValue.replace(/\s+$/, '').length);
-  const s = window.getSelection();
+  r.setStart(first, first.nodeValue!.search(/\S/));
+  r.setEnd(last, last.nodeValue!.replace(/\s+$/, '').length);
+  const s = window.getSelection()!;
   s.removeAllRanges();
   s.addRange(r);
   return true;
 }
 
-async function slashInsert(line, it) {
+async function slashInsert(line: HTMLElement, it: SlashItem) {
   if (!line.isConnected || !editing()) return;
   if (it.run === 'image' || it.run === 'link' || it.run === 'emoji') {
     caretInto(line);
@@ -4720,9 +4965,9 @@ async function slashInsert(line, it) {
   const at = lines.findIndex((l) => l.includes(SLASH_TOKEN));
   if (at < 0) { caretInto(line); toast('Couldn’t insert that here'); return; }
   const prefix = lines[at].slice(0, lines[at].indexOf(SLASH_TOKEN));
-  lines.splice(at, 1, ...md.split('\n').map((l) => (l ? prefix + l : prefix.trimEnd())));
+  lines.splice(at, 1, ...md!.split('\n').map((l) => (l ? prefix + l : prefix.trimEnd())));
   applyWholeText(lines.join('\n'));
-  clearTimeout(renderTimer);
+  clearTimeout(renderTimer!);
   render();
   placeAfterSlash(at, it);
 }
@@ -4733,7 +4978,7 @@ async function slashInsert(line, it) {
 // into the empty paragraph the caret sits in, else a new one after the
 // caret's block — and in the source on the caret's line if it's blank,
 // else after it with a blank line either side.
-async function insertBlock(id) {
+async function insertBlock(id: string) {
   const it = nibSlashItems(prefs, { folder: tree.has() }).find((x) => x.id === id);
   if (!it) return;
   if (it.run === 'image') return pickImage();
@@ -4743,10 +4988,10 @@ async function insertBlock(id) {
     const sel = window.getSelection();
     let top = sel && sel.rangeCount && preview.contains(sel.anchorNode) ? sel.anchorNode : null;
     while (top && top.parentNode !== preview) top = top.parentNode;
-    let line = top && top.nodeType === 1 && top.tagName === 'P' && !top.textContent.trim() ? top : null;
+    let line = top && top.nodeType === 1 && (top as Element).tagName === 'P' && !top.textContent!.trim() ? top as HTMLElement : null;
     if (!line) {
       line = document.createElement('p');
-      if (top) top.after(line); else preview.appendChild(line);
+      if (top) (top as ChildNode).after(line); else preview.appendChild(line);
     }
     return slashInsert(line, it);
   }
@@ -4769,7 +5014,7 @@ async function insertBlock(id) {
   if (blankLine) ed.setRangeText(md + tail, ls, le);
   else ed.setRangeText('\n\n' + md + tail, le, le);
   history.record(ed.value, true);
-  ed.setSelectionRange(from + md.length, from + md.length);
+  ed.setSelectionRange(from + md!.length, from + md!.length);
   if (view !== 'preview') ed.focus();
   onInput();
 }
@@ -4792,14 +5037,14 @@ pushInsertMenu();
 // Where the caret goes once the block is on screen: its placeholder words,
 // selected — or, for a block with nothing to type into, the line after it
 // (made, if the block was the last thing in the document).
-function placeAfterSlash(line, it) {
-  const block = preview.querySelector(`[data-line="${line}"]`);
+function placeAfterSlash(line: number, it: SlashItem) {
+  const block = preview.querySelector<HTMLElement>(`[data-line="${line}"]`);
   preview.focus({ preventScroll: true });
   if (!block) return;
   block.scrollIntoView({ block: 'nearest' });
   const target = !it.sel ? null : it.sel === 'self' ? block : block.querySelector(it.sel);
   if (target && selectText(target)) return;
-  let next = block.nextElementSibling;
+  let next = block.nextElementSibling as HTMLElement | null;
   if (!next || next.tagName !== 'P') {
     next = document.createElement('p');
     block.after(next);
@@ -4820,15 +5065,15 @@ function insertFileLink() {
     placeholder: 'Link a file…',
     hintText: (pin.label ? pin.label + ' · ' : '')
       + '⏎ links it · ⇥ a heading in it · esc to dismiss',
-    pick: (f) => insertPick(f, { from, replace, inPv }),
+    pick: (f: PaletteEntry) => insertPick(f as MentionFile, { from, replace, inPv }),
     // esc goes back to the editor, selection as it was (same promise the
     // @ mention makes; savedRange holds the preview's own)
-    cancel: (byKey) => {
+    cancel: (byKey?: boolean) => {
       if (!byKey) return;
       if (inPv) {
         preview.focus();
         if (savedRange) {
-          const s = window.getSelection();
+          const s = window.getSelection()!;
           s.removeAllRanges();
           s.addRange(savedRange);
         }
@@ -4843,11 +5088,11 @@ function insertFileLink() {
 // Where a picked file actually lands. The caret has to be remembered BEFORE
 // the palette (or the tree, or a menu) takes the focus — after that the
 // textarea's selection is stale and the preview's range is gone entirely.
-function insertPick(f, { from, replace = 0, inPv }) {
+function insertPick(f: MentionFile, { from, replace = 0, inPv }: { from: number; replace?: number; inPv: boolean }) {
   if (!inPv) { mentionIntoSource(from, f, replace); return; }
   preview.focus();
   if (savedRange) {
-    const s = window.getSelection();
+    const s = window.getSelection()!;
     s.removeAllRanges();
     s.addRange(savedRange);
   }
@@ -4870,7 +5115,7 @@ function renameCurrent() {
 
 // Files ▸ right-click ▸ Insert Link Here. Same insertion, no picker: the
 // file is the one you right-clicked.
-function insertNodeLink(node) {
+function insertNodeLink(node: TreeNode) {
   if (kind !== 'doc') return;
   insertPick({ path: node.path, name: node.name, kind: node.kind }, {
     from: ed.selectionStart,
@@ -4936,7 +5181,7 @@ tiny.menu.on((id) => {
 
 // The page's half of a menu click — named so the command palette can fire
 // it directly: a palette pick IS a menu click, minus the mouse.
-async function menuAct(id) {
+async function menuAct(id: string) {
   if (kind !== 'doc' && (DOC_ONLY.has(id) || id.startsWith('ins:'))) {
     toast(kind === 'image' ? 'That tab is a picture.' : 'That tab is a diff.');
     return;
@@ -4978,16 +5223,16 @@ async function menuAct(id) {
   else if (id === 'default-md') makeDefaultUI();
   else if (id === 'install-cli') installCliUI();
   else if (id === 'openfolder') pickFolder();
-  else if (id === 'find') find.open({ seed: findSeed() });
-  else if (id === 'find:replace') find.open({ replace: true, seed: findSeed() });
-  else if (id === 'find:next') find.next();
-  else if (id === 'find:prev') find.prev();
+  else if (id === 'find') find!.open({ seed: findSeed() });
+  else if (id === 'find:replace') find!.open({ replace: true, seed: findSeed() });
+  else if (id === 'find:next') find!.next();
+  else if (id === 'find:prev') find!.prev();
   else if (id === 'find:folder') openSearch();
   else if (id === 'quickopen') quickOpen();
   else if (id === 'palette') quickOpen('>');
   else if (id === 'insertlink') insertFileLink();
   else if (id === 'renamefile') renameCurrent();
-  else if (id === 'cleanassets') openCleanup(tree.root());
+  else if (id === 'cleanassets') openCleanup(tree.root()!);
   else if (id === 'brokenlinks') openLinks({ gone: null });
   else if (id === 'sitemenu') openMenu();
   else if (id === 'sm:undo' || id === 'sm:redo') siteMenu.history(id === 'sm:redo');
@@ -5022,12 +5267,12 @@ const gutter = $('gutter');
 gutter.addEventListener('pointerdown', (e) => {
   gutter.setPointerCapture(e.pointerId);
   gutter.classList.add('drag');
-  const move = (ev) => {
+  const move = (ev: PointerEvent) => {
     // Measured across the two panes only — the sidebars sit either side of
     // them and would otherwise offset every drag. The result is a pair of
     // grow factors, so the split holds when a sidebar opens or closes.
-    const pane = document.getElementById('editorPane');
-    const pv = document.getElementById('previewPane');
+    const pane = document.getElementById('editorPane')!;
+    const pv = document.getElementById('previewPane')!;
     const left = pane.getBoundingClientRect().left;
     const right = pv.getBoundingClientRect().right;
     const pct = Math.min(80, Math.max(20, ((ev.clientX - left) / (right - left)) * 100));
@@ -5045,9 +5290,9 @@ gutter.addEventListener('pointerdown', (e) => {
 
 // The sidebar grips work the same way; the width only reaches the store on
 // pointer-up, so a drag is one write. Double-click puts the stock width back.
-function paneGrip(id, pane, widthAt) {
+function paneGrip(id: string, pane: Pane, widthAt: (x: number) => number) {
   const grip = $(id);
-  const set = (w) => {
+  const set = (w: number) => {
     paneW[pane] = w;
     const v = pane === 'files' ? '--filw' : '--outw';
     document.body.style.setProperty(v, w + 'px');       // grip exists ⇒ pane is open
@@ -5056,7 +5301,7 @@ function paneGrip(id, pane, widthAt) {
   grip.addEventListener('pointerdown', (e) => {
     grip.setPointerCapture(e.pointerId);
     grip.classList.add('drag');
-    const move = (ev) => set(clampPane(widthAt(ev.clientX)));
+    const move = (ev: PointerEvent) => set(clampPane(widthAt(ev.clientX)));
     const up = () => {
       grip.classList.remove('drag');
       grip.removeEventListener('pointermove', move);
@@ -5092,7 +5337,7 @@ const actions = setupActions({
   // bubble is re-measured when the ⚡ appears or goes away
   bubble: $('bubble'), bubbleActs: $('bubbleActs'), bubbleActsMenu: $('bubbleActsMenu'),
   onSelActs: () => live.positionBubble(),
-  context: () => {
+  context: (): ActionContext => {
     const a = ed.selectionStart, b = ed.selectionEnd;
     const before = ed.value.slice(0, a);
     return {
@@ -5111,7 +5356,7 @@ const actions = setupActions({
   applyText: applyWholeText,
   insertText,
   toast,
-  onBusy: (on) => $('btnActions').classList.toggle('busy', on),
+  onBusy: (on: boolean) => $('btnActions').classList.toggle('busy', on),
   onManage: () => actionEditor.open('global'),
 });
 
@@ -5120,7 +5365,7 @@ const actions = setupActions({
 // isn't offered one, rather than being shown a door that doesn't open.
 const actionEditor = setupActionEditor({
   open: async () => {
-    const out = [];
+    const out: ActionFileTab[] = [];
     const mine = await tiny.api.call('actionsFile', { scope: 'global' });
     if (mine && !mine.error) out.push({ scope: 'global', name: 'My Actions' });
     const theirs = await tiny.api.call('actionsFile', { scope: 'project' });
@@ -5157,7 +5402,7 @@ const speech = setupSpeech({
   toast,
   textBefore: () => ed.value.slice(0, ed.selectionStart),
 });
-const syncSpeech = (st) => speech.setEnabled(!!(st && st.speech) && speech.available);
+const syncSpeech = (st: { speech?: boolean } | null) => speech.setEnabled(!!(st && st.speech) && speech.available);
 tiny.api.call('aiStatus').then(syncSpeech);
 tiny.api.on('ai-config', syncSpeech);
 // Whether dictation is even possible depends on the engine, which only a
@@ -5167,15 +5412,15 @@ tiny.api.call('speechPossible', { yes: speech.available });
 
 // ----------------------------------------------------------------- misc
 
-let toastTimer = null;
-function toast(text) {
+let toastTimer: ReturnType<typeof setTimeout> | null = null;
+function toast(text: string) {
   const t = $('toast');
   t.textContent = text;
   t.hidden = false;
-  clearTimeout(toastTimer);
+  clearTimeout(toastTimer!);
   toastTimer = setTimeout(() => { t.hidden = true; }, 1800);
 }
-tiny.api.on('toast', ({ text }) => toast(text));
+tiny.api.on('toast', ({ text }: { text: string }) => toast(text));
 
 // Dropped files split two ways: documents open, pictures get imported — and
 // a picture dropped on a document is a PASTE, in every sense. Same folder,
@@ -5186,11 +5431,11 @@ tiny.api.on('toast', ({ text }) => toast(text));
 //
 // A window showing a picture has nothing to paste into: another picture
 // dropped on it just opens as its own tab.
-let dragAt = null;
+let dragAt: { x: number; y: number; at: number } | null = null;
 for (const ev of ['dragover', 'dragenter']) {
   // recorded, never prevented: making the page a drop target would let
   // WebKit handle the file itself, and the backend's onDrop owns that
-  addEventListener(ev, (e) => { dragAt = { x: e.clientX, y: e.clientY, at: Date.now() }; });
+  addEventListener(ev, (e) => { dragAt = { x: (e as DragEvent).clientX, y: (e as DragEvent).clientY, at: Date.now() }; });
 }
 addEventListener('dragleave', () => { dragAt = null; });
 // …and the editable preview IS a drop target by nature, so a picture dropped
@@ -5204,7 +5449,7 @@ function caretToDrop() {
   if (editing() && preview.contains(document.elementFromPoint(x, y))) {
     const r = document.caretRangeFromPoint && document.caretRangeFromPoint(x, y);
     if (!r) return;
-    const sel = window.getSelection();
+    const sel = window.getSelection()!;
     sel.removeAllRanges();
     sel.addRange(r);
     preview.focus();
@@ -5238,9 +5483,9 @@ tiny.win.onDrop(async (paths) => {
 // The call carries no numbers: innerWidth here is CSS pixels, which UI
 // zoom divides, so a zoomed window that reported its own size spawned the
 // next one smaller by the zoom factor. The backend measures the window.
-let sizeTimer = null;
+let sizeTimer: ReturnType<typeof setTimeout> | null = null;
 window.addEventListener('resize', () => {
-  clearTimeout(sizeTimer);
+  clearTimeout(sizeTimer!);
   sizeTimer = setTimeout(() => tiny.api.call('rememberSize'), 400);
 });
 

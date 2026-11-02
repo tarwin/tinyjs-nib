@@ -12,7 +12,7 @@
 
 export const smokeOn = !!tjs.env.NIB_SMOKE;
 
-interface SmokeReport {
+export interface SmokeReport {
   ok?: string;          // page path, once it has loaded
   nodes?: number;
   err?: string;

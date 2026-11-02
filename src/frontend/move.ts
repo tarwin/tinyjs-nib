@@ -5,26 +5,26 @@
 // the file keeps the ending it had. Every line outside the moved run stays
 // byte-for-byte, so a move is a move in the diff, never a reflow.
 
-const blank = (l) => l.trim() === '';
+const blank = (l: string) => l.trim() === '';
 
 // → { text, line } with `line` where the moved run now starts, or null
 // when nothing would move (into itself, or nothing there)
-function moveLines(text, a, b, t) {
-  const ending = text.match(/\n*$/)[0];
+function moveLines(text: string, a: number, b: number, t: number): { text: string; line: number } | null {
+  const ending = text.match(/\n*$/)![0];
   const lines = text.slice(0, text.length - ending.length).split('\n');
   b = Math.min(b, lines.length);
   t = Math.min(t, lines.length);
   if (a >= b || (t >= a && t <= b)) return null;
 
   const chunk = lines.slice(a, b);
-  let gap = [];
-  while (chunk.length && blank(chunk[chunk.length - 1])) gap.unshift(chunk.pop());
+  let gap: string[] = [];
+  while (chunk.length && blank(chunk[chunk.length - 1])) gap.unshift(chunk.pop()!);
   if (!chunk.length) return null;
   if (!gap.length) gap = [''];                     // it was last: give it one
 
   const rest = lines.slice(0, a).concat(lines.slice(b));
   const at = t > b ? t - (b - a) : t;
-  let out, line;
+  let out: string[], line: number;
   if (at >= rest.length) {                         // to the very end
     while (rest.length && blank(rest[rest.length - 1])) rest.pop();
     if (rest.length) rest.push('');

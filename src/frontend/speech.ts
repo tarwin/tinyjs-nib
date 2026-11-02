@@ -14,18 +14,43 @@
 
 const Recognizer = window.SpeechRecognition || window.webkitSpeechRecognition;
 
-function setupSpeech({ button, insertText, toast, textBefore }) {
+export interface SpeechOptions {
+  /** the mic button: toggles, shows .live while listening */
+  button: HTMLElement;
+  insertText: (s: string) => void;
+  toast: (msg: string) => void;
+  /** the text left of the caret, for spacing and capitals */
+  textBefore?: () => string;
+}
+
+export interface Speech {
+  available: boolean;
+  setEnabled(v: unknown): void;
+  toggle(): void;
+  readonly listening?: boolean;
+}
+
+/** The slice of a SpeechRecognitionEvent read here. */
+interface SpeechResultEvent {
+  resultIndex: number;
+  results: ArrayLike<{ isFinal: boolean; 0: { transcript: string } }>;
+}
+
+/** A recognizer, plus the hook stop() uses to end its restart loop. */
+type Rec = SpeechRecognitionLike & { stopWanted?: () => void };
+
+function setupSpeech({ button, insertText, toast, textBefore }: SpeechOptions): Speech {
   if (!Recognizer) return { available: false, setEnabled() {}, toggle() {} };
 
-  let rec = null;
+  let rec: Rec | null = null;
   let on = false;
-  let pill = null;
+  let pill: HTMLDivElement | null = null;
   let wanted = false;               // the setting, not the state
 
   // What the interim text looks like while it is still being decided. It is
   // NOT inserted — a document that fills with guesses and un-fills again is
   // unusable, and undo would carry every revision.
-  function showPill(text) {
+  function showPill(text: string) {
     if (!pill) {
       pill = document.createElement('div');
       pill.id = 'micPill';
@@ -40,7 +65,7 @@ function setupSpeech({ button, insertText, toast, textBefore }) {
   // space after a word, a capital after a full stop. Both are decided from
   // what is already to the left of the caret, which is the only thing that
   // can know.
-  function fit(text) {
+  function fit(text: string) {
     const before = (textBefore ? textBefore() : '') || '';
     let s = text.trim();
     if (!s) return '';
@@ -53,7 +78,7 @@ function setupSpeech({ button, insertText, toast, textBefore }) {
   function start() {
     if (on) return;
     let wantsMore = true;
-    rec = new Recognizer();
+    rec = new Recognizer!();
     rec.continuous = true;
     rec.interimResults = true;
     rec.lang = navigator.language || 'en-US';
@@ -63,7 +88,7 @@ function setupSpeech({ button, insertText, toast, textBefore }) {
       button.classList.add('live');
       showPill('');
     };
-    rec.onresult = (e) => {
+    rec.onresult = (e: SpeechResultEvent) => {
       let interim = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const r = e.results[i];
@@ -76,7 +101,7 @@ function setupSpeech({ button, insertText, toast, textBefore }) {
       }
       showPill(interim);
     };
-    rec.onerror = (e) => {
+    rec.onerror = (e: { error: string }) => {
       // The two that mean something specific. Everything else is a network
       // or audio hiccup and stopping quietly is the right answer.
       if (e.error === 'service-not-allowed') {
@@ -92,12 +117,12 @@ function setupSpeech({ button, insertText, toast, textBefore }) {
     // Recognizers stop themselves after a pause. Continuous means continuous
     // to the person holding the button, so it goes again until they say no.
     rec.onend = () => {
-      if (on && wantsMore) { try { rec.start(); return; } catch { /* fall through */ } }
+      if (on && wantsMore) { try { rec!.start(); return; } catch { /* fall through */ } }
       stop();
     };
 
     rec.stopWanted = () => { wantsMore = false; };
-    try { rec.start(); } catch (e) { toast('Dictation didn’t start: ' + e.message); }
+    try { rec.start(); } catch (e) { toast('Dictation didn’t start: ' + (e as Error).message); }
   }
 
   function stop() {
@@ -128,7 +153,7 @@ function setupSpeech({ button, insertText, toast, textBefore }) {
 
   return {
     available: true,
-    setEnabled(v) {
+    setEnabled(v: unknown) {
       wanted = !!v;
       button.hidden = !wanted;
       if (!wanted && on) stop();

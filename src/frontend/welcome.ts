@@ -4,19 +4,37 @@ import { nibApplyAppearance } from './appearance.ts';
 import { checkForUpdatesUI, installCliUI, makeDefaultUI } from './updates.ts';
 import { setupZoom } from './zoom.ts';
 
-const $ = (id) => document.getElementById(id);
+const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
+
+/** A row of the recents lists. */
+interface RecentEntry {
+  path: string;
+  exists?: boolean;
+  /** folders only: a window has it open now */
+  open?: boolean;
+}
+
+/** The 'welcome' event / the boot payload, as this page reads it (main.ts). */
+interface WelcomeState {
+  appearance?: string;
+  untitledDraft?: boolean;
+  recents: RecentEntry[];
+  folders?: RecentEntry[];
+  zoom?: number;
+  introSeen?: boolean;
+}
 
 let appearance = 'system';
 // Resolving Light / Dark / Match System — and remembering the answer, so
 // the next window opens already knowing (appearance.ts).
-async function applyAppearance(a) {
+async function applyAppearance(a: string | null | undefined) {
   appearance = a || 'system';
   await nibApplyAppearance(appearance);
 }
 tiny.theme.on(() => { if (appearance === 'system') applyAppearance('system'); });
 tiny.api.on('appearance', ({ appearance: a }) => applyAppearance(a));
 
-function paint(p) {
+function paint(p: WelcomeState) {
   if (p.appearance) applyAppearance(p.appearance);
   $('draftCard').hidden = !p.untitledDraft;
 
@@ -31,12 +49,12 @@ function paint(p) {
 
   // One row shape for both lists — a folder just opens a whole tree instead
   // of a single document, and says so with its icon.
-  const heading = (text) => {
+  const heading = (text: string) => {
     const h = document.createElement('h2');
     h.textContent = text;
     box.appendChild(h);
   };
-  const rowFor = (r, { folder }) => {
+  const rowFor = (r: RecentEntry, { folder }: { folder: boolean }) => {
     const row = document.createElement('div');
     row.className = 'recent' + (r.exists ? '' : ' gone');
     const slash = r.path.lastIndexOf('/');
@@ -123,7 +141,7 @@ $('btnCli').onclick = () => installCliUI();
 // The Introduction banner, first launches only. Reading it or closing it
 // both retire it for good — the goodbye line says where it lives on
 // (Help ▸ Introduction to Nib), then the bar fades out.
-function retireIntro(open) {
+function retireIntro(open: boolean) {
   tiny.api.call('dismissIntro');
   if (open) tiny.api.call('openHelp');
   const bar = $('introBar');
@@ -139,7 +157,7 @@ $('introX').onclick = () => retireIntro(false);
 tiny.menu.on(async (id) => {
   if (!document.hasFocus()) return;
   if (id === 'new') tiny.api.call('newDoc');
-  else if (id === 'open') $('btnOpen').onclick();
+  else if (id === 'open') ($('btnOpen').onclick as () => void)();   // the handler above takes no event
   else if (id === 'openfolder') openFolder();
   // 'closefolder' and 'newwindow' are the backend's — they need no page state
   else if (id === 'check-updates') checkForUpdatesUI();
@@ -160,14 +178,14 @@ document.addEventListener('drop', () => document.body.classList.remove('dropping
 // The call carries no numbers: innerWidth here is CSS pixels, which UI
 // zoom divides, so a zoomed Welcome that reported its own size came back
 // smaller every launch. The backend measures the window itself.
-let sizeTimer = null;
+let sizeTimer: number | null = null;
 addEventListener('resize', () => {
-  clearTimeout(sizeTimer);
+  clearTimeout(sizeTimer as number | undefined);   // null is a no-op too
   sizeTimer = setTimeout(() => tiny.api.call('rememberWelcomeSize'), 400);
 });
 
 tiny.api.on('welcome', paint);
-const boot = await tiny.api.call('boot');
+const boot: WelcomeState = await tiny.api.call('boot');
 setupZoom(boot.zoom);
 $('introBar').hidden = !!boot.introSeen;
 paint(boot);

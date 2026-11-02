@@ -16,17 +16,73 @@
 // line — an actions file whose every entry exploded into eight rows would be
 // "formatted" and much worse to read.
 
-const isDigit = (c) => c >= '0' && c <= '9';
-const isSpace = (c) => c === ' ' || c === '\t' || c === '\r' || c === '\n';
+/** a token's kind: `bad` is anything the grammar has no place for */
+export type JsonTokenKind = 'ws' | 'comment' | 'str' | 'bad' | 'num' | 'lit' | 'punct';
+
+interface JsonPos { line: number; col: number }
+
+export interface JsonToken extends JsonPos {
+  t: JsonTokenKind;
+  /** the token's source text, exactly as written */
+  v: string;
+  /** offset into the text */
+  i: number;
+}
+
+export interface JsonComment {
+  /** the comment as written, its slashes and stars included */
+  text: string;
+  /** a blank line came before it */
+  blankBefore: boolean;
+  /** it sits at the end of a line with something before it */
+  sameLine: boolean;
+}
+
+/** one object member (with `key`, its source spelling, quotes and all) or
+ *  one array item (no key) */
+export interface JsonMember {
+  key?: string;
+  lead: JsonComment[];
+  trail: JsonComment[];
+  blankBefore?: boolean;
+  value: JsonNode;
+}
+
+/** a string, number, true, false or null, as written */
+export interface JsonLit { kind: 'lit'; raw: string }
+export interface JsonObj { kind: 'obj'; members: JsonMember[]; tail: JsonComment[] }
+export interface JsonArr { kind: 'arr'; items: JsonMember[]; tail: JsonComment[] }
+export type JsonNode = JsonLit | JsonObj | JsonArr;
+
+/** a whole document: the root value and the comments around it */
+export interface JsonTree { root: JsonNode; head: JsonComment[]; tail: JsonComment[] }
+
+/** check()'s answer: the tree, or where and why it failed */
+export type JsonCheck =
+  | { ok: true; tree: JsonTree }
+  | { ok: false; message: string; line: number; col: number; full: string };
+
+export interface JsonPrintOptions {
+  /** spaces per level (2) */
+  indent?: number;
+  /** the widest line a container may collapse onto (100) */
+  width?: number;
+}
+
+/** what parse() throws: the message plus where, and the message bare */
+interface JsonError extends Error { line: number; col: number; short: string }
+
+const isDigit = (c: string) => c >= '0' && c <= '9';
+const isSpace = (c: string) => c === ' ' || c === '\t' || c === '\r' || c === '\n';
 
 // ------------------------------------------------------------- tokenizer
 
-function tokenize(text) {
-  const out = [];
+function tokenize(text: string): JsonToken[] {
+  const out: JsonToken[] = [];
   let i = 0, line = 1, col = 1;
   const at = () => ({ i, line, col });
-  const push = (t, v, p) => out.push({ t, v, i: p.i, line: p.line, col: p.col });
-  const step = (n) => {
+  const push = (t: JsonTokenKind, v: string, p: JsonPos & { i: number }) => out.push({ t, v, i: p.i, line: p.line, col: p.col });
+  const step = (n: number) => {
     for (let k = 0; k < n; k++) {
       if (text[i] === '\n') { line++; col = 1; } else col++;
       i++;
@@ -101,13 +157,13 @@ function tokenize(text) {
 // on whatever comes next (or, when they sit at the end of a line with
 // something before them, on what came before — a trailing note).
 
-function parse(text) {
+function parse(text: string): JsonTree {
   const toks = tokenize(text);
   let k = 0;
 
-  const err = (msg, tok) => {
+  const err = (msg: string, tok?: JsonPos): never => {
     const t = tok || toks[k] || { line: lastLine(), col: lastCol() };
-    const e = new Error(msg + ' (line ' + t.line + ', column ' + t.col + ')');
+    const e = new Error(msg + ' (line ' + t.line + ', column ' + t.col + ')') as JsonError;
     e.line = t.line; e.col = t.col; e.short = msg;
     throw e;
   };
@@ -117,7 +173,7 @@ function parse(text) {
   // Comments (and whether a blank line preceded them, which is worth
   // keeping — a paragraph break in a config file is deliberate).
   function trivia() {
-    const got = [];
+    const got: JsonComment[] = [];
     let newlines = 0;
     while (k < toks.length && (toks[k].t === 'ws' || toks[k].t === 'comment')) {
       if (toks[k].t === 'ws') newlines += (toks[k].v.match(/\n/g) || []).length;
@@ -128,9 +184,9 @@ function parse(text) {
   }
 
   const peek = () => toks[k];
-  const isPunct = (v) => peek() && peek().t === 'punct' && peek().v === v;
+  const isPunct = (v: string) => peek() && peek().t === 'punct' && peek().v === v;
 
-  function value() {
+  function value(): JsonNode {
     const t = peek();
     if (!t) err('Unexpected end of file — a value was expected');
     if (t.t === 'punct' && t.v === '{') return container('}');
@@ -148,12 +204,12 @@ function parse(text) {
   // of a comma a comment belongs to. The rule: a comment on the SAME LINE
   // as the value it follows is that member's trailing note; anything else
   // leads whatever comes next (or ends the container).
-  function container(close) {
+  function container(close: string): JsonObj | JsonArr {
     const open = peek();
     const obj = close === '}';
     k++;
-    const list = [];
-    let carried = [];
+    const list: JsonMember[] = [];
+    let carried: JsonComment[] = [];
     for (;;) {
       const lead = trivia();
       if (!peek()) err('Unclosed “' + (obj ? '{' : '[') + '”', open);
@@ -162,7 +218,8 @@ function parse(text) {
         return obj ? { kind: 'obj', members: list, tail: carried.concat(lead.comments) }
           : { kind: 'arr', items: list, tail: carried.concat(lead.comments) };
       }
-      const item = { lead: carried.concat(lead.comments), blankBefore: lead.blankBefore, trail: [] };
+      // `value` (and `key`) are filled in below, before it goes in the list
+      const item = { lead: carried.concat(lead.comments), blankBefore: lead.blankBefore, trail: [] } as Omit<JsonMember, 'value'> as JsonMember;
       carried = [];
       if (obj) {
         const kt = peek();
@@ -211,18 +268,18 @@ function parse(text) {
 
 // ------------------------------------------------------------- the check
 
-function check(text) {
+function check(text: string): JsonCheck {
   try {
     return { ok: true, tree: parse(text) };
   } catch (e) {
-    return { ok: false, message: e.short || e.message, line: e.line || 1, col: e.col || 1,
-      full: e.message };
+    return { ok: false, message: (e as JsonError).short || (e as JsonError).message, line: (e as JsonError).line || 1,
+      col: (e as JsonError).col || 1, full: (e as JsonError).message };
   }
 }
 
 // ------------------------------------------------------------ the format
 
-function format(text, opts) {
+function format(text: string, opts?: JsonPrintOptions): string {
   const r = check(text);
   if (!r.ok) throw Object.assign(new Error(r.full), r);
   return printTree(r.tree, opts);
@@ -231,11 +288,11 @@ function format(text, opts) {
 // The same layout, from a tree rather than from text — which is what lets
 // the actions editor change one entry and write the file back with every
 // comment around it still in place.
-function printTree(t, { indent = 2, width = 100 } = {}) {
-  const pad = (d) => ' '.repeat(indent * d);
-  const out = [];
+function printTree(t: JsonTree, { indent = 2, width = 100 }: JsonPrintOptions = {}): string {
+  const pad = (d: number) => ' '.repeat(indent * d);
+  const out: string[] = [];
 
-  const hasComment = (n) => {
+  const hasComment = (n: JsonNode | undefined): boolean => {
     if (!n) return false;
     if (n.kind === 'obj') {
       return n.members.some((m) => m.lead.length || m.trail.length || hasComment(m.value))
@@ -249,7 +306,7 @@ function printTree(t, { indent = 2, width = 100 } = {}) {
   };
 
   // one line, no comments — used to decide whether a container can collapse
-  const inline = (n) => {
+  const inline = (n: JsonNode): string => {
     if (n.kind === 'lit') return n.raw;
     if (n.kind === 'obj') {
       return n.members.length
@@ -258,14 +315,14 @@ function printTree(t, { indent = 2, width = 100 } = {}) {
     return n.items.length ? '[' + n.items.map((it) => inline(it.value)).join(', ') + ']' : '[]';
   };
 
-  const commentLines = (c, d) => {
+  const commentLines = (c: JsonComment, d: number) => {
     // a block comment keeps its own interior; only its first line is placed
     const lines = c.text.split('\n');
     out.push(pad(d) + lines[0].trimEnd());
     for (let i = 1; i < lines.length; i++) out.push(pad(d) + lines[i].trim());
   };
 
-  function emit(n, d, prefix, suffix) {
+  function emit(n: JsonNode, d: number, prefix: string, suffix: string) {
     if (n.kind === 'lit') { out.push(prefix + n.raw + suffix); return; }
     const empty = n.kind === 'obj' ? !n.members.length : !n.items.length;
     if (empty) { out.push(prefix + (n.kind === 'obj' ? '{}' : '[]') + suffix); return; }
@@ -311,13 +368,13 @@ function printTree(t, { indent = 2, width = 100 } = {}) {
 // One <div class="ln"> per SOURCE line, exactly like hl.ts — the backdrop
 // and the textarea have to wrap identically or the two drift apart.
 
-const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
-const esc = (s) => String(s).replace(/[&<>]/g, (c) => ESC[c]);
+const ESC: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
+const esc = (s: string) => String(s).replace(/[&<>]/g, (c) => ESC[c]);
 
-function highlight(text) {
+function highlight(text: string): string {
   const toks = tokenize(text);
   // is this string a key? — the next significant token is a colon
-  const cls = (tok, idx) => {
+  const cls = (tok: JsonToken, idx: number) => {
     if (tok.t === 'comment') return 'tk-quote';
     if (tok.t === 'num' || tok.t === 'lit') return 'tk-cb';
     if (tok.t === 'bad') return 'tk-bad';
@@ -332,7 +389,7 @@ function highlight(text) {
     return '';
   };
   const rows = [''];
-  const add = (html) => { rows[rows.length - 1] += html; };
+  const add = (html: string) => { rows[rows.length - 1] += html; };
   toks.forEach((tok, idx) => {
     const c = cls(tok, idx);
     const parts = tok.v.split('\n');
@@ -348,11 +405,13 @@ function highlight(text) {
 // The data a tree holds, with the comments and the layout thrown away —
 // used to prove a reformat changed nothing that matters. Keys keep their
 // written order, which is what makes a plain stringify comparable.
-function toValue(n) {
+// The value is whatever JSON.parse makes of the literals — `any`, like
+// JSON.parse's own, so a caller can read it as the shape it expects.
+function toValue(n: JsonNode): any {
   if (n.kind === 'lit') return JSON.parse(n.raw);
   if (n.kind === 'arr') return n.items.map((it) => toValue(it.value));
-  const o = {};
-  for (const m of n.members) o[JSON.parse(m.key)] = toValue(m.value);
+  const o: Record<string, unknown> = {};
+  for (const m of n.members) o[JSON.parse(m.key!)] = toValue(m.value);
   return o;
 }
 
@@ -360,10 +419,10 @@ function toValue(n) {
 // This runs on SAVE, over a file the person did not ask to have rewritten —
 // so a formatter bug must cost them nothing. Returns null to mean "leave it
 // exactly as they wrote it".
-function safeFormat(text, opts) {
+function safeFormat(text: string, opts?: JsonPrintOptions): string | null {
   const before = check(text);
   if (!before.ok) return null;
-  let out;
+  let out: string;
   try { out = format(text, opts); } catch { return null; }
   const after = check(out);
   if (!after.ok) return null;
@@ -373,7 +432,7 @@ function safeFormat(text, opts) {
     }
   } catch { return null; }
   // …and every comment that went in comes out again
-  const comments = (t) => (t.match(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g) || []).length;
+  const comments = (t: string) => (t.match(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g) || []).length;
   if (comments(out) < comments(text)) return null;
   return out;
 }
@@ -381,15 +440,15 @@ function safeFormat(text, opts) {
 // A plain value as tree nodes, so an edited action can be spliced back in.
 // Anything undefined is dropped rather than written as null — an action file
 // should say what it means and stay quiet about the rest.
-function fromValue(v) {
+function fromValue(v: unknown): JsonNode {
   if (Array.isArray(v)) {
     return { kind: 'arr', items: v.filter((x) => x !== undefined)
       .map((x) => ({ lead: [], trail: [], value: fromValue(x) })), tail: [] };
   }
   if (v && typeof v === 'object') {
     return { kind: 'obj', tail: [], members: Object.keys(v)
-      .filter((k) => v[k] !== undefined)
-      .map((k) => ({ key: JSON.stringify(k), lead: [], trail: [], value: fromValue(v[k]) })) };
+      .filter((k) => (v as Record<string, unknown>)[k] !== undefined)
+      .map((k) => ({ key: JSON.stringify(k), lead: [], trail: [], value: fromValue((v as Record<string, unknown>)[k]) })) };
   }
   return { kind: 'lit', raw: JSON.stringify(v === undefined ? null : v) };
 }

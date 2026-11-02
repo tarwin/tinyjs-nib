@@ -14,16 +14,56 @@
 // run, red left half for the old side, green right half for the new, at
 // the run's position in the file. Click to jump there.
 
-function setupDiffView({ pane, note, scroll, grid, ruler, msg }) {
-  let current = null;                  // the file being shown
+export interface DiffViewOptions {
+  /** the whole pane (hidden when another tab is up) */
+  pane: HTMLElement;
+  /** the "vs last commit" caption */
+  note: HTMLElement;
+  /** the scroller around the grid */
+  scroll: HTMLElement;
+  grid: HTMLElement;
+  ruler: HTMLElement;
+  /** where a no-diff message shows */
+  msg: HTMLElement;
+}
+
+export interface DiffView {
+  show(path: string): Promise<void>;
+  refresh(): void;
+  /** the file being shown */
+  shown(): string | null;
+}
+
+/** One aligned row: old line number/text, new line number/text; null = blank side. */
+interface DiffRow {
+  o: number | null;
+  ot: string | null;
+  n: number | null;
+  nt: string | null;
+  kind: 'same' | 'mod' | 'del' | 'add';
+}
+
+/** gitDiff's answer (main.ts). */
+interface GitDiff {
+  rel?: string;
+  error?: string;
+  binary?: boolean;
+  diff?: string;
+  same?: boolean;
+  added?: boolean;
+  text?: string;
+}
+
+function setupDiffView({ pane, note, scroll, grid, ruler, msg }: DiffViewOptions): DiffView {
+  let current: string | null = null;                  // the file being shown
   let token = 0;                       // a newer show() wins the race
 
   // unified diff -> aligned rows: {o, n, ot, nt, kind} where kind is
   // 'same' | 'mod' (paired -/+) | 'del' | 'add'; a null side is a blank
-  function rowsOf(diff) {
-    const out = [];
+  function rowsOf(diff: string) {
+    const out: DiffRow[] = [];
     let oldN = 0, newN = 0, inHunk = false;
-    let dels = [], adds = [];
+    let dels: { n: number; t: string }[] = [], adds: { n: number; t: string }[] = [];
     const flush = () => {
       for (let i = 0; i < Math.max(dels.length, adds.length); i++) {
         const d = dels[i], a = adds[i];
@@ -60,7 +100,7 @@ function setupDiffView({ pane, note, scroll, grid, ruler, msg }) {
     return out;
   }
 
-  function render(rows) {
+  function render(rows: DiffRow[]) {
     grid.textContent = '';
     const frag = document.createDocumentFragment();
     // who's who, for anyone who doesn't live in a diff tool: a sticky
@@ -72,7 +112,7 @@ function setupDiffView({ pane, note, scroll, grid, ruler, msg }) {
       frag.appendChild(el);
     }
     for (const r of rows) {
-      const mk = (cls, txt) => {
+      const mk = (cls: string, txt: string | null) => {
         const el = document.createElement('div');
         el.className = cls;
         // a blank side stays blank; an empty LINE still needs a line box
@@ -93,7 +133,7 @@ function setupDiffView({ pane, note, scroll, grid, ruler, msg }) {
   // The overview: changed rows fold into runs, each a mark at its
   // proportional place in the file. Row index stands in for height —
   // wrapped lines skew it a little, never enough to matter for a glance.
-  function paintRuler(rows) {
+  function paintRuler(rows: DiffRow[]) {
     ruler.textContent = '';
     if (!rows.length) return;
     const runs = [];
@@ -125,17 +165,17 @@ function setupDiffView({ pane, note, scroll, grid, ruler, msg }) {
     scroll.scrollTop = frac * scroll.scrollHeight - scroll.clientHeight / 2;
   });
 
-  const say = (t) => {
+  const say = (t: string) => {
     msg.textContent = t;
     msg.hidden = false;
     grid.textContent = '';
     ruler.textContent = '';
   };
 
-  async function show(path) {
+  async function show(path: string): Promise<void> {
     current = path;
     const mine = ++token;
-    const r = await tiny.api.call('gitDiff', { path });
+    const r: GitDiff | null = await tiny.api.call('gitDiff', { path });
     if (mine !== token || !pane.isConnected) return;
     msg.hidden = true;
     note.textContent = 'vs last commit';
@@ -144,12 +184,12 @@ function setupDiffView({ pane, note, scroll, grid, ruler, msg }) {
     if (r.same) return say('No changes since the last commit.');
     if (r.added) {
       note.textContent = 'new file — not in the last commit';
-      const lines = r.text.split('\n');
+      const lines = r.text!.split('\n');
       if (lines[lines.length - 1] === '') lines.pop();
-      render(lines.map((t, i) => ({ o: null, ot: null, n: i + 1, nt: t, kind: 'add' })));
+      render(lines.map((t, i): DiffRow => ({ o: null, ot: null, n: i + 1, nt: t, kind: 'add' })));
       return;
     }
-    render(rowsOf(r.diff));
+    render(rowsOf(r.diff!));
   }
 
   return {

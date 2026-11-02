@@ -7,7 +7,7 @@
 // system draws them.
 
 // group: [glyph label, [[emoji, keywords], …]]
-const GROUPS = [
+const GROUPS: [string, string, string][] = [
   ['🙂', 'Smileys', `
       😀 grin smile happy | 😃 smiley happy | 😄 laugh happy | 😁 beam grin |
       😆 laugh squint | 😅 sweat laugh | 🤣 rofl laugh | 😂 joy tears laugh |
@@ -159,8 +159,8 @@ const parsed = GROUPS.map(([icon, name, blob]) => ({
 // Preview ▸ Markdown Flavor ▸ Emoji Shortcodes is on). Every keyword names its
 // glyph — the full phrase with underscores, then each word, first claim
 // wins — topped up with the GitHub spellings people actually type.
-const byCode = {};
-const claim = (code, ch) => {
+const byCode: Record<string, string> = {};
+const claim = (code: string, ch: string) => {
   code = String(code).toLowerCase();
   if (code && !(code in byCode)) byCode[code] = ch;
 };
@@ -187,11 +187,32 @@ Object.assign(byCode, {
   crossed_fingers: '🤞', partying_face: '🥳', skull: '💀',
 });
 
+export interface EmojiOptions {
+  /** the toolbar button that toggles the picker */
+  button: HTMLElement;
+  pop: HTMLElement;
+  search: HTMLInputElement;
+  tabs: HTMLElement;
+  grid: HTMLElement;
+  /** where a picked character goes by default */
+  insert: (ch: string) => void;
+  /** localStorage key for the recents list */
+  recentKey: string;
+}
+
+export interface EmojiPicker {
+  open(): void;
+  close(): void;
+  toggle(): void;
+  /** open against another button, handing the choice to `onPick` once */
+  openFor(btn: HTMLElement, onPick: (ch: string) => void): void;
+}
+
 // The picker owns its own popover; the caller supplies `insert` and
 // decides where the character lands.
-function setupEmoji({ button, pop, search, tabs, grid, insert, recentKey }) {
+function setupEmoji({ button, pop, search, tabs, grid, insert, recentKey }: EmojiOptions): EmojiPicker {
   let group = 0;
-  let recents = [];
+  let recents: string[] = [];
   try { recents = JSON.parse(localStorage.getItem(recentKey) || '[]'); } catch { recents = []; }
 
   const all = parsed.flatMap((g) => g.items);
@@ -222,7 +243,7 @@ function setupEmoji({ button, pop, search, tabs, grid, insert, recentKey }) {
 
   const paintTabs = () => {
     tabs.textContent = '';
-    const add = (label, idx, title) => {
+    const add = (label: string, idx: number, title: string) => {
       const b = document.createElement('button');
       b.type = 'button';
       b.textContent = label;
@@ -239,9 +260,9 @@ function setupEmoji({ button, pop, search, tabs, grid, insert, recentKey }) {
   // another button and hands the choice to a callback instead of `insert` —
   // how Manage Actions fills its Icon field without a second picker.
   let curButton = button;               // whose click is "toggle", not "close"
-  let curPick = null;                   // one-shot destination, else insert
+  let curPick: ((ch: string) => void) | null = null;                   // one-shot destination, else insert
 
-  function pick(ch) {
+  function pick(ch: string) {
     recents = [ch, ...recents.filter((r) => r !== ch)].slice(0, 24);
     try { localStorage.setItem(recentKey, JSON.stringify(recents)); } catch { /* private mode */ }
     (curPick || insert)(ch);
@@ -263,7 +284,7 @@ function setupEmoji({ button, pop, search, tabs, grid, insert, recentKey }) {
   }
   const close = () => { pop.hidden = true; curButton = button; curPick = null; };
   const toggle = () => (pop.hidden ? open() : close());
-  const openFor = (btn, onPick) => {
+  const openFor = (btn: HTMLElement, onPick: (ch: string) => void) => {
     if (!pop.hidden) close();
     curButton = btn;
     curPick = onPick;
@@ -281,7 +302,7 @@ function setupEmoji({ button, pop, search, tabs, grid, insert, recentKey }) {
     }
   });
   document.addEventListener('mousedown', (e) => {
-    if (!pop.hidden && !pop.contains(e.target) && !curButton.contains(e.target)) close();
+    if (!pop.hidden && !pop.contains(e.target as Node) && !curButton.contains(e.target as Node)) close();
   });
   window.addEventListener('blur', close);
 

@@ -345,7 +345,7 @@ Made with [Nib](https://tinyjs.app) 🖋
 // A tiny standalone SVG so the Images section actually has something to show.
 // The carousel's three little frames — same deal as the swatch above:
 // written beside the document so the strip is real, editable, deletable.
-const strip = (w, fill, n) => `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="160" viewBox="0 0 ${w} 160">
+const strip = (w: number, fill: string, n: string) => `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="160" viewBox="0 0 ${w} 160">
   <rect width="${w}" height="160" rx="10" fill="${fill}"/>
   <text x="50%" y="55%" font-family="-apple-system, Helvetica, sans-serif" font-size="44"
         font-weight="600" fill="#ffffff" fill-opacity=".9" text-anchor="middle">${n}</text>

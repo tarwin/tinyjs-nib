@@ -16,14 +16,186 @@
 // is open, and a `__proto__:` key (or `[__proto__]` table) assigned onto a
 // plain object would reach Object.prototype for the whole backend.
 const BAD_KEY = new Set(['__proto__', 'constructor', 'prototype']);
-export const safeKey = (k) => !BAD_KEY.has(k);
+export const safeKey = (k: string) => !BAD_KEY.has(k);
+
+// ------------------------------------------------------------------ types
+//
+// Shared by menus.ts, menuedit.ts and menutree.ts.
+
+// [start, end) offsets into a source text
+export type Span = [number, number];
+
+export type Token =
+  | { t: 'num'; v: number; s: number; e: number }
+  | { t: 'str' | 'tpl' | 'id' | 'p'; v: string; s: number; e: number };
+
+// A value read out of a file in the opened folder — a JS literal, YAML, TOML
+// or JSON. Its shape is whatever that file wrote, so it stays `any`; the code
+// that walks it checks typeof / Array.isArray as it goes. Arrays read from JS
+// carry a hidden `$spans` (and YAML sequences `$lines`), objects `$keys` /
+// `$spread`, and anything that would need running is a DynNode.
+export type Parsed = any;
+
+// a parsed list, with where its elements sit: `$spans` (JS) or `$lines` (YAML)
+export type ParsedArray = Parsed[] & { $spans?: Span[]; $lines?: number[] };
+
+// front matter, parsed
+
+export type FrontMatter = Record<string, Parsed>;
+
+// code the reader didn't run: its (shortened) text, and where it might lead
+export interface DynNode { $dyn: string; $ref?: string; $call?: string }
+
+// where one `key: value` of an object literal sits
+export interface KeyInfo { key: string; ks: number; s: number; e: number }
+
+// a value read from tokens, its span, and the index of the token after it
+export interface ReadResult { v: Parsed; s: number; e: number; end: number }
+export interface KeyedResult extends ReadResult { at: number }
+
+// What every menu reader and writer is handed to reach the disk.
+export interface FileReader { read(rel: string): Promise<string | null> }
+
+// ------------------------------------------------------------- menu shapes
+
+export type ItemKind = 'page' | 'group' | 'link' | 'sep' | 'dyn' | 'auto';
+// the front matter flavors menutree.ts writes to
+export type FmFlavor = 'docusaurus' | 'starlight' | 'hugo' | 'jtd' | 'retype';
+export type JsonPath = (string | number)[];
+
+// a per-folder meta file entry: the folder whose meta file lists it, and the
+// key (or, for Rspress, the element as written) it's listed as
+export interface MetaRef {
+  dir: string;
+  key?: string;
+  entry?: Parsed;
+  isDir?: boolean;
+  rest?: boolean;
+}
+
+export interface MenuItem {
+  text: string;
+  kind: ItemKind;
+  link?: string | null;
+  file?: string | null;
+  href?: string;
+  items?: MenuItem[];
+  collapsed?: boolean;
+  note?: string;
+  // where it sits in its file: a line (line-based sources, and code ones
+  // after addLines), a span, the span of its `items` array and of its label
+  line?: number;
+  span?: Span;
+  itemsSpan?: Span;
+  textSpan?: Span;
+  textKey?: string;
+  // JSON sources: its own path, and its children's list's
+  jpath?: JsonPath;
+  listPath?: JsonPath;
+  childBase?: string;
+  part?: boolean;
+  draft?: boolean;
+  noEdit?: boolean;
+  top?: boolean;
+  // YAML-map sources: the keys its label, link and children live under
+  ylabel?: string | null;
+  ylink?: string;
+  ychild?: string;
+  // menus built from folders
+  fm?: FmFlavor;
+  dir?: string;
+  pos?: number | null;
+  meta?: MetaRef;
+  // set by annotate()
+  missing?: boolean;
+  generated?: boolean;
+}
+
+export type SourceKind = 'json' | 'folders' | 'yamllist' | 'yaml' | 'mdlist' | 'adoclist' | 'xml' | 'yamlmap'
+  | 'toctree' | 'meta-tree' | 'frontmatter';
+
+export interface MenuSource {
+  file: string;
+  kind?: SourceKind;
+  via?: string | null;
+  span?: Span | null;
+  key?: string;
+  line?: number;
+}
+
+export interface Menu {
+  id: string;
+  label: string;
+  scope?: string | null;
+  source: MenuSource;
+  editable: boolean;
+  complete: boolean;
+  items: MenuItem[];
+  // `system:root:id`, set once its site is known
+  key?: string;
+  auto?: boolean;
+  top?: boolean;
+  flavor?: string;
+  lang?: string | null;
+  base?: string;
+  note?: string;
+  arraySpan?: Span | null;
+  listPath?: JsonPath;
+  eject?: { config: string; locale: string | null } | null;
+  ids?: Record<string, string>;
+  slugs?: Record<string, string>;
+  linkRoot?: string;
+  metaRoot?: string;
+}
+
+// a menu entry whose link lands on nothing
+export interface DeadLink {
+  menu: string | undefined;
+  text: string;
+  link: string;
+  trail: string[];
+  generated?: boolean;
+}
+
+// One docs site and its menus, as readSites (menus.ts) answers
+export interface Site {
+  system: string;
+  label: string;
+  root: string;
+  config: string;
+  content: string;
+  menus: Menu[];
+  notes: string[];
+  implicit: string[];
+  // VitePress `rewrites`, as [from, to] (main.ts drops it before the page sees it)
+  rewrites?: [string, string][];
+  // set by annotate()
+  generated?: { dir: string; count: number }[];
+  dead?: DeadLink[];
+  orphans?: string[];
+}
+
+// One edit to one menu (see editMenu in menus.ts)
+
+export interface MenuOp {
+  kind: 'move' | 'rename' | 'remove' | 'add' | 'eject';
+  at?: string | null;
+  to?: string | null;
+  where?: 'before' | 'after' | 'inside';
+  text?: string;
+  file?: string;
+  link?: string;
+}
+
+export interface FileWrite { file: string; text: string }
+export interface EditResult { error?: string; writes?: FileWrite[] }
 
 // ------------------------------------------------------------------ JS / TS
 
 const PUNCT = '{}[](),:;?.=<>!&|+-*/%~^@#';
 
-export function tokenizeJS(src) {
-  const out = [];
+export function tokenizeJS(src: string): Token[] {
+  const out: Token[] = [];
   const n = src.length;
   let i = 0;
   while (i < n) {
@@ -90,17 +262,17 @@ export function tokenizeJS(src) {
   return out;
 }
 
-function unescape1(c) {
+function unescape1(c: string | undefined): string {
   return c === 'n' ? '\n' : c === 't' ? '\t' : c === 'r' ? '\r' : c === undefined ? '' : c;
 }
 
-const isP = (tok, v) => tok && tok.t === 'p' && tok.v === v;
-const CLOSE = { '{': '}', '[': ']', '(': ')' };
+const isP = (tok: Token | undefined, v: string) => tok && tok.t === 'p' && tok.v === v;
+const CLOSE: Record<string, string> = { '{': '}', '[': ']', '(': ')' };
 
 // Skip one balanced expression from toks[i] to the next `,` / closer at depth
 // 0. Used for anything the reader won't interpret — a call, an arrow
 // function, a ternary — so the reader can carry on past it.
-function skipExpr(toks, i) {
+function skipExpr(toks: Token[], i: number): number {
   let depth = 0;
   for (; i < toks.length; i++) {
     const t = toks[i];
@@ -115,7 +287,7 @@ function skipExpr(toks, i) {
 }
 
 // TS's trailing `as const` / `satisfies X` / `as Foo<Bar>`: read past it.
-function skipTypeTail(toks, i) {
+function skipTypeTail(toks: Token[], i: number): number {
   while (toks[i] && toks[i].t === 'id' && (toks[i].v === 'as' || toks[i].v === 'satisfies')) {
     i++;
     let depth = 0;
@@ -136,10 +308,10 @@ function skipTypeTail(toks, i) {
 // Read one value starting at toks[i]. Returns { v, s, e, end } where `end` is
 // the index of the first token after it. `src` is only used to quote the
 // text of anything dynamic.
-export function readValue(toks, i, src) {
+export function readValue(toks: Token[], i: number, src: string): ReadResult {
   const t = toks[i];
   if (!t) return { v: undefined, s: src.length, e: src.length, end: i };
-  const done = (v, endTok, j) => {
+  const done = (v: Parsed, endTok: Token, j: number): ReadResult => {
     const k = skipTypeTail(toks, j);
     return { v, s: t.s, e: endTok.e, end: k };
   };
@@ -157,12 +329,12 @@ export function readValue(toks, i, src) {
     return done(t.v === 'true' ? true : t.v === 'false' ? false : null, t, i + 1);
   }
   if (isP(t, '-') && toks[i + 1] && toks[i + 1].t === 'num') {
-    return { v: -toks[i + 1].v, s: t.s, e: toks[i + 1].e, end: i + 2 };
+    return { v: -(toks[i + 1].v as number), s: t.s, e: toks[i + 1].e, end: i + 2 };
   }
   if (isP(t, '[')) {
-    const arr = [];
+    const arr: Parsed[] = [];
     // where each element sits, strings included, so a writer can move rows
-    const spans = [];
+    const spans: Span[] = [];
     Object.defineProperty(arr, '$spans', { value: spans, enumerable: false });
     let j = i + 1;
     while (j < toks.length && !isP(toks[j], ']')) {
@@ -184,8 +356,8 @@ export function readValue(toks, i, src) {
     return done(arr, toks[j], j + 1);
   }
   if (isP(t, '{')) {
-    const obj = {};
-    const keys = [];
+    const obj: Record<string, Parsed> = {};
+    const keys: KeyInfo[] = [];
     let j = i + 1;
     while (j < toks.length && !isP(toks[j], '}')) {
       const k = toks[j];
@@ -197,7 +369,7 @@ export function readValue(toks, i, src) {
         j = end;
         continue;
       }
-      let key = null;
+      let key: string | null = null;
       if (k.t === 'id' || k.t === 'str' || k.t === 'num') key = String(k.v);
       else if (isP(k, '[')) {                     // [computed]: v
         const end = skipExpr(toks, j + 1);
@@ -241,7 +413,7 @@ export function readValue(toks, i, src) {
   return dyn(toks, i, src);
 }
 
-function dyn(toks, i, src) {
+function dyn(toks: Token[], i: number, src: string): ReadResult {
   const end = skipExpr(toks, i);
   const last = toks[Math.max(i, end - 1)];
   const node = dynNode(src, toks[i].s, last.e);
@@ -254,17 +426,17 @@ function dyn(toks, i, src) {
   return { v: node, s: toks[i].s, e: last.e, end };
 }
 
-function dynNode(src, s, e) {
+function dynNode(src: string, s: number, e: number): DynNode {
   const text = src.slice(s, e);
   return { $dyn: text.length > 80 ? text.slice(0, 77) + '…' : text };
 }
 
-export const isDyn = (v) => !!v && typeof v === 'object' && '$dyn' in v;
+export const isDyn = (v: Parsed): v is DynNode => !!v && typeof v === 'object' && '$dyn' in v;
 
 // Where `name = <value>` is declared at the top level of a module:
 // const/let/var (with or without a type annotation), `export default`, or
 // `module.exports =`. Returns { v, s, e } or null.
-export function findDeclared(src, toks, name) {
+export function findDeclared(src: string, toks: Token[], name: string): ReadResult | null {
   for (let i = 0; i < toks.length; i++) {
     const t = toks[i];
     if (t.t !== 'id') continue;
@@ -287,7 +459,7 @@ export function findDeclared(src, toks, name) {
   return null;
 }
 
-export function findDefaultExport(src, toks) {
+export function findDefaultExport(src: string, toks: Token[]): ReadResult | null {
   for (let i = 0; i < toks.length; i++) {
     const t = toks[i];
     if (t.t === 'id' && t.v === 'export' && toks[i + 1] && toks[i + 1].v === 'default') {
@@ -309,8 +481,8 @@ export function findDefaultExport(src, toks) {
 // `sidebar:` inside themeConfig, inside a locale, inside starlight({…}).
 // Shorthand `{ sidebar }` counts too. Returns [{ v, s, e, at }] where `at` is
 // the token index, so a caller can ask what encloses it.
-export function findKeyed(src, toks, name) {
-  const out = [];
+export function findKeyed(src: string, toks: Token[], name: string): KeyedResult[] {
+  const out: KeyedResult[] = [];
   for (let i = 0; i < toks.length; i++) {
     const t = toks[i];
     if (!((t.t === 'id' || t.t === 'str') && t.v === name)) continue;
@@ -326,8 +498,8 @@ export function findKeyed(src, toks, name) {
 
 // The chain of keys enclosing token `at` — ['locales', 'ja', 'themeConfig']
 // — by walking back over balanced brackets. Good enough to name a menu.
-export function keyPath(toks, at) {
-  const path = [];
+export function keyPath(toks: Token[], at: number): string[] {
+  const path: string[] = [];
   let depth = 0;
   for (let i = at - 1; i >= 0; i--) {
     const t = toks[i];
@@ -345,20 +517,20 @@ export function keyPath(toks, at) {
 
 // `import X from './x'`, `import { X } from './x'`, `import { Y as X } …`
 // -> { from: './x', name: 'default' | 'Y' } for local name X.
-export function findImport(toks, local) {
+export function findImport(toks: Token[], local: string): { from: string; name: string } | null {
   for (let i = 0; i < toks.length; i++) {
     if (!(toks[i].t === 'id' && toks[i].v === 'import')) continue;
     let j = i + 1;
-    const names = [];
+    const names: [string, string][] = [];
     if (toks[j] && toks[j].t === 'id' && toks[j].v === 'type') j++;
-    if (toks[j] && toks[j].t === 'id') { names.push(['default', toks[j].v]); j++; }
+    if (toks[j] && toks[j].t === 'id') { names.push(['default', toks[j].v as string]); j++; }
     if (isP(toks[j], ',')) j++;
     if (isP(toks[j], '{')) {
       j++;
       while (toks[j] && !isP(toks[j], '}')) {
         if (toks[j].t === 'id' && toks[j].v !== 'type') {
-          const imported = toks[j].v;
-          if (toks[j + 1] && toks[j + 1].v === 'as') { names.push([imported, toks[j + 2].v]); j += 3; continue; }
+          const imported = toks[j].v as string;
+          if (toks[j + 1] && toks[j + 1].v === 'as') { names.push([imported, toks[j + 2].v as string]); j += 3; continue; }
           names.push([imported, imported]);
         }
         j++;
@@ -366,13 +538,13 @@ export function findImport(toks, local) {
       j++;
     }
     if (!(toks[j] && toks[j].v === 'from' && toks[j + 1] && toks[j + 1].t === 'str')) continue;
-    for (const [imported, as] of names) if (as === local) return { from: toks[j + 1].v, name: imported };
+    for (const [imported, as] of names) if (as === local) return { from: toks[j + 1].v as string, name: imported };
   }
   // CommonJS: const X = require('./x')
   for (let i = 0; i < toks.length; i++) {
     if (toks[i].t === 'id' && toks[i].v === local && isP(toks[i + 1], '=') && toks[i + 2]
         && toks[i + 2].v === 'require' && toks[i + 4] && toks[i + 4].t === 'str') {
-      return { from: toks[i + 4].v, name: 'default' };
+      return { from: toks[i + 4].v as string, name: 'default' };
     }
   }
   return null;
@@ -381,7 +553,7 @@ export function findImport(toks, local) {
 // The body of `function name(…) { … }` or `const name = (…) => { … }`, as a
 // token range — so a sidebar written `getSidebar('en')` can be followed to
 // the literal the helper starts from.
-export function functionBody(toks, name) {
+export function functionBody(toks: Token[], name: string): Span | null {
   for (let i = 0; i < toks.length; i++) {
     const t = toks[i];
     if (t.t !== 'id' || t.v !== name) continue;
@@ -414,8 +586,10 @@ export function functionBody(toks, name) {
 // and aliases are dropped. Keys keep their order — Nextra-style "order is the
 // key order" depends on it, and JS objects keep string-key order anyway.
 
-export function parseYAML(text) {
-  const lines = [];
+interface YLine { ind: number; text: string; raw: string; n: number }
+
+export function parseYAML(text: string): Parsed {
+  const lines: (YLine | null)[] = [];
   // n: the line's number in the file, kept so a sequence can say where
   // each of its items starts (arr.$lines) — what the menu editor cuts by
   const all = text.replace(/\r\n?/g, '\n').split('\n');
@@ -428,7 +602,7 @@ export function parseYAML(text) {
     }
     const stripped = stripComment(raw);
     if (!stripped.trim()) { lines.push(null); continue; }
-    lines.push({ ind: stripped.match(/^ */)[0].length, text: stripped.trim(), raw, n });
+    lines.push({ ind: stripped.match(/^ */)![0].length, text: stripped.trim(), raw, n });
   }
   let i = 0;
   const peek = () => {
@@ -436,16 +610,16 @@ export function parseYAML(text) {
     return lines[i];
   };
 
-  function block(ind) {
+  function block(ind: number): Parsed {
     const l = peek();
     if (!l || l.ind < ind) return null;
     if (l.text.startsWith('- ') || l.text === '-') return seq(l.ind);
     return map(l.ind);
   }
 
-  function seq(ind) {
-    const arr = [];
-    const at = [];
+  function seq(ind: number): Parsed[] {
+    const arr: Parsed[] = [];
+    const at: number[] = [];
     Object.defineProperty(arr, '$lines', { value: at, enumerable: false });
     for (;;) {
       const l = peek();
@@ -473,8 +647,8 @@ export function parseYAML(text) {
     return arr;
   }
 
-  function map(ind) {
-    const obj = {};
+  function map(ind: number): Record<string, Parsed> {
+    const obj: Record<string, Parsed> = {};
     for (;;) {
       const l = peek();
       if (!l || l.ind !== ind) break;
@@ -494,10 +668,10 @@ export function parseYAML(text) {
     return obj;
   }
 
-  function scalarOrBlock(v, ind) {
+  function scalarOrBlock(v: string, ind: number): Parsed {
     if (/^[|>][-+0-9]*$/.test(v)) {
       const fold = v[0] === '>';
-      const body = [];
+      const body: string[] = [];
       let base = -1;
       while (i < lines.length) {
         const l = lines[i];
@@ -516,8 +690,8 @@ export function parseYAML(text) {
   return block(0) ?? null;
 }
 
-function stripComment(line) {
-  let q = null;
+function stripComment(line: string): string {
+  let q: string | null = null;
   for (let k = 0; k < line.length; k++) {
     const c = line[k];
     if (q) { if (c === q) q = null; continue; }
@@ -533,8 +707,8 @@ function stripComment(line) {
 }
 
 // `key: value` -> [key, value]; quoted keys allowed; `http://x` is not a key
-function splitKey(text) {
-  let k, rest;
+function splitKey(text: string): [string, string] | null {
+  let k: string, rest: string;
   if (text[0] === '"' || text[0] === "'") {
     const e = text.indexOf(text[0], 1);
     if (e < 0) return null;
@@ -549,7 +723,7 @@ function splitKey(text) {
   return [m[1], m[3].trim()];
 }
 
-function scalar(v) {
+function scalar(v: string): Parsed {
   v = v.replace(/^&\S+\s*/, '');                     // anchors
   if (v.startsWith('*')) return null;               // aliases
   if (v[0] === '[' || v[0] === '{') {
@@ -567,14 +741,14 @@ function scalar(v) {
 }
 
 // [a, "b", {c: d}] — flow collections, recursively
-function flow(s) {
+function flow(s: string): Parsed {
   let i = 0;
   const ws = () => { while (/\s/.test(s[i] || '')) i++; };
-  function val() {
+  function val(): Parsed {
     ws();
     if (s[i] === '[') {
       i++;
-      const arr = [];
+      const arr: Parsed[] = [];
       for (;;) {
         ws();
         if (s[i] === ']') { i++; return arr; }
@@ -586,7 +760,7 @@ function flow(s) {
     }
     if (s[i] === '{') {
       i++;
-      const obj = {};
+      const obj: Record<string, Parsed> = {};
       for (;;) {
         ws();
         if (s[i] === '}') { i++; return obj; }
@@ -601,7 +775,7 @@ function flow(s) {
     }
     return scalar(atom());
   }
-  function atom(stop) {
+  function atom(stop?: string): string {
     ws();
     if (s[i] === '"' || s[i] === "'") {
       const q = s[i];
@@ -624,7 +798,7 @@ function flow(s) {
 // `key = value` lines, plus [tables] one level deep — enough for weight,
 // title and linkTitle). Returns {} when there is none.
 
-export function frontMatter(text) {
+export function frontMatter(text: string | null | undefined): FrontMatter {
   if (!text) return {};
   if (text.startsWith('---')) {
     const end = text.search(/\n(---|\.\.\.)\s*(\n|$)/);
@@ -645,9 +819,9 @@ export function frontMatter(text) {
 // Flat TOML: `key = value` lines and `[table]` headers. Arrays and inline
 // tables come through the YAML flow reader, which accepts `{a = 1}` poorly
 // and `["a", "b"]` fine — enough for config keys like contentDir.
-export function parseTOMLish(text) {
-  const out = {};
-  let cur = out;
+export function parseTOMLish(text: string): Record<string, Parsed> {
+  const out: Record<string, Parsed> = {};
+  let cur: Record<string, Parsed> = out;
   for (const raw of text.split('\n')) {
     const line = stripComment(raw).trim();
     if (!line) continue;
@@ -672,7 +846,7 @@ export function parseTOMLish(text) {
 // The page title a menu shows when the menu itself doesn't name it: front
 // matter `title:` (or `sidebar_label`-style overrides the caller looks for),
 // else the first `# Heading`, else null.
-export function titleOf(text, fm = frontMatter(text)) {
+export function titleOf(text: string | null | undefined, fm: FrontMatter = frontMatter(text)): string | null {
   if (fm && typeof fm.title === 'string' && fm.title.trim()) return fm.title.trim();
   const m = /^#\s+(.+?)\s*#*\s*$/m.exec(stripFront(text || ''));
   if (m) return m[1].replace(/\{#[^}]*\}\s*$/, '').trim();
@@ -681,7 +855,8 @@ export function titleOf(text, fm = frontMatter(text)) {
   return null;
 }
 
-export function stripFront(text) {
+export function stripFront(text: string): string {
+
   if (text.startsWith('---')) {
     const end = text.search(/\n(---|\.\.\.)\s*(\n|$)/);
     if (end >= 0) return text.slice(text.indexOf('\n', end + 1) + 1);

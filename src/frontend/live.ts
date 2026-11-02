@@ -11,14 +11,14 @@ import { highlightCode } from './code.ts';
 
 const BLOCKISH = /^(P|DIV|H[1-6]|LI|BLOCKQUOTE|TD|TH|SUMMARY|PRE)$/;
 
-const elt = (tag, txt) => {
+const elt = (tag: string, txt: string) => {
   const el = document.createElement(tag);
   el.textContent = txt;
   return el;
 };
 
 // markers you type at the end of a word/phrase, and what they become
-const INLINE = [
+const INLINE: { ch: string; re: RegExp; make: (m: RegExpMatchArray) => HTMLElement }[] = [
   { ch: '`', re: /`([^`\n]+)`$/, make: (m) => elt('code', m[1]) },
   { ch: '*', re: /\*\*\*([^*\n]+)\*\*\*$/, make: (m) => {
     const s = document.createElement('strong');
@@ -42,7 +42,14 @@ const INLINE = [
 // no good here — it loses the caret when the block is empty, which is the
 // common case (you type "## " on a fresh line) — so these rehouse the
 // block's children by hand instead.
-const BLOCK = [
+/** The block rewrites a BLOCK rule can ask for (setupLiveEditing's `surgery`). */
+interface BlockSurgery {
+  reblock(block: HTMLElement, tag: string): void;
+  relist(block: HTMLElement, tag: string): void;
+  requote(block: HTMLElement): void;
+}
+
+const BLOCK: { re: RegExp; run: (block: HTMLElement, m: RegExpMatchArray, api: BlockSurgery) => void }[] = [
   { re: /^(#{1,6})\s$/, run: (block, m, api) => api.reblock(block, 'h' + m[1].length) },
   { re: /^[-*+]\s$/, run: (block, m, api) => api.relist(block, 'ul') },
   { re: /^\d+[.)]\s$/, run: (block, m, api) => api.relist(block, 'ol') },
@@ -58,7 +65,16 @@ const BLOCK = [
 // swap ({from, to, block}) and where the selection lands ({start, end}) —
 // each endpoint follows its own text, so one at column 0 stays there —
 // or null when nothing would change.
-export const nibIndent = function nibIndent(text, start, end, out) {
+/** nibIndent's answer: replace [from, to) with `block`, select [start, end]. */
+export interface IndentChange {
+  from: number;
+  to: number;
+  block: string;
+  start: number;
+  end: number;
+}
+
+export const nibIndent = function nibIndent(text: string, start: number, end: number, out: boolean): IndentChange | null {
   const UNIT = '  ';
   const from = text.lastIndexOf('\n', start - 1) + 1;
   const lastAt = end > start && text[end - 1] === '\n' ? end - 1 : end;
@@ -70,7 +86,7 @@ export const nibIndent = function nibIndent(text, start, end, out) {
   if (!deltas.some(Boolean)) return null;
   const redone = lines.map((ln, i) => deltas[i] > 0 ? UNIT + ln : ln.slice(-deltas[i]))
     .join('\n');
-  const adjust = (p) => {
+  const adjust = (p: number) => {
     let acc = 0, at = from;
     for (let i = 0; i < lines.length; i++) {
       const lnEnd = at + lines[i].length;
@@ -87,8 +103,37 @@ export const nibIndent = function nibIndent(text, start, end, out) {
   return { from, to, block: redone, start: start2, end: Math.max(start2, adjust(end)) };
 };
 
+export interface LiveEditingOptions {
+  /** the rendered document, contenteditable while editing */
+  preview: HTMLElement;
+  /** the floating format bar over a selection */
+  bubble: HTMLElement;
+  /** the bubble's ⋯ menu, and the button that opens it */
+  more?: HTMLElement | null;
+  moreBtn?: HTMLElement | null;
+  /** the DOM changed: serialize it back to Markdown */
+  changed: () => void;
+  /** a hard undo boundary at the current state */
+  mark: () => void;
+  /** the bubble's link button */
+  link: () => void;
+  /** the code-block language picker, and its <select> */
+  langPop?: HTMLElement | null;
+  langPick?: HTMLSelectElement | null;
+  /** is Preview ▸ Markdown Flavor ▸ Math on */
+  canMath?: () => boolean;
+  /** re-run the preview's after-render decorations (math, diagrams) */
+  decorate?: () => void;
+}
+
+export interface LiveEditing {
+  hideBubble(): void;
+  positionBubble(): void;
+  toggleHighlight(): void;
+}
+
 function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
-  langPop, langPick, canMath = () => false, decorate = () => {} }) {
+  langPop, langPick, canMath = () => false, decorate = () => {} }: LiveEditingOptions): LiveEditing {
   const editing = () => preview.isContentEditable;
 
   const caret = () => {
@@ -97,11 +142,11 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
     const r = sel.getRangeAt(0);
     if (!r.collapsed || r.startContainer.nodeType !== 3) return null;
     if (!preview.contains(r.startContainer)) return null;
-    return { node: r.startContainer, off: r.startOffset };
+    return { node: r.startContainer as Text, off: r.startOffset };
   };
 
-  const place = (node, off) => {
-    const sel = window.getSelection();
+  const place = (node: Node, off: number) => {
+    const sel = window.getSelection()!;
     const r = document.createRange();
     r.setStart(node, off);
     r.collapse(true);
@@ -109,32 +154,33 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
     sel.addRange(r);
   };
 
-  const blockOf = (node) => {
-    let el = node.nodeType === 3 ? node.parentNode : node;
-    while (el && el !== preview && !BLOCKISH.test(el.tagName)) el = el.parentNode;
+  // the elements walked here are all HTMLElements: a text node's parent, up to the preview
+  const blockOf = (node: Node): HTMLElement | null => {
+    let el = (node.nodeType === 3 ? node.parentNode : node) as HTMLElement | null;
+    while (el && el !== preview && !BLOCKISH.test(el.tagName)) el = el.parentNode as HTMLElement | null;
     return el === preview ? null : el;
   };
 
   // An element with no content needs a <br> or WebKit won't hold a caret
   // in it; one with content wants the caret in its first text node.
-  const settle = (el) => {
-    if (!el.textContent.length && !el.querySelector('br, img, input')) {
+  const settle = <T extends HTMLElement>(el: T): T => {
+    if (!el.textContent!.length && !el.querySelector('br, img, input')) {
       el.textContent = '';
       el.appendChild(document.createElement('br'));
     }
     return el;
   };
-  const caretInto = (el) => {
+  const caretInto = (el: Element) => {
     const first = document.createTreeWalker(el, NodeFilter.SHOW_TEXT).nextNode();
     if (first) place(first, 0); else place(el, 0);
     return el;
   };
-  const moveInto = (from, to) => {
+  const moveInto = <T extends Element>(from: Element, to: T): T => {
     while (from.firstChild) to.appendChild(from.firstChild);
     return to;
   };
 
-  const surgery = {
+  const surgery: BlockSurgery = {
     reblock(block, tag) {
       const el = settle(moveInto(block, document.createElement(tag)));
       block.replaceWith(el);
@@ -161,7 +207,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
   // so far, so the marker regexes can anchor on it. It deliberately does
   // NOT require an empty line: typing "## " in front of a paragraph you
   // already wrote should turn that paragraph into a heading.
-  const atBlockStart = (block, node) => {
+  const atBlockStart = (block: HTMLElement | null, node: Node) => {
     if (!block) return false;
     const walk = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
     return walk.nextNode() === node;
@@ -169,13 +215,13 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
 
   // ------------------------------------------------------------ input rules
 
-  function rules(e) {
+  function rules(e: InputEvent) {
     if (!editing() || e.inputType !== 'insertText' || !e.data) return;
     const c = caret();
     if (!c) return;
     const { node, off } = c;
-    if (blockOf(node) && blockOf(node).tagName === 'PRE') return;   // code is literal
-    const before = node.nodeValue.slice(0, off);
+    if (blockOf(node) && blockOf(node)!.tagName === 'PRE') return;   // code is literal
+    const before = node.nodeValue!.slice(0, off);
 
     if (e.data === ' ') {
       const block = blockOf(node);
@@ -184,7 +230,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
         if (block.tagName === 'LI') {
           const t = before.match(/^\[([ xX]?)\]\s$/);
           if (t) {
-            node.nodeValue = node.nodeValue.slice(off);
+            node.nodeValue = node.nodeValue!.slice(off);
             for (const br of [...block.querySelectorAll(':scope > br')]) br.remove();
             const box = document.createElement('input');
             box.type = 'checkbox';
@@ -200,7 +246,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
           for (const r of BLOCK) {
             const m = before.match(r.re);
             if (!m) continue;
-            node.nodeValue = node.nodeValue.slice(off);
+            node.nodeValue = node.nodeValue!.slice(off);
             r.run(block, m, surgery);
             changed();
             return;
@@ -224,7 +270,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
       const el = r.make(m);
       range.insertNode(el);
       const tail = document.createTextNode('​');   // somewhere to land
-      el.parentNode.insertBefore(tail, el.nextSibling);
+      el.parentNode!.insertBefore(tail, el.nextSibling);
       place(tail, 1);
       changed();
       return;
@@ -242,9 +288,10 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
     if (!sel || !sel.rangeCount) return false;
     const r = sel.getRangeAt(0);
     if (!preview.contains(r.startContainer)) return false;
-    let top = r.startContainer.nodeType === 3 ? r.startContainer.parentNode : r.startContainer;
-    if (top === preview) top = top.childNodes[Math.min(r.startOffset, top.childNodes.length - 1)];
-    while (top && top.parentNode !== preview) top = top.parentNode;
+    // past the nodeType check below, `top` is an element child of the preview
+    let top = (r.startContainer.nodeType === 3 ? r.startContainer.parentNode : r.startContainer) as HTMLElement | null;
+    if (top === preview) top = top.childNodes[Math.min(r.startOffset, top.childNodes.length - 1)] as HTMLElement;
+    while (top && top.parentNode !== preview) top = top.parentNode as HTMLElement | null;
     if (!top || top.nodeType !== 1 || (top.classList && top.classList.contains('pgbrk'))) return false;
 
     const brk = document.createElement('div');
@@ -268,8 +315,8 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
     // two sides disagree). At the start the break lands before the intact
     // paragraph; at the end it lands after, and the caret moves to
     // whatever block already follows.
-    const has = (el) => el.textContent.trim() || el.querySelector('img, input');
-    let landing;
+    const has = (el: Element) => el.textContent!.trim() || el.querySelector('img, input');
+    let landing: Element | null;
     if (top.tagName === 'P' && !has(top) && has(p2)) {           // caret at the very start
       settle(p2);
       top.replaceWith(brk, p2);
@@ -282,7 +329,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
       top.after(brk, p2);
       landing = p2;
     }
-    caretInto(landing);
+    caretInto(landing!);
     changed();
     return true;
   }
@@ -296,13 +343,14 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
   // the atomic block islands: contenteditable=false, deleted whole —
   // page breaks, mermaid diagrams, block math
   const ISLAND = '.pgbrk, .mm, .math.mblock, .oemb, .toc';
-  const isIsland = (el) => !!(el && el.nodeType === 1 && el.matches && el.matches(ISLAND));
-  const topOf = (node) => {
-    let el = node.nodeType === 3 ? node.parentNode : node;
-    while (el && el !== preview && el.parentNode !== preview) el = el.parentNode;
+  const isIsland = (el: Node | null | undefined): el is Element =>
+    !!(el && el.nodeType === 1 && (el as Element).matches && (el as Element).matches(ISLAND));
+  const topOf = (node: Node) => {
+    let el = (node.nodeType === 3 ? node.parentNode : node) as HTMLElement | null;
+    while (el && el !== preview && el.parentNode !== preview) el = el.parentNode as HTMLElement | null;
     return el && el !== preview ? el : null;
   };
-  function onDelete(e) {
+  function onDelete(e: KeyboardEvent) {
     if (!editing() || (e.key !== 'Backspace' && e.key !== 'Delete')) return;
     const sel = window.getSelection();
     if (!sel || !sel.rangeCount) return;
@@ -348,20 +396,20 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
 
   // A click on the strip selects it whole — the caret can't sit in it, and
   // a selected break is one Backspace from gone.
-  function onBreakClick(e) {
+  function onBreakClick(e: MouseEvent) {
     if (!editing()) return;
-    const brk = e.target && e.target.closest && e.target.closest(ISLAND);
+    const brk = e.target && (e.target as Element).closest && (e.target as Element).closest(ISLAND);
     if (!brk || !preview.contains(brk)) return;
     e.preventDefault();                  // or the click collapses it to a caret
     preview.focus();
-    const sel = window.getSelection();
+    const sel = window.getSelection()!;
     const r = document.createRange();
     r.selectNode(brk);
     sel.removeAllRanges();
     sel.addRange(r);
   }
 
-  function onKey(e) {
+  function onKey(e: KeyboardEvent) {
     if (!editing() || e.key !== 'Enter') return;
     if (!e.shiftKey && (e.metaKey || e.ctrlKey)) {
       if (pageBreakAt()) e.preventDefault();
@@ -375,7 +423,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
     const sel0 = window.getSelection();
     if (sel0 && sel0.rangeCount && preview.contains(sel0.getRangeAt(0).startContainer)) {
       const r0 = sel0.getRangeAt(0);
-      const el0 = r0.startContainer.nodeType === 3 ? r0.startContainer.parentNode : r0.startContainer;
+      const el0 = (r0.startContainer.nodeType === 3 ? r0.startContainer.parentNode : r0.startContainer) as Element | null;
       const pre = el0 && el0.closest ? el0.closest('pre') : null;
       if (pre && preview.contains(pre) && !pre.classList.contains('fm')) {
         e.preventDefault();
@@ -462,7 +510,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
     const p = document.createElement('p');
     p.appendChild(document.createElement('br'));
     block.replaceWith(hr);
-    hr.parentNode.insertBefore(p, hr.nextSibling);
+    hr.parentNode!.insertBefore(p, hr.nextSibling);
     place(p, 0);
     changed();
   }
@@ -471,14 +519,14 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
   // has no caret position after it, so typing there keeps extending the
   // code. Give it the same U+200B perch the input rules leave (unmd strips
   // it) and step onto it, and typing carries on in plain text.
-  function onArrowOut(e) {
+  function onArrowOut(e: KeyboardEvent) {
     if (!editing() || e.key !== 'ArrowRight'
         || e.shiftKey || e.metaKey || e.altKey || e.ctrlKey) return;
     const sel = window.getSelection();
     if (!sel || !sel.rangeCount || !sel.isCollapsed) return;
     const r = sel.getRangeAt(0);
     if (!preview.contains(r.startContainer)) return;
-    let code = r.startContainer.nodeType === 3 ? r.startContainer.parentNode : r.startContainer;
+    let code = (r.startContainer.nodeType === 3 ? r.startContainer.parentNode : r.startContainer) as Element | null;
     code = code && code.closest ? code.closest('code') : null;
     if (!code || !preview.contains(code) || code.closest('pre')) return;
     const rest = document.createRange();
@@ -487,7 +535,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
     if (rest.toString().length) return;            // not at the code's end yet
     const after = code.nextSibling;                 // real text after it? the
     if (after && after.nodeType === 3              // arrow already works
-        && after.nodeValue.replace(/​/g, '').length) return;
+        && after.nodeValue!.replace(/​/g, '').length) return;
     e.preventDefault();
     let perch = after && after.nodeType === 3 ? after : null;
     if (!perch) {
@@ -496,7 +544,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
     } else if (!perch.nodeValue) {
       perch.nodeValue = '​';
     }
-    place(perch, perch.nodeValue.length);
+    place(perch, perch.nodeValue!.length);
   }
 
   // ⌄ inside the document's LAST code block or table — or ⌃ inside its
@@ -507,14 +555,14 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
   // typeable follows: footnotes, say, are an island you can't put a caret
   // in. "First" likewise, and front matter counts as nothing before — it's
   // the file's header, not somewhere to write.
-  function onArrowOut(e) {
+  function onArrowOut(e: KeyboardEvent) {
     const down = e.key === 'ArrowDown';
     if (!editing() || !(down || e.key === 'ArrowUp')
         || e.shiftKey || e.metaKey || e.altKey || e.ctrlKey) return;
     const sel = window.getSelection();
     if (!sel || !sel.rangeCount || !sel.isCollapsed) return;
     const r = sel.getRangeAt(0);
-    const el = r.startContainer.nodeType === 3 ? r.startContainer.parentNode : r.startContainer;
+    const el = (r.startContainer.nodeType === 3 ? r.startContainer.parentNode : r.startContainer) as Element | null;
     const pre = el && el.closest ? el.closest('pre, table') : null;
     if (!pre || !preview.contains(pre) || pre.classList.contains('fm')) return;
     const nb = down ? pre.nextElementSibling : pre.previousElementSibling;
@@ -540,25 +588,25 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
   // block is the safe moment to redo it — no selection inside, nothing
   // measured. The same watcher hangs the language picker off whichever
   // block the caret is in.
-  let inPre = null;
-  const langOf = (pre) => {
+  let inPre: HTMLElement | null = null;
+  const langOf = (pre: Element) => {
     const code = pre.querySelector('code');
     return (code && (code.className.match(/lang-([\w+-]+)/) || [])[1]) || '';
   };
-  function rehighlight(pre) {
+  function rehighlight(pre: Element) {
     const code = pre.querySelector('code');
     const lang = langOf(pre);
     if (!code || !lang || !highlightCode) return;
-    const src = code.textContent;
+    const src = code.textContent!;
     if (!src.trim()) return;
     code.innerHTML = highlightCode(src, lang);
   }
-  function placeLangPop(pre) {
+  function placeLangPop(pre: Element | null) {
     if (!langPop) return;
     if (!pre) { langPop.hidden = true; return; }
     const lang = langOf(pre);
-    const known = [...langPick.options].some((o) => o.value === lang);
-    langPick.value = known ? lang : '';
+    const known = [...langPick!.options].some((o) => o.value === lang);
+    langPick!.value = known ? lang : '';
     langPop.hidden = false;
     const rect = pre.getBoundingClientRect();
     langPop.style.left = Math.round(rect.right - langPop.offsetWidth - 8) + 'px';
@@ -567,11 +615,11 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
   function watchPre() {
     if (langPop && document.activeElement === langPick) return;   // mid-pick
     const sel = window.getSelection();
-    let pre = null;
+    let pre: HTMLElement | null = null;
     if (editing() && sel && sel.rangeCount) {
       const n = sel.getRangeAt(0).startContainer;
       if (preview.contains(n)) {
-        const el = n.nodeType === 3 ? n.parentNode : n;
+        const el = (n.nodeType === 3 ? n.parentNode : n) as Element | null;
         pre = el && el.closest ? el.closest('pre') : null;
         if (pre && (pre.classList.contains('fm') || !preview.contains(pre))) pre = null;
       }
@@ -590,9 +638,9 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
       rehighlight(pre);
       preview.focus({ preventScroll: true });
       const walk = document.createTreeWalker(code, NodeFilter.SHOW_TEXT);
-      let t = null, next;
+      let t: Node | null = null, next;
       while ((next = walk.nextNode())) t = next;
-      if (t) place(t, t.nodeValue.length); else place(code, 0);
+      if (t) place(t, t.nodeValue!.length); else place(code, 0);
       changed();
     });
   }
@@ -603,35 +651,36 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
   // block's TEXT and the swap is range surgery, like Enter above, because
   // highlight spans may be anywhere and execCommand's insertText would
   // let WebKit re-block embedded newlines.
-  function onTab(e) {
+  function onTab(e: KeyboardEvent) {
     if (!editing() || e.key !== 'Tab') return;
     const sel = window.getSelection();
     if (!sel || !sel.rangeCount) return;
     const r = sel.getRangeAt(0);
-    const el = r.startContainer.nodeType === 3 ? r.startContainer.parentNode : r.startContainer;
+    const el = (r.startContainer.nodeType === 3 ? r.startContainer.parentNode : r.startContainer) as Element | null;
     const pre = el && el.closest ? el.closest('pre') : null;
     if (!pre || !preview.contains(pre) || pre.classList.contains('fm')) return;
     const code = pre.querySelector('code') || pre;
     if (!code.contains(r.endContainer)) return;    // selection leaves the block
     e.preventDefault();
-    const at = (node, off) => {                    // range point → text offset
+    const at = (node: Node, off: number) => {                    // range point → text offset
       const m = document.createRange();
       m.selectNodeContents(code);
       m.setEnd(node, off);
       return m.toString().length;
     };
-    const point = (off) => {                       // text offset → [node, off]
+    const point = (off: number): [Node, number] => {   // text offset → [node, off]
       const walk = document.createTreeWalker(code, NodeFilter.SHOW_TEXT);
-      let n, seen = 0;
+      let n: Node | null, seen = 0;
       while ((n = walk.nextNode())) {
-        if (seen + n.nodeValue.length >= off) return [n, off - seen];
-        seen += n.nodeValue.length;
+        if (seen + n.nodeValue!.length >= off) return [n, off - seen];
+        seen += n.nodeValue!.length;
       }
-      return n ? [n, n.nodeValue.length] : [code, 0];
+      // (n is always null here — the loop only ends on it)
+      return n ? [n, (n as Node).nodeValue!.length] : [code, 0];
     };
     const start = at(r.startContainer, r.startOffset);
     const end = at(r.endContainer, r.endOffset);
-    const text = code.textContent;
+    const text = code.textContent!;
     if (!e.shiftKey && !text.slice(start, end).includes('\n')) {
       r.deleteContents();                          // a caret just gets the unit
       const t = document.createTextNode('  ');
@@ -698,7 +747,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
     });
   }
 
-  function format(cmd) {
+  function format(cmd: string) {
     preview.focus();
     if (cmd === 'link') { link(); hide(); return; }
     if (cmd === 'mark') toggleHighlight();
@@ -707,7 +756,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
     else if (cmd === 'code') {
       const sel = String(window.getSelection() || '') || 'code';
       document.execCommand('insertHTML', false, '<code>'
-        + sel.replace(/[&<>]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]))
+        + sel.replace(/[&<>]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' } as Record<string, string>)[ch])
         + '</code>');
     } else if (/^(h[1-6]|p)$/.test(cmd) && retag(cmd)) {
       // done — a paragraph ↔ heading swap by hand
@@ -729,13 +778,13 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
   // math, an emoji) as a paragraph edge and heads only the part before it,
   // splitting the line in two. Same element swap, same text nodes — the
   // selection is put back on them afterwards.
-  function retag(tag) {
+  function retag(tag: string) {
     const sel = window.getSelection();
     if (!sel || !sel.rangeCount) return false;
-    const b = blockOf(sel.anchorNode);
-    if (!b || b !== blockOf(sel.focusNode) || !/^(P|H[1-6])$/.test(b.tagName)) return false;
+    const b = blockOf(sel.anchorNode!);
+    if (!b || b !== blockOf(sel.focusNode!) || !/^(P|H[1-6])$/.test(b.tagName)) return false;
     const r = sel.getRangeAt(0);
-    const pts = [r.startContainer, r.startOffset, r.endContainer, r.endOffset];
+    const pts = [r.startContainer, r.startOffset, r.endContainer, r.endOffset] as [Node, number, Node, number];
     const el = document.createElement(tag);
     for (const a of b.attributes) if (a.name !== 'id') el.setAttribute(a.name, a.value);
     while (b.firstChild) el.appendChild(b.firstChild);
@@ -751,7 +800,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
   // mousedown would drop the selection before the click lands
   bubble.addEventListener('mousedown', (e) => e.preventDefault());
   bubble.addEventListener('click', (e) => {
-    const b = e.target.closest('button');
+    const b = (e.target as Element).closest<HTMLElement>('button');
     if (!b || !b.dataset.cmd) return;   // the ⚡ and ⋯ open menus, not formats
     format(b.dataset.cmd);
   });
@@ -766,38 +815,38 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
   // inside it.
 
   const INLINE_FMT = /^(STRONG|B|EM|I|DEL|S|STRIKE|MARK|CODE|A|U|SPAN|FONT)$/;
-  const island = (n) => {
-    const el = n.nodeType === 3 ? n.parentNode : n;
+  const island = (n: Node) => {
+    const el = (n.nodeType === 3 ? n.parentNode : n) as Element | null;
     return !!(el && el.closest && el.closest('[contenteditable="false"]'));
   };
-  const unwrap = (el) => {
-    while (el.firstChild) el.parentNode.insertBefore(el.firstChild, el);
+  const unwrap = (el: Element) => {
+    while (el.firstChild) el.parentNode!.insertBefore(el.firstChild, el);
     el.remove();
   };
 
   // the selection cut into one range per block it touches, text-trimmed so
   // a stray space at either edge stays outside the formatting (unmd trims
   // inside markers, and "foo ==bar==" would come back as "foo==bar==")
-  function blockRanges(r) {
+  function blockRanges(r: Range): Range[] {
     const root = r.commonAncestorContainer;
-    const walk = document.createTreeWalker(root.nodeType === 3 ? root.parentNode : root,
+    const walk = document.createTreeWalker((root.nodeType === 3 ? root.parentNode : root)!,
       NodeFilter.SHOW_TEXT);
-    const groups = new Map();
+    const groups = new Map<HTMLElement, Node[]>();
     for (let n; (n = walk.nextNode());) {
       if (!r.intersectsNode(n) || island(n) || !preview.contains(n)) continue;
       const b = blockOf(n);
       if (!b) continue;
       if (!groups.has(b)) groups.set(b, []);
-      groups.get(b).push(n);
+      groups.get(b)!.push(n);
     }
-    const out = [];
+    const out: Range[] = [];
     for (const nodes of groups.values()) {
       const first = nodes[0], last = nodes[nodes.length - 1];
       let s = first === r.startContainer ? r.startOffset : 0;
-      let e = last === r.endContainer ? r.endOffset : last.nodeValue.length;
-      while (s < first.nodeValue.length && /\s/.test(first.nodeValue[s])
+      let e = last === r.endContainer ? r.endOffset : last.nodeValue!.length;
+      while (s < first.nodeValue!.length && /\s/.test(first.nodeValue![s])
              && (first !== last || s < e)) s++;
-      while (e > 0 && /\s/.test(last.nodeValue[e - 1]) && (first !== last || e > s)) e--;
+      while (e > 0 && /\s/.test(last.nodeValue![e - 1]) && (first !== last || e > s)) e--;
       if (first === last && s >= e) continue;
       const sub = document.createRange();
       sub.setStart(first, s);
@@ -810,23 +859,24 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
   // Move a run of siblings [first..last] up out of every inline formatting
   // element above them (splitting each one around the run), stopping at
   // the block — so plain text inserted inside a <strong> comes out plain.
-  function liftOut(first, last) {
-    let p = first.parentNode;
+  function liftOut(first: Node, last: Node) {
+    // only ever an element: the walk stops at the block
+    let p = first.parentNode as HTMLElement | null;
     while (p && p !== preview && INLINE_FMT.test(p.tagName) && !BLOCKISH.test(p.tagName)) {
       const tail = p.cloneNode(false);
       while (last.nextSibling) tail.appendChild(last.nextSibling);
-      const run = [];
-      for (let n = first; n; n = n === last ? null : n.nextSibling) run.push(n);
+      const run: Node[] = [];
+      for (let n: Node | null = first; n; n = n === last ? null : n.nextSibling) run.push(n);
       let at = p.nextSibling;
-      for (const n of run) p.parentNode.insertBefore(n, at);
-      if (tail.firstChild) p.parentNode.insertBefore(tail, at);
+      for (const n of run) p.parentNode!.insertBefore(n, at);
+      if (tail.firstChild) p.parentNode!.insertBefore(tail, at);
       if (!p.textContent && !p.querySelector('br, img')) p.remove();
-      p = first.parentNode;
+      p = first.parentNode as HTMLElement | null;
     }
   }
 
-  const selectRun = (first, last) => {
-    const sel = window.getSelection();
+  const selectRun = (first: Node, last: Node) => {
+    const sel = window.getSelection()!;
     const r = document.createRange();
     r.setStartBefore(first);
     r.setEndAfter(last);
@@ -835,9 +885,9 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
   };
 
   // one <mark> next to another serializes as "==a====b==" — fold it in
-  function mergeMarks(m) {
-    for (const side of ['previousSibling', 'nextSibling']) {
-      const n = m[side];
+  function mergeMarks(m: HTMLElement): HTMLElement {
+    for (const side of ['previousSibling', 'nextSibling'] as const) {
+      const n = m[side] as HTMLElement | null;
       if (!n || n.nodeType !== 1 || n.tagName !== 'MARK') continue;
       if (side === 'previousSibling') { while (m.firstChild) n.appendChild(m.firstChild); }
       else { while (n.firstChild) m.appendChild(n.firstChild); n.remove(); continue; }
@@ -862,23 +912,24 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
     if (!r) return;
     const subs = blockRanges(r);
     if (!subs.length) return;
-    const marked = (n) => !!(n.parentNode && n.parentNode.closest('mark'));
-    const texts = [];
+    const marked = (n: Node) => !!(n.parentNode && (n.parentNode as Element).closest('mark'));
+    const texts: Node[] = [];
     for (const s of subs) {
-      const walk = document.createTreeWalker(blockOf(s.startContainer), NodeFilter.SHOW_TEXT);
+      const walk = document.createTreeWalker(blockOf(s.startContainer)!, NodeFilter.SHOW_TEXT);
       for (let n; (n = walk.nextNode());) {
-        if (s.intersectsNode(n) && n.nodeValue.trim()) texts.push(n);
+        if (s.intersectsNode(n) && n.nodeValue!.trim()) texts.push(n);
       }
     }
     mark();
     if (texts.length && texts.every(marked)) {
-      const marks = new Set(texts.map((n) => n.parentNode.closest('mark')));
-      const first = [...marks][0].firstChild, lastM = [...marks].pop();
+      // every one of them is inside a mark: texts.every(marked)
+      const marks = new Set(texts.map((n) => (n.parentNode as Element).closest('mark')!));
+      const first = [...marks][0].firstChild, lastM = [...marks].pop()!;
       const last = lastM.lastChild;
       for (const m of marks) unwrap(m);
       if (first && last) selectRun(first, last);
     } else {
-      let first = null, last = null;
+      let first: HTMLElement | null = null, last: HTMLElement | null = null;
       for (const s of subs.reverse()) {
         const frag = s.extractContents();
         frag.querySelectorAll('mark').forEach(unwrap);
@@ -889,7 +940,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
         if (!last) last = m;
         first = m;
       }
-      selectRun(first, last);
+      selectRun(first!, last!);
     }
     changed();
     position();
@@ -903,15 +954,15 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
     const subs = blockRanges(r);
     if (!subs.length) return;
     mark();
-    let first = null, last = null;
+    let first: ChildNode | null = null, last: ChildNode | null = null;
     for (const s of subs.reverse()) {
       const frag = s.extractContents();
-      const flat = (parent) => {
+      const flat = (parent: ParentNode) => {
         for (const n of [...parent.childNodes]) {
           if (n.nodeType !== 1) continue;
-          if (n.getAttribute('contenteditable') === 'false' || n.tagName === 'BR') continue;
-          flat(n);
-          unwrap(n);
+          if ((n as Element).getAttribute('contenteditable') === 'false' || (n as Element).tagName === 'BR') continue;
+          flat(n as Element);
+          unwrap(n as Element);
         }
       };
       flat(frag);
@@ -923,7 +974,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
       if (!last) last = kids[kids.length - 1];
       first = kids[0];
     }
-    if (first) selectRun(first, last);
+    if (first) selectRun(first, last!);
     changed();
     position();
   }
@@ -948,7 +999,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
     el.appendChild(elt('code', tex));
     s.insertNode(el);
     const tail = document.createTextNode('​');
-    el.parentNode.insertBefore(tail, el.nextSibling);
+    el.parentNode!.insertBefore(tail, el.nextSibling);
     place(tail, 1);
     changed();
     decorate();
@@ -961,7 +1012,10 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
   // already is). Built fresh on every open — Inline math comes and goes
   // with Preview ▸ Markdown Flavor.
 
-  const MORE = [
+  /** A ⋯ menu row: a format command, or a section heading. */
+  interface MoreItem { cmd?: string; label?: string; key?: string; when?: () => boolean; head?: string }
+
+  const MORE: MoreItem[] = [
     { cmd: 'mark', label: 'Highlight', key: '⇧⌘M' },
     { cmd: 'math', label: 'Inline math', when: () => canMath() },
     { cmd: 'clear', label: 'Clear formatting' },
@@ -979,7 +1033,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
     const sel = window.getSelection();
     const b = sel && sel.anchorNode && blockOf(sel.anchorNode);
     if (!b) return null;
-    if (b.tagName === 'LI') return b.parentNode.tagName === 'OL' ? 'ol' : 'ul';
+    if (b.tagName === 'LI') return (b.parentNode as Element).tagName === 'OL' ? 'ol' : 'ul';
     if (b.closest('blockquote')) return 'blockquote';
     return /^(H[1-3]|P)$/.test(b.tagName) ? b.tagName.toLowerCase() : null;
   }
@@ -988,29 +1042,29 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
 
   function openMore() {
     const now = blockKind();
-    more.textContent = '';
+    more!.textContent = '';
     for (const it of MORE) {
       if (it.when && !it.when()) continue;
       if (it.head) {
         const h = document.createElement('div');
         h.className = 'bmhead';
         h.textContent = it.head;
-        more.appendChild(h);
+        more!.appendChild(h);
         continue;
       }
       const b = document.createElement('button');
-      b.appendChild(elt('span', it.label));
+      b.appendChild(elt('span', it.label!));
       if (it.key) b.appendChild(elt('kbd', it.key));
       if (it.cmd === now) b.classList.add('on');
-      b.onmousedown = (e) => { e.preventDefault(); hideMore(); format(it.cmd); };
-      more.appendChild(b);
+      b.onmousedown = (e) => { e.preventDefault(); hideMore(); format(it.cmd!); };
+      more!.appendChild(b);
     }
-    more.hidden = false;
-    const r = moreBtn.getBoundingClientRect();
-    const w = more.offsetWidth, h = more.offsetHeight;
-    more.style.left = Math.round(Math.min(Math.max(8, r.right - w), innerWidth - w - 8)) + 'px';
+    more!.hidden = false;
+    const r = moreBtn!.getBoundingClientRect();
+    const w = more!.offsetWidth, h = more!.offsetHeight;
+    more!.style.left = Math.round(Math.min(Math.max(8, r.right - w), innerWidth - w - 8)) + 'px';
     const above = r.top - h - 6;
-    more.style.top = Math.round(above > 6 ? above : r.bottom + 6) + 'px';
+    more!.style.top = Math.round(above > 6 ? above : r.bottom + 6) + 'px';
   }
 
   if (more && moreBtn) {
@@ -1024,7 +1078,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
     });
     addEventListener('scroll', hideMore, true);
     addEventListener('mousedown', (e) => {
-      if (!more.hidden && !more.contains(e.target) && !moreBtn.contains(e.target)) hideMore();
+      if (!more.hidden && !more.contains(e.target as Node) && !moreBtn.contains(e.target as Node)) hideMore();
     });
     addEventListener('keydown', (e) => { if (e.key === 'Escape') hideMore(); }, true);
     addEventListener('blur', hideMore);

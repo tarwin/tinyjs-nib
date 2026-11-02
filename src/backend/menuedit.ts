@@ -19,11 +19,16 @@
 // The reader (menus.ts) is run fresh before every edit, so spans and lines
 // are never stale; menus.ts marks what this file can edit (`editable`).
 
+import type { Parsed, Span, JsonPath, Menu, MenuItem, MenuOp, Site } from './menuparse.ts';
+
+// what an edit answers: the file's new text, or why not
+interface EditText { text?: string; error?: string }
+
 // ----------------------------------------------------------------- helpers
 
-const dirOf = (p) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
+const dirOf = (p: string) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
 
-function relPath(fromDir, target) {
+function relPath(fromDir: string, target: string) {
   const a = fromDir.split('/').filter(Boolean);
   const b = target.split('/').filter(Boolean);
   let i = 0;
@@ -31,30 +36,35 @@ function relPath(fromDir, target) {
   return '../'.repeat(a.length - i) + b.slice(i).join('/');
 }
 
+interface Located { item: MenuItem | null; list: MenuItem[]; index: number; parent: MenuItem | null }
+// a Located for an `op.at` already checked to be there (with `T`'s fields)
+type Found<T = object> = Located & { item: MenuItem & T };
+
 // '0.2.1' -> the item, its parent list, its index in that list
-function locate(menu, at) {
+function locate(menu: Menu, at: string | null | undefined): Located | null {
   if (at === null || at === undefined || at === '') return { item: null, list: menu.items, index: -1, parent: null };
   const ids = String(at).split('.').map(Number);
-  let list = menu.items, parent = null, item = null;
+  // a missing `items` is caught by the `!item` on the next step
+  let list: MenuItem[] = menu.items, parent: MenuItem | null = null, item: MenuItem | null = null;
   for (let k = 0; k < ids.length; k++) {
     item = list && list[ids[k]];
     if (!item) return null;
-    if (k < ids.length - 1) { parent = item; list = item.items; }
+    if (k < ids.length - 1) { parent = item; list = item.items!; }
   }
   return { item, list, index: ids[ids.length - 1], parent };
 }
 
-const inside = (a, b) => String(b).startsWith(String(a) + '.');   // b is under a
+const inside = (a: string | null | undefined, b: string | null | undefined) => String(b).startsWith(String(a) + '.');   // b is under a
 
 // ===================================================================== lines
 
-const indentOf = (l) => (l.match(/^[ \t]*/)[0].replace(/\t/g, '    ').length);
-const isHeading = (l) => /^#{1,6}\s/.test(l);
-const isRule = (l) => /^\s*([-*_])(\s*\1){2,}\s*$/.test(l);
+const indentOf = (l: string) => (l.match(/^[ \t]*/)![0].replace(/\t/g, '    ').length);
+const isHeading = (l: string) => /^#{1,6}\s/.test(l);
+const isRule = (l: string) => /^\s*([-*_])(\s*\1){2,}\s*$/.test(l);
 
 // [start, end) of the lines an entry owns: itself and everything more
 // indented under it. A part heading owns up to the next heading or rule.
-function blockOf(lines, n, item) {
+function blockOf(lines: string[], n: number, item: MenuItem | null | undefined): [number, number] {
   if (item && item.part) {
     let e = n + 1;
     while (e < lines.length && !isHeading(lines[e]) && !isRule(lines[e])) e++;
@@ -73,7 +83,7 @@ function blockOf(lines, n, item) {
 }
 
 // the indent one level deeper than `ind`, as this file writes it
-function stepOf(lines) {
+function stepOf(lines: string[]) {
   let step = 0;
   for (let n = 1; n < lines.length; n++) {
     const d = indentOf(lines[n]) - indentOf(lines[n - 1]);
@@ -82,7 +92,7 @@ function stepOf(lines) {
   return step || 2;
 }
 
-function reindent(block, delta) {
+function reindent(block: string[], delta: number) {
   if (!delta) return block;
   return block.map((l) => {
     if (!l.trim()) return l;
@@ -94,14 +104,16 @@ function reindent(block, delta) {
 
 // Where a new block goes, and at what indent: before/after an entry, or
 // as the last child of a group (a part heading's children sit at indent 0).
-function landing(lines, menu, target, where, step) {
+interface LineLanding { at: number; ind: number; header?: string | null }
+
+function landing(lines: string[], menu: Menu, target: { item: MenuItem | null }, where: string | undefined, step: number): LineLanding | null {
   if (!target.item) {
     // the end of the menu: after the last line any entry owns
     let last = -1;
-    const walk = (items) => { for (const it of items || []) { if (it.line != null) last = Math.max(last, blockOf(lines, it.line, it)[1]); walk(it.items); } };
+    const walk = (items: MenuItem[] | undefined) => { for (const it of items || []) { if (it.line != null) last = Math.max(last, blockOf(lines, it.line, it)[1]); walk(it.items); } };
     walk(menu.items);
     const first = menu.items.find((it) => it.line != null && !it.part);
-    return { at: last < 0 ? lines.length : last, ind: first ? indentOf(lines[first.line]) : 0 };
+    return { at: last < 0 ? lines.length : last, ind: first ? indentOf(lines[first.line!]) : 0 };
   }
   const t = target.item;
   if (t.line == null) return null;
@@ -111,24 +123,25 @@ function landing(lines, menu, target, where, step) {
   // inside: as its last child
   if (t.part) return { at: end, ind: 0 };
   const kid = (t.items || []).find((k) => k.line != null);
-  return { at: end, ind: kid ? indentOf(lines[kid.line]) : indentOf(lines[t.line]) + step };
+  return { at: end, ind: kid ? indentOf(lines[kid.line!]) : indentOf(lines[t.line]) + step };
 }
 
 // YAML lists of mappings (Quarto, Jupyter Book, Jekyll's navigation.yml):
 // the key an entry's link is written under, and its name when the reader
 // didn't say (a bare `- page.qmd` has neither until it's renamed)
-const YLINK = { quarto: 'href', jbook: 'file', myst: 'file', jekyll: 'url' };
-const YLABEL = { quarto: 'text', jbook: 'title', myst: 'title', jekyll: 'title' };
-const yq = (t) => (/^[\w][\w .,/()&+-]*$/.test(t) && !/^(true|false|null|yes|no|~|-?\d+(\.\d+)?)$/i.test(t) && !/\s$/.test(t)
+const YLINK: Record<string, string> = { quarto: 'href', jbook: 'file', myst: 'file', jekyll: 'url' };
+const YLABEL: Record<string, string> = { quarto: 'text', jbook: 'title', myst: 'title', jekyll: 'title' };
+const yq = (t: string) => (/^[\w][\w .,/()&+-]*$/.test(t) && !/^(true|false|null|yes|no|~|-?\d+(\.\d+)?)$/i.test(t) && !/\s$/.test(t)
   ? t : JSON.stringify(t));
-const isMapping = (t) => /^("[^"]*"|'[^']*'|[^:'"\s][^:]*?)\s*:(\s|$)/.test(t);
+const isMapping = (t: string) => /^("[^"]*"|'[^']*'|[^:'"\s][^:]*?)\s*:(\s|$)/.test(t);
 
-function ymapRename(lines, it, menu, name) {
-  const n = it.line;
+// (only called for an entry that has a line)
+function ymapRename(lines: string[], it: MenuItem, menu: Menu, name: string): string | null {
+  const n = it.line!;
   const m = /^(\s*-\s+)(.*)$/.exec(lines[n]);
   if (!m) return 'That entry isn’t a list item any more.';
   const pad = ' '.repeat(m[1].length);
-  const key = it.ylabel || YLABEL[menu.flavor];
+  const key = it.ylabel || YLABEL[menu.flavor!];
   const re = new RegExp('^' + key + '\\s*:');
   if (re.test(m[2])) { lines[n] = m[1] + key + ': ' + yq(name); return null; }
   const [, end] = blockOf(lines, n, it);
@@ -139,20 +152,21 @@ function ymapRename(lines, it, menu, name) {
     }
   }
   // not named yet: a bare `- page.qmd` becomes a mapping that can be
-  if (!isMapping(m[2])) lines[n] = m[1] + YLINK[menu.flavor] + ': ' + m[2];
+  if (!isMapping(m[2])) lines[n] = m[1] + YLINK[menu.flavor!] + ': ' + m[2];
   lines.splice(n + 1, 0, pad + key + ': ' + yq(name));
   return null;
 }
 
 // Landing INSIDE a YAML-map group with no children yet: under its child key
 // (`contents:`, `children:` …), which is added when it isn't there
-function ymapInside(lines, t) {
-  const m = /^(\s*-\s+)/.exec(lines[t.line]);
-  const padLen = m ? m[1].length : indentOf(lines[t.line]) + 2;
-  const [, end] = blockOf(lines, t.line, t);
+// (lineEdit has checked t.line is there)
+function ymapInside(lines: string[], t: MenuItem): LineLanding {
+  const m = /^(\s*-\s+)/.exec(lines[t.line!]);
+  const padLen = m ? m[1].length : indentOf(lines[t.line!]) + 2;
+  const [, end] = blockOf(lines, t.line!, t);
   const key = t.ychild;
-  if (new RegExp('^\\s*-\\s+' + key + '\\s*:\\s*$').test(lines[t.line])) return { at: t.line + 1, ind: padLen + 2, header: null };
-  for (let k = t.line + 1; k < end; k++) {
+  if (new RegExp('^\\s*-\\s+' + key + '\\s*:\\s*$').test(lines[t.line!])) return { at: t.line! + 1, ind: padLen + 2, header: null };
+  for (let k = t.line! + 1; k < end; k++) {
     if (new RegExp('^\\s*' + key + '\\s*:\\s*(\\[\\s*\\])?\\s*$').test(lines[k])) {
       if (/\[\s*\]/.test(lines[k])) lines[k] = lines[k].replace(/\s*\[\s*\]\s*$/, '');
       return { at: k + 1, ind: indentOf(lines[k]) + 2, header: null };
@@ -164,7 +178,7 @@ function ymapInside(lines, t) {
 // After a cut at line `a`: a child key (`sections:`) left with nothing under
 // it would read as null and break the site's build — take it out too.
 // Returns how many lines went, so a landing spot below can be adjusted.
-function dropEmptyKey(lines, a) {
+function dropEmptyKey(lines: string[], a: number) {
   const k = a - 1;
   if (k < 0 || !/^\s*[\w-]+\s*:\s*$/.test(lines[k]) || /^\s*-\s/.test(lines[k])) return 0;
   let n = a;
@@ -175,18 +189,20 @@ function dropEmptyKey(lines, a) {
   return 1;
 }
 
-function markerOf(lines, menu, yaml) {
+function markerOf(lines: string[], menu: Menu, yaml: boolean) {
   if (yaml) return '-';
   for (const l of lines) { const m = /^\s*([-*+])\s/.exec(l); if (m) return m[1]; }
   return '-';
 }
 
-function lineEdit(text, menu, op, ctx) {
+// (`ctx` is never passed; applyEdit calls with three)
+function lineEdit(text: string, menu: Menu, op: MenuOp, ctx?: unknown): EditText {
   const lines = text.split('\n');
   const ymap = menu.source.kind === 'yamlmap';
   const yaml = menu.source.kind === 'yamllist' || ymap;
   const step = stepOf(lines);
-  const src = op.at != null ? locate(menu, op.at) : null;
+  // every edit but `add` names an entry (op.at), checked to be there just below
+  const src = (op.at != null ? locate(menu, op.at) : null) as Found<{ line: number }>;
   if (op.at != null && (!src || !src.item || src.item.line == null)) return { error: 'That entry isn’t in the file any more.' };
 
   if (op.kind === 'rename') {
@@ -199,9 +215,9 @@ function lineEdit(text, menu, op, ctx) {
       return err ? { error: err } : { text: lines.join('\n') };
     }
     if (yaml) {
-      const m = /^(\s*-\s+)(.*)$/.exec(l);
+      const m = /^(\s*-\s+)(.*)$/.exec(l)!;
       const kv = /^(['"]?)(.*?)\1\s*:\s*(.*)$/.exec(m[2]);
-      const q = (t) => (/[:#'"{}[\],&*?|<>=!%@`]/.test(t) || /^\s|\s$/.test(t) ? '"' + t.replace(/["\\]/g, '\\$&') + '"' : t);
+      const q = (t: string) => (/[:#'"{}[\],&*?|<>=!%@`]/.test(t) || /^\s|\s$/.test(t) ? '"' + t.replace(/["\\]/g, '\\$&') + '"' : t);
       lines[n] = kv && !/^https?:/.test(m[2]) ? m[1] + q(name) + ':' + (kv[3] ? ' ' + kv[3] : '')
         : m[1] + q(name) + ': ' + m[2];                    // `- page.md` -> `- Name: page.md`
     } else if (src.item.part || isHeading(l)) {
@@ -231,7 +247,7 @@ function lineEdit(text, menu, op, ctx) {
     // beside a part heading means "into the part", at its top or bottom
     op = { ...op, where: 'inside' };
   }
-  let land;
+  let land: LineLanding | null;
   if (ymap && op.where === 'inside' && target.item) {
     if (!target.item.ychild || target.item.line == null) return { error: 'Only a group can hold entries — drop it beside this one instead.' };
     land = (target.item.items || []).some((k) => k.line != null) ? landing(lines, menu, target, 'inside', step) : ymapInside(lines, target.item);
@@ -239,7 +255,7 @@ function lineEdit(text, menu, op, ctx) {
   if (!land) return { error: 'Can’t find where to put it.' };
   const head = land.header ? [land.header] : [];
 
-  let block;
+  let block: string[];
   if (op.kind === 'move') {
     const [a, b] = blockOf(lines, src.item.line, src.item);
     block = lines.slice(a, b);
@@ -256,11 +272,11 @@ function lineEdit(text, menu, op, ctx) {
   }
 
   if (op.kind === 'add') {
-    const link = op.link;
+    const link = op.link!;              // editMenu worked it out
     const title = op.text;
     const pad = ' '.repeat(land.ind);
     const mk = markerOf(lines, menu, yaml);
-    let line;
+    let line: string;
     if (ymap) {
       const f = menu.flavor;
       const add = f === 'jekyll' ? [pad + '- title: ' + yq(title || link), pad + '  url: ' + link]
@@ -279,16 +295,16 @@ function lineEdit(text, menu, op, ctx) {
 
 // ====================================================================== code
 
-const lineStartOf = (src, i) => src.lastIndexOf('\n', i - 1) + 1;
-const padBefore = (src, i) => src.slice(lineStartOf(src, i), i);
-const ownLine = (src, s) => !padBefore(src, s).trim();
+const lineStartOf = (src: string, i: number) => src.lastIndexOf('\n', i - 1) + 1;
+const padBefore = (src: string, i: number) => src.slice(lineStartOf(src, i), i);
+const ownLine = (src: string, s: number) => !padBefore(src, s).trim();
 
 // The text an element owns: from its line start (when it's alone on the
 // line) through its comma, a trailing comment and the newline — so cutting
 // it leaves no blank line or stray comma. Inline elements own just
 // themselves and the comma after.
-function regionOf(src, [s, e]) {
-  const tail = /^[ \t]*,?[ \t]*(\/\/[^\n]*)?\n?/.exec(src.slice(e))[0];
+function regionOf(src: string, [s, e]: Span): [number, number, boolean] {
+  const tail = /^[ \t]*,?[ \t]*(\/\/[^\n]*)?\n?/.exec(src.slice(e))![0];
   if (ownLine(src, s) && tail.endsWith('\n')) return [lineStartOf(src, s), e + tail.length, true];
   const comma = /^\s*,\s*/.exec(src.slice(e));
   if (comma) return [s, e + comma[0].length, false];
@@ -298,7 +314,7 @@ function regionOf(src, [s, e]) {
 }
 
 // Move every line after the first by `delta` columns
-function shiftLines(text, delta) {
+function shiftLines(text: string, delta: number) {
   if (!delta) return text;
   return text.split('\n').map((l, k) => {
     if (!k || !l.trim()) return l;
@@ -307,11 +323,13 @@ function shiftLines(text, delta) {
   }).join('\n');
 }
 
-const quoteOf = (src) => ((src.match(/'/g) || []).length >= (src.match(/"/g) || []).length ? "'" : '"');
-const lit = (s, q) => q + String(s).replace(/\\/g, '\\\\').replace(new RegExp(q, 'g'), '\\' + q).replace(/\n/g, '\\n') + q;
+const quoteOf = (src: string) => ((src.match(/'/g) || []).length >= (src.match(/"/g) || []).length ? "'" : '"');
+const lit = (s: unknown, q: string) => q + String(s).replace(/\\/g, '\\\\').replace(new RegExp(q, 'g'), '\\' + q).replace(/\n/g, '\\n') + q;
 
 // Apply non-overlapping splices, last first
-function splice(src, edits) {
+interface Splice { s: number; e: number; text: string }
+
+function splice(src: string, edits: Splice[]) {
   edits.sort((a, b) => b.s - a.s || b.e - a.e);
   for (const { s, e, text } of edits) src = src.slice(0, s) + text + src.slice(e);
   return src;
@@ -319,9 +337,23 @@ function splice(src, edits) {
 
 // Where to insert a new element and how: before/after a sibling, or at the
 // end of an array (a group's items, or the menu itself).
-function codeLanding(src, menu, target, where) {
-  const t = target.item;
-  let arr = null;                                  // [s, e] of an array literal
+interface CodeLanding {
+  error?: string;
+  s: number;
+  e?: number;
+  empty?: boolean;
+  ind?: string | null;
+  own?: boolean;
+  before?: boolean;
+  needComma?: number | false;
+  inlineLast?: boolean;
+}
+
+function codeLanding(src: string, menu: Menu, target: { item: MenuItem | null }, where: string | undefined): CodeLanding | { error: string } {
+  // null only for the end of the menu, which lands in menu.arraySpan
+  // (applyEdit sends no code menu without one)
+  const t = target.item!;
+  let arr: Span | null | undefined = null;                                  // [s, e] of an array literal
   if (!t) arr = menu.arraySpan;
   else if (where === 'inside') {
     if (!t.itemsSpan) return { error: t.kind === 'group' ? 'This group’s entries are built by code.' : 'Only a group can hold entries — drop it beside this one instead.' };
@@ -332,7 +364,7 @@ function codeLanding(src, menu, target, where) {
     const last = [...kids].reverse().find((k) => k.span);
     if (last) return codeLanding(src, menu, { item: last }, 'after');
     // an empty array: `[]` becomes a multi-line one
-    const ind = padBefore(src, arr[0]).match(/^\s*/)[0];
+    const ind = padBefore(src, arr[0]).match(/^\s*/)![0];
     return { s: arr[0], e: arr[1], empty: true, ind };
   }
   if (!t.span) return { error: 'That entry is built by code.' };
@@ -351,12 +383,12 @@ function codeLanding(src, menu, target, where) {
     : { s: t.span[1], own: false, inlineLast: true };
 }
 
-function insertAt(src, land, elemText) {
+function insertAt(src: string, land: CodeLanding, elemText: string): Splice[] {
   if (land.empty) {
     const body = '[\n' + land.ind + '  ' + shiftLines(elemText, 0) + ',\n' + land.ind + ']';
-    return [{ s: land.s, e: land.e, text: body }];
+    return [{ s: land.s, e: land.e!, text: body }];
   }
-  const edits = [];
+  const edits: Splice[] = [];
   if (land.needComma) edits.push({ s: land.needComma, e: land.needComma, text: ',' });
   if (land.own) edits.push({ s: land.s, e: land.s, text: land.ind + elemText + ',\n' });
   else if (land.before) edits.push({ s: land.s, e: land.s, text: elemText + ', ' });
@@ -364,8 +396,9 @@ function insertAt(src, land, elemText) {
   return edits;
 }
 
-function codeEdit(src, menu, op, site) {
-  const at = op.at != null ? locate(menu, op.at) : null;
+function codeEdit(src: string, menu: Menu, op: MenuOp, site: Site): EditText {
+  // every edit but `add` names an entry (op.at), checked to be there just below
+  const at = (op.at != null ? locate(menu, op.at) : null) as Found;
   if (op.at != null && (!at || !at.item)) return { error: 'That entry isn’t in the file any more.' };
   const q = quoteOf(src);
 
@@ -397,10 +430,11 @@ function codeEdit(src, menu, op, site) {
   const target = op.to != null ? locate(menu, op.to) : { item: null };
   if (!target) return { error: 'Can’t find where to put it.' };
   if (op.kind === 'move' && (op.to === op.at || inside(op.at, op.to))) return { error: 'Can’t move an entry into itself.' };
-  const land = codeLanding(src, menu, target, op.where);
+  // (an error answer is returned just below)
+  const land = codeLanding(src, menu, target, op.where) as CodeLanding;
   if (land.error) return land;
 
-  let elem, cut = null;
+  let elem: string, cut: Splice | null = null;
   if (op.kind === 'move') {
     if (!at.item.span) return { error: 'That entry is built by code.' };
     const [s, e] = at.item.span;
@@ -408,7 +442,7 @@ function codeEdit(src, menu, op, site) {
     if (land.s > r[0] && land.s < r[1]) return { error: 'Can’t move an entry into itself.' };
     cut = { s: r[0], e: r[1], text: '' };
     const fromInd = ownLine(src, s) ? padBefore(src, s).length : 0;
-    const toInd = land.own ? land.ind.length : land.empty ? land.ind.length + 2 : fromInd;
+    const toInd = land.own ? land.ind!.length : land.empty ? land.ind!.length + 2 : fromInd;
     elem = shiftLines(src.slice(s, e), toInd - fromInd);
   } else if (op.kind === 'add') {
     elem = menu.flavor === 'docusaurus' ? lit(op.link, q)
@@ -429,20 +463,21 @@ function codeEdit(src, menu, op, site) {
 // ====================================================================== json
 
 // the file's indent step: its smallest one (the first indented line may be nested)
-function jsonIndent(text) {
-  let best = null;
+function jsonIndent(text: string) {
+  let best: string | null = null;
   for (const m of text.matchAll(/\n([ \t]+)\S/g)) if (!best || m[1].length < best.length) best = m[1];
   return best || '  ';
 }
 
-function jsonEdit(text, menu, op) {
-  let j;
+function jsonEdit(text: string, menu: Menu, op: MenuOp): EditText {
+  let j: Parsed;
   try { j = JSON.parse(text); } catch { return { error: 'The file isn’t valid JSON right now.' }; }
   const ind = jsonIndent(text);
-  const get = (path) => path.reduce((o, k) => (o == null ? o : o[k]), j);
-  const at = op.at != null ? locate(menu, op.at) : null;
+  const get = (path: JsonPath): Parsed => path.reduce((o: Parsed, k) => (o == null ? o : o[k]), j);
+  // every edit but `add` names an entry (op.at), checked to be there just below
+  const at = (op.at != null ? locate(menu, op.at) : null) as Found<{ jpath: JsonPath }>;
   if (op.at != null && (!at || !at.item || !at.item.jpath)) return { error: 'That entry isn’t in the file any more.' };
-  const parentOf = (jp) => ({ arr: get(jp.slice(0, -1)), i: jp[jp.length - 1] });
+  const parentOf = (jp: JsonPath) => ({ arr: get(jp.slice(0, -1)), i: jp[jp.length - 1] });
 
   if (op.kind === 'rename') {
     const it = at.item;
@@ -468,24 +503,24 @@ function jsonEdit(text, menu, op) {
     const target = op.to != null ? locate(menu, op.to) : { item: null };
     if (!target) return { error: 'Can’t find where to put it.' };
     if (op.kind === 'move' && (op.to === op.at || inside(op.at, op.to))) return { error: 'Can’t move an entry into itself.' };
-    let value;
+    let value: Parsed;
     if (op.kind === 'move') {
       const { arr, i } = parentOf(at.item.jpath);
       value = arr[i];
       arr[i] = undefined;                               // a hole, so later indices don't shift
     } else value = menu.flavor === 'vitepress' ? { text: op.text || op.link, link: op.link } : op.link;
-    let dest, di;
-    if (!target.item) { dest = get(menu.listPath); di = dest.length; }
+    let dest: Parsed, di: number;
+    if (!target.item) { dest = get(menu.listPath!); di = dest.length; }
     else if (op.where === 'inside') {
       if (!target.item.listPath) return { error: 'Only a group can hold pages — drop it beside this one instead.' };
       dest = get(target.item.listPath); di = dest.length;
     } else {
-      const p = parentOf(target.item.jpath);
-      dest = p.arr; di = p.i + (op.where === 'after' ? 1 : 0);
+      const p = parentOf(target.item.jpath!);
+      dest = p.arr; di = (p.i as number) + (op.where === 'after' ? 1 : 0);
     }
     dest.splice(di, 0, value);
     // close the hole the move left
-    const sweep = (o) => {
+    const sweep = (o: Parsed): void => {
       if (Array.isArray(o)) { for (let k = o.length - 1; k >= 0; k--) if (o[k] === undefined) o.splice(k, 1); o.forEach(sweep); }
       else if (o && typeof o === 'object') Object.values(o).forEach(sweep);
     };
@@ -500,15 +535,16 @@ function jsonEdit(text, menu, op) {
 // How this menu would write a link to project-relative `file`. Checked
 // against the site's own resolver (`resolves`), so a link that wouldn't come
 // back to the file is never written.
-export function linkFor(site, menu, file, resolves) {
+export function linkFor(site: Site, menu: Menu, file: string, resolves: (t: string) => string | null): string | null {
   const content = site.content || '';
   const sub = content ? file.slice(content.length + 1) : file;
   const noExt = sub.replace(/\.(mdx?|markdown|qmd|rmd|adoc)$/i, '');
-  const tries = [];
+  const tries: string[] = [];
   switch (menu.flavor) {
     case 'relative': tries.push(relPath(dirOf(menu.source.file), file)); break;
     case 'docsify': tries.push(content ? file.slice(content.length + 1) : file); break;
-    case 'wiki': tries.push(noExt.split('/').pop()); break;
+    case 'wiki': tries.push(noExt.split('/').pop()!); break;
+
     case 'mkdocs': tries.push(sub); break;
     case 'mintlify': tries.push(noExt); break;
     case 'quarto': tries.push(file.slice(site.root ? site.root.length + 1 : 0)); break;
@@ -544,7 +580,8 @@ export function linkFor(site, menu, file, resolves) {
 // =================================================================== the API
 
 // -> { file, text } to write, or { error }
-export function applyEdit(site, menu, text, op) {
+export function applyEdit(site: Site, menu: Menu, text: string, op: MenuOp): EditText {
+
   if (!menu.editable) return { error: 'Nib can’t edit this menu yet — open its file to change it.' };
   const kind = menu.source.kind;
   if (kind === 'mdlist' || kind === 'yamllist' || kind === 'yamlmap') return lineEdit(text, menu, op);

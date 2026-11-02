@@ -9,26 +9,26 @@
 //
 // Same escaping discipline as md.ts: nothing reaches innerHTML unescaped.
 
-const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
-const esc = (s) => String(s).replace(/[&<>]/g, (c) => ESC[c]);
-const span = (cls, s) => `<span class="${cls}">${esc(s)}</span>`;
-const attr = (s) => esc(s).replace(/"/g, '&quot;');
+const ESC: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
+const esc = (s: unknown) => String(s).replace(/[&<>]/g, (c) => ESC[c]);
+const span = (cls: string, s: unknown) => `<span class="${cls}">${esc(s)}</span>`;
+const attr = (s: unknown) => esc(s).replace(/"/g, '&quot;');
 // A whole link, wrapped: the backdrop is the only place the source text has
 // real boxes (the textarea over it is transparent), so this is what doc.ts
 // hit-tests to put a hand cursor under an ⌥-hover and to know what an
 // ⌥-click landed on. The target rides along in the attribute already parsed.
-const link = (href, inner) => `<span class="tk-a" data-href="${attr(href)}">${inner}</span>`;
+const link = (href: string, inner: string) => `<span class="tk-a" data-href="${attr(href)}">${inner}</span>`;
 // What was written between the parens, as a path: <brackets> are a wrapper
 // (and everything inside is the path, spaces included), while a bare target
 // ends at the first space — what follows it is a "title".
-const target = (u) => (u.startsWith('<') && u.endsWith('>')
+const target = (u: string) => (u.startsWith('<') && u.endsWith('>')
   ? u.slice(1, -1) : u.trim().split(/\s+/)[0]);
 
 // --------------------------------------------------------------- inline
 
-function inline(raw) {
-  const stash = [];
-  const keep = (html) => '\uE000' + (stash.push(html) - 1) + '\uE001';
+function inline(raw: unknown) {
+  const stash: string[] = [];
+  const keep = (html: string) => '\uE000' + (stash.push(html) - 1) + '\uE001';
   let s = String(raw);
 
   s = s.replace(/(`+)([^`]*)\1/g, (m) => keep(span('tk-code', m)));
@@ -64,7 +64,7 @@ function inline(raw) {
     [/\*\*\*([^*\n]+)\*\*\*/g, 'tk-bi'], [/\*\*([^*\n]+)\*\*/g, 'tk-b'],
     [/__([^_\n]+)__/g, 'tk-b'], [/~~([^~\n]+)~~/g, 'tk-s'],
     [/==([^=\n]+)==/g, 'tk-mark'], [/\*([^*\n]+)\*/g, 'tk-i'],
-  ]) {
+  ] as [RegExp, string][]) {
     s = s.replace(re, (m, inner) => {
       const mark = (m.length - inner.length) / 2;
       return keep(span('tk-p', m.slice(0, mark)) + span(cls, inner) + span('tk-p', m.slice(0, mark)));
@@ -81,7 +81,10 @@ function inline(raw) {
 const FENCE = /^\s*(`{3,}|~{3,})/;
 const CB = /^ {0,3}(:{3,})\s*([A-Za-z][\w-]*)?(.*)$/;
 
-function lineHtml(raw, state) {
+/** Carried line to line: inside front-matter / inside a fence. */
+interface LineState { fence: boolean; fm: boolean }
+
+function lineHtml(raw: string, state: LineState) {
   if (state.fm) {                                    // YAML front-matter
     if (raw === '---') { state.fm = false; return span('tk-fence', raw); }
     const kv = raw.match(/^([\w.-]+)(\s*:)([\s\S]*)$/);
@@ -135,8 +138,8 @@ function lineHtml(raw, state) {
 
 // A space keeps an empty line's box the height of a full one, so the
 // backdrop and the textarea stay in step all the way down.
-export const highlightSource = (text) => {
-  const state = { fence: false, fm: String(text).startsWith('---\n') };
+export const highlightSource = (text: string): string => {
+  const state: LineState = { fence: false, fm: String(text).startsWith('---\n') };
   return String(text).split('\n')
     .map((l, i) => {
       if (state.fm && i === 0) return '<div class="ln">' + span('tk-fence', l) + '</div>';

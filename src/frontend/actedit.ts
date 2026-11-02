@@ -17,15 +17,123 @@
 import { highlightCode } from './code.ts';
 import { nibActIcon, nibIsIconName } from './icons.ts';
 import { jsonc } from './json.ts';
+import type { NibIconSvg } from './icons.ts';
+import type { JsonArr, JsonMember, JsonTree } from './json.ts';
 
-const OSES = ['macos', 'windows', 'linux'];
-const OS_NAMES = { macos: 'macOS', windows: 'Windows', linux: 'Linux' };
+type OsName = 'macos' | 'windows' | 'linux';
+
+/** Which actions file: yours, or the open folder's. */
+export type ActionScope = 'global' | 'project';
+
+/** A per-platform block: { "run": … } under "macos" / "windows" / "linux". */
+interface OsBlock {
+  run?: string | string[];
+  shell?: boolean;
+}
+
+/** One `ask` question as the file spells it (a bare string is a text one). */
+interface AskSpec {
+  label: string;
+  name?: string;
+  type?: string;
+  default?: string;
+  choices?: string[];
+}
+
+/** One action as it sits in an actions file — hand-written JSON, so every
+ *  field is optional and only what was said is there. */
+export interface ActionSpec {
+  id?: string;
+  label?: string;
+  icon?: string;
+  description?: string;
+  toolbar?: boolean;
+  selection?: boolean;
+  ask?: string | AskSpec | (string | AskSpec)[];
+  type?: string;
+  /** argv, or a line for the shell */
+  run?: string | string[];
+  shell?: boolean;
+  script?: string;
+  prompt?: string;
+  system?: string;
+  tools?: string;
+  approve?: string;
+  needs?: string;
+  match?: string | string[];
+  stdin?: string;
+  output?: string;
+  cwd?: string;
+  timeout?: number;
+  save?: boolean;
+  confirm?: boolean;
+  os?: OsName | OsName[];
+  macos?: OsBlock;
+  windows?: OsBlock;
+  linux?: OsBlock;
+}
+
+/** An ask question while the form holds it: choices still one string. */
+interface AskRow {
+  label: string;
+  type: string;
+  name?: string;
+  default?: string;
+  choices?: string;
+}
+
+/** A line in the list: its place in the parsed file (null until saved), and
+ *  what the form is holding (null once it matches the file). */
+interface Row {
+  item: JsonMember | null;
+  draft: ActionSpec | null;
+}
+
+/** actionsFile's answer. */
+type ActionsFile = {
+  /** set instead of the rest when there is no such file to have */
+  error?: string;
+  path: string;
+  scope: ActionScope;
+  name: string;
+  starter: string;
+} & ({ exists: true; text: string } | { exists: false; text: null });
+
+/** One tab of the sheet: a file that exists right now. */
+export interface ActionFileTab {
+  scope: ActionScope;
+  name: string;
+}
+
+/** iconSearch's hits: a name and its drawing. */
+interface IconHit extends NibIconSvg {
+  name: string;
+}
+
+export interface ActionEditorOptions {
+  /** which actions files are available now */
+  open: () => Promise<ActionFileTab[]>;
+  /** "Run it now", once the file holds the action */
+  onRun?: (scope: ActionScope, id: string) => unknown;
+  toast: (text: string) => void;
+  /** the Icon field borrows the toolbar's emoji picker */
+  pickEmoji?: (btn: HTMLElement, cb: (ch: string) => void) => void;
+  closeEmoji?: () => void;
+}
+
+export interface ActionEditorHandle {
+  open(which: ActionScope): Promise<void>;
+  isOpen(): boolean;
+}
+
+const OSES: OsName[] = ['macos', 'windows', 'linux'];
+const OS_NAMES: Record<OsName, string> = { macos: 'macOS', windows: 'Windows', linux: 'Linux' };
 
 // A command line as argv, the way a shell would split it — quotes hold a
 // word together, so `pandoc "my file.md"` is two arguments and not three.
-function splitArgv(line) {
-  const out = [];
-  let cur = '', q = null, any = false;
+function splitArgv(line: string): string[] {
+  const out: string[] = [];
+  let cur = '', q: string | null = null, any = false;
   for (let i = 0; i < line.length; i++) {
     const c = line[i];
     if (q) {
@@ -42,16 +150,16 @@ function splitArgv(line) {
 }
 
 // …and back again, quoting only what would otherwise come apart.
-const joinArgv = (argv) => (argv || [])
+const joinArgv = (argv: string[] | null | undefined): string => (argv || [])
   .map((a) => (/[\s"']/.test(a) ? JSON.stringify(a) : a)).join(' ');
 
-const slug = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-')
+const slug = (s: unknown) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-')
   .replace(/^-|-$/g, '').slice(0, 40) || 'action';
 
-const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
-function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji }) {
-  const $ = (id) => document.getElementById(id);
+function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji }: ActionEditorOptions): ActionEditorHandle {
+  const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
   const shade = $('actEditShade');
 
   // ---------------------------------------------------------------- icons
@@ -63,7 +171,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
 
   // An icon string into a span: emoji as text, an Iconify name as a marked
   // slot that decorate() fills in once the drawing arrives.
-  function iconInto(span, icon) {
+  function iconInto(span: HTMLElement, icon: string | undefined) {
     span.textContent = '';
     delete span.dataset.iconname;
     if (!icon) return;
@@ -73,22 +181,22 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
 
   // One round trip for every marked slot under root — the backend answers
   // from its cache (or fetches), misses just stay empty.
-  async function decorate(root) {
-    const want = [...root.querySelectorAll('[data-iconname]')]
+  async function decorate(root: ParentNode) {
+    const want = [...root.querySelectorAll<HTMLElement>('[data-iconname]')]
       .map((el) => el.dataset.iconname);
     if (!want.length) return;
     const r = await tiny.api.call('iconGet', { names: [...new Set(want)] });
-    const map = (r && r.icons) || {};
-    for (const el of root.querySelectorAll('[data-iconname]')) {
-      const rec = map[el.dataset.iconname];
+    const map: Record<string, NibIconSvg> = (r && r.icons) || {};
+    for (const el of root.querySelectorAll<HTMLElement>('[data-iconname]')) {
+      const rec = map[el.dataset.iconname!];
       if (!rec) continue;
       delete el.dataset.iconname;
-      el.appendChild(nibActIcon({ iconSvg: rec }));
+      el.appendChild(nibActIcon({ iconSvg: rec })!);
     }
   }
 
   // The list row's name: icon slot, then the label.
-  function nameInto(span, v) {
+  function nameInto(span: HTMLElement, v: ActionSpec) {
     span.textContent = '';
     const ico = document.createElement('span');
     ico.className = 'aeicon';
@@ -102,50 +210,50 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     const s = $('aeIconPrev');
     s.textContent = '';
     delete s.dataset.iconname;
-    const v = $('aeIcon').value.trim();
+    const v = $<HTMLInputElement>('aeIcon').value.trim();
     if (!nibIsIconName(v)) { s.hidden = true; return; }
     s.hidden = false;
     s.dataset.iconname = v;
-    decorate(s.parentElement);
+    decorate(s.parentElement!);
   }
 
-  let scope = 'global';                 // which file is on screen
-  let file = null;                      // { path, text, name, … }
-  let tree = null;                      // json.ts tree for that text
-  let items = null;                     // the actions array's items, in the tree
-  let rows = [];                        // what the list shows: saved + not-yet-saved
+  let scope: ActionScope = 'global';                 // which file is on screen
+  let file: ActionsFile | null = null;                      // { path, text, name, … }
+  let tree: JsonTree | null = null;                      // json.ts tree for that text
+  let items: JsonMember[] | null = null;                     // the actions array's items, in the tree
+  let rows: Row[] = [];                        // what the list shows: saved + not-yet-saved
   let picked = -1;
-  let scopes = [];
+  let scopes: ActionFileTab[] = [];
 
   // A row is one line in the list. `item` is its place in the parsed file —
   // absent on one you have just added, which exists only here until it is
   // saved. `draft` is what the form is holding: null once it matches what is
   // in the file.
   const cur = () => (picked >= 0 ? rows[picked] : null);
-  const saved = (r) => (r && r.item ? jsonc.toValue(r.item.value) : null);
-  const isDirty = (r) => !!r && (!r.item || (!!r.draft && !same(r.draft, saved(r))));
+  const saved = (r: Row | null): ActionSpec | null => (r && r.item ? jsonc.toValue(r.item.value) : null);
+  const isDirty = (r: Row | null) => !!r && (!r.item || (!!r.draft && !same(r.draft, saved(r))));
   const anyDirty = () => rows.some(isDirty);
-  const shown = (r) => (r ? (r.draft || saved(r) || {}) : {});
+  const shown = (r: Row | null): ActionSpec => (r ? (r.draft || saved(r) || {}) : {});
 
   // ------------------------------------------------------- the file model
 
   // The actions array inside whatever shape the file is in — a bare array at
   // the root is allowed too, because the loader allows it.
-  function actionsItems(t) {
+  function actionsItems(t: JsonTree) {
     const root = t.root;
     if (root.kind === 'arr') return root.items;
     if (root.kind === 'obj') {
       const m = root.members.find((x) => x.key === '"actions"');
       if (m && m.value.kind === 'arr') return m.value.items;
       // no `actions` key yet: add one, so the first New Action has a home
-      const value = { kind: 'arr', items: [], tail: [] };
+      const value: JsonArr = { kind: 'arr', items: [], tail: [] };
       root.members.push({ key: '"actions"', lead: [], trail: [], value });
       return value.items;
     }
     return null;
   }
 
-  async function load(which) {
+  async function load(which: ActionScope) {
     scope = which;
     file = await tiny.api.call('actionsFile', { scope });
     if (!file || file.error) { note(file && file.error); return false; }
@@ -161,7 +269,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     }
     tree = parsed.tree;
     items = actionsItems(tree);
-    rows = items.map((item) => ({ item, draft: null }));
+    rows = items!.map((item) => ({ item, draft: null }));
     picked = rows.length ? 0 : -1;
     paint();
     note(file.exists ? '' : 'New file — nothing is written until you save');
@@ -173,26 +281,26 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
   async function writeFile() {
     if (!tree) return false;
     const text = jsonc.printTree(tree);
-    const r = await tiny.api.call('actionsWrite', { scope, text });
+    const r: { error?: string; problems?: string[] } | null = await tiny.api.call('actionsWrite', { scope, text });
     if (!r || r.error) { note((r && r.error) || 'couldn’t write that'); return false; }
-    file.exists = true;
+    file!.exists = true;
     note(r.problems && r.problems.length ? '⚠ ' + r.problems[0] : 'Saved');
     return true;
   }
 
   // One row, from its draft into the tree.
-  function apply(r) {
+  function apply(r: Row | null) {
     if (!r || !isDirty(r)) return;
     const value = jsonc.fromValue(r.draft || saved(r));
     if (r.item) r.item.value = value;
     else {
       r.item = { lead: [], trail: [], value };
-      items.push(r.item);
+      items!.push(r.item);
     }
     r.draft = null;
   }
 
-  async function saveOne(r) {
+  async function saveOne(r: Row | null) {
     const bad = await vetJs(r);
     if (bad) {
       drawScriptErr();
@@ -215,7 +323,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
       picked = rows.indexOf(bad);
       paint();
       note(problem(bad) + ' — fix it or discard it');
-      toast(problem(bad));
+      toast(problem(bad)!);
       return false;
     }
     for (const r of rows.filter(isDirty)) {
@@ -235,7 +343,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     return ok;
   }
 
-  const note = (s) => { $('aeNote').textContent = s || ''; };
+  const note = (s?: string | null) => { $('aeNote').textContent = s || ''; };
 
   // ---------------------------------------------------------------- paint
 
@@ -291,16 +399,16 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
   // just made. (That is how a perfectly good "Reveal in terminal" became
   // `"run": []` and stopped existing.) So it is caught before the save, on
   // the button that would have done it.
-  function problem(r) {
+  function problem(r: Row | null) {
     const v = shown(r);
     if (!r) return null;
     if (v.type === 'js') return String(v.script || '').trim() ? null : 'The script is empty';
     if (v.type === 'ai') return String(v.prompt || '').trim() ? null : 'The prompt is empty';
-    const filled = (run) => (Array.isArray(run)
+    const filled = (run: unknown) => (Array.isArray(run)
       ? !!run.filter((x) => String(x).trim()).length : !!String(run || '').trim());
     if (v.run === undefined && OSES.some((o) => v[o])) {
       // per-platform: every platform it is on needs its own command
-      const on = v.os ? [].concat(v.os) : OSES;
+      const on = v.os ? ([] as OsName[]).concat(v.os) : OSES;
       const missing = on.find((o) => !v[o] || !filled(v[o].run));
       return missing ? 'The ' + OS_NAMES[missing] + ' command is empty' : null;
     }
@@ -311,53 +419,54 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     const r = cur();
     const d = isDirty(r);
     const bad = d ? problem(r) : null;
-    $('aeSave').disabled = !d || !!bad;
+    $<HTMLButtonElement>('aeSave').disabled = !d || !!bad;
     $('aeSave').title = bad || '';
-    $('aeRevert').disabled = !d;
+    $<HTMLButtonElement>('aeRevert').disabled = !d;
     $('aeRevert').textContent = r && !r.item ? 'Discard' : 'Revert';
     return bad;
   }
 
-  function fill(a) {
+  function fill(a: ActionSpec) {
     a = a || {};
-    $('aeLabel').value = a.label || '';
-    $('aeIcon').value = a.icon || '';
-    $('aeDesc').value = a.description || '';
-    $('aeToolbar').checked = !!a.toolbar;
-    $('aeSelection').checked = !!a.selection;
+    $<HTMLInputElement>('aeLabel').value = a.label || '';
+    $<HTMLInputElement>('aeIcon').value = a.icon || '';
+    $<HTMLInputElement>('aeDesc').value = a.description || '';
+    $<HTMLInputElement>('aeToolbar').checked = !!a.toolbar;
+    $<HTMLInputElement>('aeSelection').checked = !!a.selection;
     askRows = normalizeAskForForm(a.ask);
-    $('aeType').value = a.type === 'js' ? 'js' : a.type === 'ai' ? 'ai' : 'cli';
+    $<HTMLSelectElement>('aeType').value = a.type === 'js' ? 'js' : a.type === 'ai' ? 'ai' : 'cli';
     drawAsk();          // after the type lands — its hint speaks differently for js
     const shell = typeof a.run === 'string' || a.shell === true;
-    $('aeShell').checked = shell;
-    $('aeRun').value = typeof a.run === 'string' ? a.run : joinArgv(a.run);
+    $<HTMLInputElement>('aeShell').checked = shell;
+    $<HTMLInputElement>('aeRun').value = typeof a.run === 'string' ? a.run : joinArgv(a.run);
     // Each platform's command: its block, else the shared one — so an old
     // base-plus-override action reads as tabs prefilled with the base.
     const blocks = OSES.filter((o) => a[o] && typeof a[o] === 'object' && a[o].run !== undefined);
     perOS = !!blocks.length;
-    $('aePerOS').checked = perOS;
+    $<HTMLInputElement>('aePerOS').checked = perOS;
     osRuns = blankRuns();
     for (const o of OSES) {
-      const b = blocks.includes(o) ? a[o] : null;
+      const b = blocks.includes(o) ? a[o]! : null;
       osRuns[o] = b
         ? { line: runLine(b.run), shell: typeof b.run === 'string' || b.shell === true }
-        : { line: $('aeRun').value, shell };
+        : { line: $<HTMLInputElement>('aeRun').value, shell };
     }
     if (perOS && !blocks.includes(osTab)) osTab = blocks[0];
-    $('aeScript').value = a.script || '';
-    $('aePrompt').value = a.prompt || '';
-    $('aeSystem').value = a.system || '';
-    $('aeTools').value = a.tools || '';
-    $('aeApprove').value = a.approve || '';
-    $('aeNeeds').value = a.needs || 'none';
-    $('aeMatch').value = [].concat(a.match || []).join(', ');
-    $('aeStdin').value = a.stdin || 'none';
-    $('aeOutput').value = a.output || 'panel';
-    $('aeCwd').value = a.cwd || '';
-    $('aeTimeout').value = Math.round((a.timeout || 120000) / 1000);
-    $('aeSaveFirst').checked = a.save !== false;
-    $('aeConfirm').checked = !!a.confirm;
-    const on = a.os ? [].concat(a.os) : OSES;
+    $<HTMLTextAreaElement>('aeScript').value = a.script || '';
+    $<HTMLTextAreaElement>('aePrompt').value = a.prompt || '';
+    $<HTMLTextAreaElement>('aeSystem').value = a.system || '';
+    $<HTMLSelectElement>('aeTools').value = a.tools || '';
+    $<HTMLSelectElement>('aeApprove').value = a.approve || '';
+    $<HTMLSelectElement>('aeNeeds').value = a.needs || 'none';
+    $<HTMLInputElement>('aeMatch').value = ([] as string[]).concat(a.match || []).join(', ');
+    $<HTMLSelectElement>('aeStdin').value = a.stdin || 'none';
+    $<HTMLSelectElement>('aeOutput').value = a.output || 'panel';
+    $<HTMLInputElement>('aeCwd').value = a.cwd || '';
+    // a number, which the DOM writes as a string
+    $<HTMLInputElement>('aeTimeout').value = Math.round((a.timeout || 120000) / 1000) as unknown as string;
+    $<HTMLInputElement>('aeSaveFirst').checked = a.save !== false;
+    $<HTMLInputElement>('aeConfirm').checked = !!a.confirm;
+    const on: readonly string[] = a.os ? ([] as string[]).concat(a.os) : OSES;
     for (const box of $('aeOS').querySelectorAll('input')) box.checked = on.includes(box.value);
     $('aeId').textContent = a.id ? 'id: ' + a.id : '';
     applyType();
@@ -366,7 +475,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     paintScript();
     closeCtx();
     drawScriptErr();
-    if ($('aeType').value === 'js') checkScriptSoon();
+    if ($<HTMLSelectElement>('aeType').value === 'js') checkScriptSoon();
   }
 
   // ------------------------------------------------------------- ask rows
@@ -375,22 +484,22 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
   // redrawn, rather than read out of the DOM on every keystroke — the rows
   // move (up, down, gone) and reading a moving list is how off-by-ones live.
 
-  let askRows = [];
-  const ASK_KINDS = [['text', 'A line of text'], ['multiline', 'Several lines'],
+  let askRows: AskRow[] = [];
+  const ASK_KINDS: [string, string][] = [['text', 'A line of text'], ['multiline', 'Several lines'],
     ['number', 'A number'], ['choice', 'One of a list'],
     ['check', 'A tick box'], ['file', 'A file'], ['folder', 'A folder']];
 
-  function normalizeAskForForm(ask) {
-    return [].concat(ask || []).map((x) => (typeof x === 'string'
+  function normalizeAskForForm(ask: ActionSpec['ask']): AskRow[] {
+    return ([] as (string | AskSpec)[]).concat(ask || []).map((x) => (typeof x === 'string'
       ? { label: x, type: 'text' }
       : { label: x.label || x.name || '', type: x.type || 'text',
           name: x.name || '', default: x.default || '',
-          choices: [].concat(x.choices || []).join(', ') }));
+          choices: ([] as string[]).concat(x.choices || []).join(', ') }));
   }
 
-  function collectAsk() {
+  function collectAsk(): (string | AskSpec)[] {
     return askRows.filter((r) => String(r.label || '').trim()).map((r) => {
-      const o = { label: r.label.trim() };
+      const o: AskSpec = { label: r.label.trim() };
       if (r.name && r.name.trim()) o.name = r.name.trim();
       if (r.type && r.type !== 'text') o.type = r.type;
       if (r.default) o.default = r.default;
@@ -456,7 +565,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
       : 'Nothing — it runs straight away.';
   }
 
-  $('aeAskAdd').onclick = (e) => {
+  $('aeAskAdd').onclick = (e: MouseEvent) => {
     e.preventDefault();
     askRows.push({ label: '', type: 'text' });
     drawAsk();
@@ -464,7 +573,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
   };
 
   function applyType() {
-    const t = $('aeType').value;
+    const t = $<HTMLSelectElement>('aeType').value;
     $('aeCli').hidden = t !== 'cli';
     // a script asks for itself (ctx.prompt / choose / pickFile) — the form
     // would be a second way to say the same thing
@@ -478,12 +587,12 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     // meaning something else.
     const nothing = $('aeStdin').querySelector('option[value="none"]');
     if (nothing) nothing.textContent = t === 'ai' ? 'Nothing (the prompt alone)' : 'Nothing';
-    $('aeToolsHint').textContent = {
+    $('aeToolsHint').textContent = ({
       '': '', off: 'Safest, and right for anything that rewrites text.',
       read: 'It can read and search the folder you have open.',
       full: 'It can write files, run commands and add actions — each one asks first '
         + 'unless you turned asking off. Only your own actions may use this.',
-    }[$('aeTools').value] || '';
+    } as Record<string, string>)[$<HTMLSelectElement>('aeTools').value] || '';
   }
 
   // What the command will actually be handed as, shown while you type: the
@@ -491,11 +600,11 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
   function showArgv() {
     const box = $('aeArgv');
     box.textContent = '';
-    if ($('aeShell').checked) {
+    if ($<HTMLInputElement>('aeShell').checked) {
       box.textContent = 'Handed to a shell exactly as written';
       return;
     }
-    const argv = splitArgv($('aeRun').value);
+    const argv = splitArgv($<HTMLInputElement>('aeRun').value);
     if (!argv.length) { box.textContent = 'The program to run, then its arguments'; return; }
     argv.forEach((a, i) => {
       const chip = document.createElement('span');
@@ -517,15 +626,15 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
   // isn't offered there.
 
   let perOS = false;
-  let osTab = 'macos';
+  let osTab: OsName = 'macos';
   let osRuns = blankRuns();
-  function blankRuns() {
+  function blankRuns(): Record<OsName, { line: string; shell: boolean }> {
     return { macos: { line: '', shell: false },
       windows: { line: '', shell: false }, linux: { line: '', shell: false } };
   }
-  const runLine = (run) => (typeof run === 'string' ? run : joinArgv(run));
+  const runLine = (run: string | string[] | undefined) => (typeof run === 'string' ? run : joinArgv(run));
   const stash = () => {
-    if (perOS) osRuns[osTab] = { line: $('aeRun').value, shell: $('aeShell').checked };
+    if (perOS) osRuns[osTab] = { line: $<HTMLInputElement>('aeRun').value, shell: $<HTMLInputElement>('aeShell').checked };
   };
   const osChecked = () => [...$('aeOS').querySelectorAll('input')]
     .filter((b) => b.checked).map((b) => b.value);
@@ -537,7 +646,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     off.hidden = true;
     // the ticks on the tabs ARE the On row, so showing both is saying it
     // twice — the row stays for the single command and for js/ai actions
-    $('aeOnRow').hidden = perOS && $('aeType').value === 'cli';
+    $('aeOnRow').hidden = perOS && $<HTMLSelectElement>('aeType').value === 'cli';
     if (!perOS) return;
     box.textContent = '';
     const on = new Set(osChecked());
@@ -556,7 +665,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
         drawOSTabs();
       };
       tab.append(tick, document.createTextNode(OS_NAMES[o]));
-      tab.onclick = (e) => {
+      tab.onclick = (e: MouseEvent) => {
         if (e.target === tick) return;
         stash();
         osTab = o;
@@ -574,8 +683,8 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
   // The Command field is the active tab's when there are tabs.
   function showRunFor() {
     if (perOS) {
-      $('aeRun').value = osRuns[osTab].line;
-      $('aeShell').checked = osRuns[osTab].shell;
+      $<HTMLInputElement>('aeRun').value = osRuns[osTab].line;
+      $<HTMLInputElement>('aeShell').checked = osRuns[osTab].shell;
     }
     drawOSTabs();
     showArgv();
@@ -585,8 +694,8 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
   // command — start from what you had, then make Windows its own. Turning
   // it OFF keeps whichever platform you were looking at as the one command.
   $('aePerOS').addEventListener('change', () => {
-    if ($('aePerOS').checked) {
-      const line = $('aeRun').value, sh = $('aeShell').checked;
+    if ($<HTMLInputElement>('aePerOS').checked) {
+      const line = $<HTMLInputElement>('aeRun').value, sh = $<HTMLInputElement>('aeShell').checked;
       perOS = true;
       for (const o of OSES) if (!osRuns[o].line.trim()) osRuns[o] = { line, shell: sh };
     } else {
@@ -607,7 +716,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
   // thing worth knowing here — the ctx surface — and offers it when you
   // type `ctx.`; everything else you already know how to spell.
 
-  const CTX_WORDS = [
+  const CTX_WORDS: [string, string][] = [
     ['sel', 'the selection'], ['text', 'the whole document'],
     ['file', 'the open file, full path'], ['dir', 'its directory'],
     ['root', 'the open folder'], ['rel', 'file, relative to the folder'],
@@ -633,7 +742,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     ['stemname(path)', ''], ['extname(path)', ''],
   ];
 
-  const scriptEl = () => $('aeScript');
+  const scriptEl = () => $<HTMLTextAreaElement>('aeScript');
   function paintScript() {
     // the trailing newline keeps the last line box alive, so the layers
     // stay the same height while you type at the bottom
@@ -642,7 +751,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
   }
 
   const ctxPop = $('aeCtxPop');
-  let ctxItems = [];
+  let ctxItems: [string, string][] = [];
   let ctxSel = 0;
   let ctxAt = 0;                        // where the partial word starts
   const closeCtx = () => { ctxPop.hidden = true; ctxItems = []; };
@@ -676,7 +785,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
         row.appendChild(h);
       }
       // mousedown, not click — the textarea must keep the focus
-      row.onmousedown = (e) => { e.preventDefault(); ctxSel = i; acceptCtx(); };
+      row.onmousedown = (e: MouseEvent) => { e.preventDefault(); ctxSel = i; acceptCtx(); };
       ctxPop.appendChild(row);
     });
     const on = ctxPop.children[ctxSel];
@@ -685,7 +794,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
 
   // Where the caret is, by the mirror trick: a hidden clone of the field's
   // text up to the word being completed, with a marker to measure.
-  function placeCtx(ta) {
+  function placeCtx(ta: HTMLTextAreaElement) {
     const r = ta.getBoundingClientRect();
     const cs = getComputedStyle(ta);
     const mir = document.createElement('div');
@@ -720,7 +829,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     touch();
   }
 
-  scriptEl().addEventListener('keydown', (e) => {
+  scriptEl().addEventListener('keydown', (e: KeyboardEvent) => {
     if (ctxPop.hidden) return;
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
       e.preventDefault();
@@ -749,10 +858,10 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
   // vets is what pressing the button gets. Checked as you type for the
   // inline line, and checked FRESH on the way into a save, because the
   // whole point of the form is that a button you just made works.
-  let jsCheck = { src: null, error: null, line: null };
-  let jsCheckTimer = null;
+  let jsCheck: { src: string | null; error: string | null; line: number | null } = { src: null, error: null, line: null };
+  let jsCheckTimer: ReturnType<typeof setTimeout> | null = null;
 
-  async function checkScript(src) {
+  async function checkScript(src: string) {
     if (jsCheck.src !== src) {
       const r = await tiny.api.call('actionCheckJs', { script: src });
       jsCheck = { src, error: (r && r.error) || null, line: (r && r.line) || null };
@@ -760,7 +869,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     return jsCheck;
   }
   function checkScriptSoon() {
-    clearTimeout(jsCheckTimer);
+    clearTimeout(jsCheckTimer!);
     jsCheckTimer = setTimeout(async () => {
       const src = scriptEl().value;
       await checkScript(src);
@@ -782,16 +891,16 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
   // Saving a broken script is allowed — half-written work belongs in the
   // file too — but never silently: the dialog says what pressing the
   // button would do, and Keep Editing is the default answer.
-  async function askBroken(bad) {
+  async function askBroken(bad: string) {
     return tiny.dialog.confirm('Save it anyway?', {
       detail: bad + '\n\nThe button will fail when pressed until it parses.',
       ok: 'Save Anyway', cancel: 'Keep Editing',
     });
   }
-  async function vetJs(r) {
+  async function vetJs(r: Row | null) {
     const v = shown(r);
     if (v.type !== 'js' || !String(v.script || '').trim()) return null;
-    const c = await checkScript(v.script);
+    const c = await checkScript(v.script!);
     return c.error
       ? '“' + (v.label || v.id) + '” doesn’t parse — '
         + (c.line ? 'line ' + c.line + ': ' : '') + c.error
@@ -803,9 +912,9 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
   // The form as an action object — only what was actually said. Defaults are
   // left OUT of the file: a folder's actions.json should read like a
   // sentence, not like a settings dump.
-  function collect(prev) {
-    const a = {};
-    const label = $('aeLabel').value.trim() || 'Action';
+  function collect(prev: ActionSpec): ActionSpec {
+    const a: ActionSpec = {};
+    const label = $<HTMLInputElement>('aeLabel').value.trim() || 'Action';
     // The id is what a trust grant is pinned to, so once it means something
     // it is kept: renaming a button must not ask its owner to approve it
     // again. The placeholder a new row is born with means nothing, so that
@@ -813,22 +922,22 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     const born = prev && prev.id && /^action-\d+$/.test(prev.id);
     a.id = (!born && prev && prev.id) ? prev.id : uniqueId(slug(label));
     a.label = label;
-    if ($('aeIcon').value.trim()) a.icon = $('aeIcon').value.trim();
-    if ($('aeDesc').value.trim()) a.description = $('aeDesc').value.trim();
-    if ($('aeToolbar').checked) a.toolbar = true;
-    if ($('aeSelection').checked) a.selection = true;
+    if ($<HTMLInputElement>('aeIcon').value.trim()) a.icon = $<HTMLInputElement>('aeIcon').value.trim();
+    if ($<HTMLInputElement>('aeDesc').value.trim()) a.description = $<HTMLInputElement>('aeDesc').value.trim();
+    if ($<HTMLInputElement>('aeToolbar').checked) a.toolbar = true;
+    if ($<HTMLInputElement>('aeSelection').checked) a.selection = true;
     const ask = collectAsk();
-    if (ask.length && $('aeType').value !== 'js') a.ask = ask;
-    if ($('aeType').value === 'js') {
+    if (ask.length && $<HTMLSelectElement>('aeType').value !== 'js') a.ask = ask;
+    if ($<HTMLSelectElement>('aeType').value === 'js') {
       a.type = 'js';
-      a.script = $('aeScript').value;
-    } else if ($('aeType').value === 'ai') {
+      a.script = $<HTMLTextAreaElement>('aeScript').value;
+    } else if ($<HTMLSelectElement>('aeType').value === 'ai') {
       a.type = 'ai';
-      a.prompt = $('aePrompt').value;
-      if ($('aeSystem').value.trim()) a.system = $('aeSystem').value.trim();
-      if ($('aeTools').value) a.tools = $('aeTools').value;
-      if ($('aeApprove').value) a.approve = $('aeApprove').value;
-    } else if ($('aePerOS').checked) {
+      a.prompt = $<HTMLTextAreaElement>('aePrompt').value;
+      if ($<HTMLTextAreaElement>('aeSystem').value.trim()) a.system = $<HTMLTextAreaElement>('aeSystem').value.trim();
+      if ($<HTMLSelectElement>('aeTools').value) a.tools = $<HTMLSelectElement>('aeTools').value;
+      if ($<HTMLSelectElement>('aeApprove').value) a.approve = $<HTMLSelectElement>('aeApprove').value;
+    } else if ($<HTMLInputElement>('aePerOS').checked) {
       // the per-OS block form: no top-level run, one block per platform
       // that has a command — ticked off or not, so nothing typed is lost
       stash();
@@ -838,29 +947,29 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
         a[o] = { run: shell ? line : splitArgv(line) };
       }
     } else {
-      const line = $('aeRun').value;
-      if ($('aeShell').checked) a.run = line;
+      const line = $<HTMLInputElement>('aeRun').value;
+      if ($<HTMLInputElement>('aeShell').checked) a.run = line;
       else a.run = splitArgv(line);
     }
-    const needs = $('aeNeeds').value;
+    const needs = $<HTMLSelectElement>('aeNeeds').value;
     if (needs !== 'none') a.needs = needs;
-    const match = $('aeMatch').value.split(',').map((s) => s.trim()).filter(Boolean);
+    const match = $<HTMLInputElement>('aeMatch').value.split(',').map((s) => s.trim()).filter(Boolean);
     if (match.length) a.match = match.length === 1 ? match[0] : match;
-    const os = [...$('aeOS').querySelectorAll('input')].filter((b) => b.checked).map((b) => b.value);
+    const os = [...$('aeOS').querySelectorAll('input')].filter((b) => b.checked).map((b) => b.value as OsName);
     if (os.length && os.length < OSES.length) a.os = os.length === 1 ? os[0] : os;
-    if ($('aeStdin').value !== 'none') a.stdin = $('aeStdin').value;
-    if ($('aeOutput').value !== 'panel') a.output = $('aeOutput').value;
-    if ($('aeCwd').value.trim()) a.cwd = $('aeCwd').value.trim();
-    const secs = Math.max(1, Math.min(3600, +$('aeTimeout').value || 120));
+    if ($<HTMLSelectElement>('aeStdin').value !== 'none') a.stdin = $<HTMLSelectElement>('aeStdin').value;
+    if ($<HTMLSelectElement>('aeOutput').value !== 'panel') a.output = $<HTMLSelectElement>('aeOutput').value;
+    if ($<HTMLInputElement>('aeCwd').value.trim()) a.cwd = $<HTMLInputElement>('aeCwd').value.trim();
+    const secs = Math.max(1, Math.min(3600, +$<HTMLInputElement>('aeTimeout').value || 120));
     if (secs !== 120) a.timeout = secs * 1000;
-    if (!$('aeSaveFirst').checked) a.save = false;
-    if ($('aeConfirm').checked) a.confirm = true;
+    if (!$<HTMLInputElement>('aeSaveFirst').checked) a.save = false;
+    if ($<HTMLInputElement>('aeConfirm').checked) a.confirm = true;
     return a;
   }
 
   // Two actions with one id would make a trust grant ambiguous (and the
   // loader drops the loser), so a clash gets a number.
-  function uniqueId(want) {
+  function uniqueId(want: string) {
     const taken = new Set(rows.map((r, i) => (i === picked ? null : (shown(r).id || null)))
       .filter(Boolean));
     if (!taken.has(want)) return want;
@@ -876,10 +985,10 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     $('aeId').textContent = 'id: ' + next.id;
     const row = $('aeRows').children[picked];
     if (row) {
-      nameInto(row.querySelector('.aename'), next);
+      nameInto(row.querySelector<HTMLElement>('.aename')!, next);
       decorate(row);
       row.classList.toggle('dirty', isDirty(r));
-      const k = row.querySelector('.aekind');
+      const k = row.querySelector<HTMLElement>('.aekind')!;
       k.textContent = isDirty(r) ? '●' : next.type === 'js' ? 'js' : next.type === 'ai' ? 'ai' : '';
       k.title = isDirty(r) ? 'Unsaved changes' : '';
     }
@@ -906,19 +1015,19 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
   // the backend — the click writes the icon's NAME into the field, which is
   // all the file ever carries.
 
-  $('aeIconEmoji').onclick = (e) => {
+  $('aeIconEmoji').onclick = (e: MouseEvent) => {
     e.preventDefault();
     if (!pickEmoji) return;
     icoClose();
     pickEmoji($('aeIconEmoji'), (ch) => {
-      $('aeIcon').value = ch;
+      $<HTMLInputElement>('aeIcon').value = ch;
       prevIcon();
       touch();
     });
   };
 
   const icoPop = $('icoPop');
-  let icoTimer = null;
+  let icoTimer: ReturnType<typeof setTimeout> | null = null;
   let icoTok = 0;
   const icoClose = () => { icoPop.hidden = true; };
   function icoOpen() {
@@ -931,23 +1040,23 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     $('icoNote').textContent = 'Type a word — rocket, deploy, tidy… '
       + 'Icons come from iconify.design; the one you pick is kept on this Mac.';
     // the action's name is usually the best first query
-    const seed = nibIsIconName($('aeIcon').value.trim()) ? ''
-      : ($('aeLabel').value.trim().split(/\s+/)[0] || '');
-    $('icoSearch').value = seed;
+    const seed = nibIsIconName($<HTMLInputElement>('aeIcon').value.trim()) ? ''
+      : ($<HTMLInputElement>('aeLabel').value.trim().split(/\s+/)[0] || '');
+    $<HTMLInputElement>('icoSearch').value = seed;
     if (seed) icoSearch(seed);
     $('icoSearch').focus();
-    $('icoSearch').select();
+    $<HTMLInputElement>('icoSearch').select();
   }
-  $('aeIconFind').onclick = (e) => {
+  $('aeIconFind').onclick = (e: MouseEvent) => {
     e.preventDefault();
     if (icoPop.hidden) icoOpen();
     else icoClose();
   };
 
-  async function icoSearch(q) {
+  async function icoSearch(q: string) {
     const tok = ++icoTok;
     $('icoNote').textContent = 'Searching…';
-    const r = await tiny.api.call('iconSearch', { query: q });
+    const r: { error?: string; icons?: IconHit[] } | null = await tiny.api.call('iconSearch', { query: q });
     if (tok !== icoTok || icoPop.hidden) return;
     const grid = $('icoGrid');
     grid.textContent = '';
@@ -958,9 +1067,9 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
       const b = document.createElement('button');
       b.type = 'button';
       b.title = ic.name;
-      b.appendChild(nibActIcon({ iconSvg: ic }));
+      b.appendChild(nibActIcon({ iconSvg: ic })!);
       b.onclick = () => {
-        $('aeIcon').value = ic.name;
+        $<HTMLInputElement>('aeIcon').value = ic.name;
         prevIcon();
         touch();
         icoClose();
@@ -969,12 +1078,12 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     }
   }
   $('icoSearch').addEventListener('input', () => {
-    clearTimeout(icoTimer);
-    const q = $('icoSearch').value.trim();
+    clearTimeout(icoTimer!);
+    const q = $<HTMLInputElement>('icoSearch').value.trim();
     if (!q) { $('icoGrid').textContent = ''; return; }
     icoTimer = setTimeout(() => icoSearch(q), 300);
   });
-  $('icoSearch').addEventListener('keydown', (e) => {
+  $('icoSearch').addEventListener('keydown', (e: KeyboardEvent) => {
     if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); icoClose(); }
     if (e.key === 'Enter') {
       e.preventDefault();
@@ -982,9 +1091,9 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
       if (first) first.click();
     }
   });
-  document.addEventListener('mousedown', (e) => {
-    if (!icoPop.hidden && !icoPop.contains(e.target)
-      && !$('aeIconFind').contains(e.target)) icoClose();
+  document.addEventListener('mousedown', (e: MouseEvent) => {
+    if (!icoPop.hidden && !icoPop.contains(e.target as Node)
+      && !$('aeIconFind').contains(e.target as Node)) icoClose();
   });
   for (const id of ['aeNeeds', 'aeOutput', 'aeStdin']) $(id).addEventListener('change', touch);
   $('aeType').addEventListener('change', () => { applyType(); drawAsk(); touch(); });
@@ -1019,20 +1128,20 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     paint();
     note('New action — Save to add it to the file');
     $('aeLabel').focus();
-    $('aeLabel').select();
+    $<HTMLInputElement>('aeLabel').select();
   };
 
   $('aeDelete').onclick = async () => {
     const r = cur();
     if (!r) return;
     const v = shown(r);
-    if (!r.item) { $('aeRevert').onclick(); return; }   // never made it to the file
+    if (!r.item) { ($('aeRevert').onclick as () => void)(); return; }   // never made it to the file
     const sure = await tiny.dialog.confirm('Delete “' + (v.label || v.id) + '”?', {
       detail: 'It goes out of ' + (file ? file.path : 'the actions file') + '.',
       ok: 'Delete', cancel: 'Keep',
     });
     if (!sure) return;
-    items.splice(items.indexOf(r.item), 1);
+    items!.splice(items!.indexOf(r.item), 1);
     rows.splice(picked, 1);
     picked = Math.min(picked, rows.length - 1);
     await writeFile();
@@ -1054,7 +1163,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     }
     const v = shown(r);
     close();
-    if (onRun) onRun(scope, v.id);
+    if (onRun) onRun(scope, v.id!);
   };
 
   $('aeHelp').onclick = () => tiny.api.call('openHelp', { at: 'actions' });
@@ -1067,7 +1176,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
 
   // Anything that would walk away from unsaved work asks once. Save is the
   // default button, so the safe answer is the easy one.
-  async function settle(question) {
+  async function settle(question: string) {
     if (!anyDirty()) return true;
     const n = rows.filter(isDirty).length;
     const ok = await tiny.dialog.confirm(question, {
@@ -1085,7 +1194,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     return true;
   }
 
-  async function switchScope(which) {
+  async function switchScope(which: ActionScope) {
     if (which === scope) return;
     if (!(await settle('Save your changes to this file first?'))) return;
     load(which);
@@ -1097,8 +1206,8 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     close();
   }
   $('aeClose').onclick = done;
-  shade.addEventListener('mousedown', (e) => { if (e.target === shade) done(); });
-  addEventListener('keydown', (e) => {
+  shade.addEventListener('mousedown', (e: MouseEvent) => { if (e.target === shade) done(); });
+  addEventListener('keydown', (e: KeyboardEvent) => {
     if (shade.hidden) return;
     if (e.key === 'Escape') {
       e.preventDefault();
@@ -1116,7 +1225,7 @@ function setupActionEditor({ open: openApi, onRun, toast, pickEmoji, closeEmoji 
     }
   }, true);
 
-  async function open(which) {
+  async function open(which: ActionScope) {
     scopes = await openApi();             // which files are available now
     if (!scopes.length) return toast('No actions file is available');
     const want = scopes.some((s) => s.scope === which) ? which : scopes[0].scope;

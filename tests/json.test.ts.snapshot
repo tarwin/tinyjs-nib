@@ -1,0 +1,13 @@
+exports[`check rejects broken JSON with a position 1`] = `
+{
+  "ok": false,
+  "message": "Unexpected “}”",
+  "line": 1,
+  "col": 16,
+  "full": "Unexpected “}” (line 1, column 16)"
+}
+`;
+
+exports[`format keeps the comments 1`] = `
+"// my actions\\n{\\n  \\"actions\\": [\\n    /* the first */\\n    { \\"id\\": \\"a\\", \\"label\\": \\"Say hi\\", \\"cmd\\": [\\"echo\\", \\"hi\\"] },\\n    { \\"id\\": \\"b\\", \\"label\\": \\"Nested\\", \\"args\\": { \\"x\\": 1, \\"y\\": [true, null, 2.5e3] } } // trailing\\n  ],\\n  \\"version\\": 2\\n}\\n"
+`;

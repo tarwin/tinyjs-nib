@@ -10,26 +10,78 @@
 // anything — is aiask.ts, and it lives in document windows rather than here,
 // because that is where the question is asked and where the answer lands.
 
-const TOOLS = [
+/** A <select>'s choices: [value, label]. */
+type Pair = [string, string];
+
+type AiTools = 'off' | 'read' | 'full';
+type AiApprove = 'always' | 'writes' | 'never';
+
+/** One provider row of aiStatus (backend ai.ts), with its providerState. */
+export interface AiProviderRow {
+  id: string;
+  label: string;
+  kind: string;
+  local: boolean;
+  note: string | null;
+  base: string;
+  model: string;
+  needsKey: boolean;
+  keyHint: string | null;
+  keyUrl: string | null;
+  hasKey: boolean;
+  off: boolean;
+  /** this provider's own limits; null/undefined means the general answer */
+  tools: AiTools | null;
+  approve: AiApprove | null;
+  ok: boolean;
+  why: string | null;
+  status?: string;
+}
+
+/** What the backend's aiStatus answers (and aiSet returns). */
+export interface AiStatus {
+  enabled: boolean;
+  provider: string;
+  tools: AiTools;
+  approve: AiApprove;
+  speech: boolean;
+  keyStore: 'store' | 'secrets';
+  providers: AiProviderRow[];
+  ready: boolean;
+}
+
+export interface AiPanelOptions {
+  toast: (text: string) => void;
+}
+
+/** The handle Settings drives the AI section with. */
+export interface AiPanel {
+  /** Settings hands over the section body; the panel owns what goes in it. */
+  renderInto(el: HTMLElement): Promise<void>;
+  refresh(): Promise<AiStatus | null>;
+  status(): AiStatus | null;
+}
+
+const TOOLS: Pair[] = [
   ['off', 'None — text only'],
   ['read', 'Read the open folder'],
   ['full', 'Read, write, run, make actions'],
 ];
-const APPROVE = [
+const APPROVE: Pair[] = [
   ['always', 'Before every tool'],
   ['writes', 'Before anything that changes something'],
   ['never', 'Never'],
 ];
 // The same two choices in the width a provider row can spare. The long
 // labels above are the general setting's, where there is room to explain.
-const TOOLS_SHORT = [['off', 'Nothing'], ['read', 'Read'], ['full', 'Read & write']];
-const APPROVE_SHORT = [['always', 'Always'], ['writes', 'On changes'], ['never', 'Never']];
+const TOOLS_SHORT: Pair[] = [['off', 'Nothing'], ['read', 'Read'], ['full', 'Read & write']];
+const APPROVE_SHORT: Pair[] = [['always', 'Always'], ['writes', 'On changes'], ['never', 'Never']];
 
-function setupAiPanel({ toast }) {
+function setupAiPanel({ toast }: AiPanelOptions): AiPanel {
   // ---------------------------------------------------------- the panel
 
-  let status = null;
-  let host = null;                 // the section element Settings gave us
+  let status: AiStatus | null = null;
+  let host: HTMLElement | null = null;                 // the section element Settings gave us
 
   async function refresh(redraw = true) {
     status = await tiny.api.call('aiStatus');
@@ -37,13 +89,13 @@ function setupAiPanel({ toast }) {
     return status;
   }
 
-  async function save(patch) {
+  async function save(patch: Record<string, unknown>) {
     status = await tiny.api.call('aiSet', patch);
     draw();
   }
 
   // one row's worth of provider settings, patched without disturbing the rest
-  const patchProvider = (id, bit) => save({ providers: { [id]: bit } });
+  const patchProvider = (id: string, bit: Record<string, unknown>) => save({ providers: { [id]: bit } });
 
   function draw() {
     if (!host || !status) return;
@@ -93,7 +145,7 @@ function setupAiPanel({ toast }) {
 
   // ------------------------------------------------------- little builders
 
-  function head(text, why) {
+  function head(text: string, why?: string) {
     const h = document.createElement('div');
     h.className = 'sethead';
     h.textContent = text;
@@ -103,7 +155,7 @@ function setupAiPanel({ toast }) {
     return wrap;
   }
 
-  function hint(text) {
+  function hint(text: string | undefined) {
     const el = document.createElement('div');
     el.className = 'ahint';
     el.textContent = text || '';
@@ -112,7 +164,7 @@ function setupAiPanel({ toast }) {
 
   // The same row shape Settings' own sections use, so the label column lines
   // up across every section rather than only within one.
-  function field(label, control) {
+  function field(label: string, control: Node) {
     const row = document.createElement('label');
     row.className = 'setrow';
     const lab = document.createElement('span');
@@ -125,7 +177,7 @@ function setupAiPanel({ toast }) {
     return row;
   }
 
-  function check(on, onChange) {
+  function check(on: unknown, onChange: (v: boolean) => void) {
     const el = document.createElement('input');
     el.type = 'checkbox';
     el.checked = !!on;
@@ -133,7 +185,8 @@ function setupAiPanel({ toast }) {
     return el;
   }
 
-  function select(pairs, value, onChange, extra) {
+  function select(pairs: Pair[], value: string | null | undefined,
+    onChange: (v: string | null) => void, extra?: Pair) {
     const el = document.createElement('select');
     for (const [v, label] of (extra ? [extra, ...pairs] : pairs)) {
       const o = document.createElement('option');
@@ -146,9 +199,9 @@ function setupAiPanel({ toast }) {
     return el;
   }
 
-  function rowFor(p) {
+  function rowFor(p: AiProviderRow) {
     const el = document.createElement('div');
-    el.className = 'aiprov' + (status.provider === p.id ? ' picked' : '')
+    el.className = 'aiprov' + (status!.provider === p.id ? ' picked' : '')
       + (p.off ? ' isoff' : '');
 
     const top = document.createElement('div');
@@ -159,7 +212,7 @@ function setupAiPanel({ toast }) {
     const radio = document.createElement('input');
     radio.type = 'radio';
     radio.name = 'aiprov';
-    radio.checked = status.provider === p.id;
+    radio.checked = status!.provider === p.id;
     radio.disabled = p.off;
     radio.title = 'Use this one by default';
     radio.onchange = () => save({ provider: p.id });
@@ -230,7 +283,7 @@ function setupAiPanel({ toast }) {
     return el;
   }
 
-  function keyField(p) {
+  function keyField(p: AiProviderRow) {
     const row = document.createElement('div');
     row.className = 'aifield';
     const lab = document.createElement('span');
@@ -266,7 +319,7 @@ function setupAiPanel({ toast }) {
       const a = document.createElement('a');
       a.href = '#';
       a.textContent = 'get one';
-      a.onclick = (e) => { e.preventDefault(); tiny.app.shell.open(p.keyUrl); };
+      a.onclick = (e) => { e.preventDefault(); tiny.app.shell.open(p.keyUrl!); };
       row.appendChild(a);
     }
     return row;
@@ -274,7 +327,7 @@ function setupAiPanel({ toast }) {
 
   // Model, with a list when the provider will tell us — for Ollama that is
   // the only way to know what has actually been pulled.
-  function modelField(p) {
+  function modelField(p: AiProviderRow) {
     const row = document.createElement('div');
     row.className = 'aifield';
     const lab = document.createElement('span');
@@ -327,7 +380,8 @@ function setupAiPanel({ toast }) {
     return row;
   }
 
-  function textField(label, value, placeholder, onSave) {
+  function textField(label: string, value: string | undefined, placeholder: string,
+    onSave: (v: string) => void) {
     const row = document.createElement('div');
     row.className = 'aifield';
     const lab = document.createElement('span');
@@ -343,7 +397,7 @@ function setupAiPanel({ toast }) {
     return row;
   }
 
-  function smallField(label, control) {
+  function smallField(label: string, control: Node) {
     const row = document.createElement('div');
     row.className = 'aifield asmallf';
     const lab = document.createElement('span');
@@ -354,7 +408,7 @@ function setupAiPanel({ toast }) {
 
   return {
     // Settings hands us the section body; we own what goes in it.
-    async renderInto(el) {
+    async renderInto(el: HTMLElement) {
       host = el;
       await refresh(false);
       draw();

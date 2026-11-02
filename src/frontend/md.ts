@@ -18,8 +18,42 @@
 import { highlightCode } from './code.ts';
 import { emojiByCode } from './emoji.ts';
 
-const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
-const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ESC[c]);
+/** The Markdown Flavor toggles (Preview ▸ Markdown Flavor). */
+export interface MdExtensions {
+  alerts: boolean;
+  emojiCodes: boolean;
+  footnotes: boolean;
+  math: boolean;
+  mermaid: boolean;
+  carousel: boolean;
+  download: boolean;
+  embed: boolean;
+  pagelink: boolean;
+  toc: boolean;
+  html: boolean;
+}
+
+/** renderMarkdown's options: any flavor toggle (unset = its default), plus
+ *  Preview ▸ --- as Page Break. */
+export interface RenderMarkdownOptions extends Partial<MdExtensions> {
+  hrBreaks?: boolean;
+}
+
+/** an attribute's vetting: the clean value, or null to drop it */
+type AttrCheck = (v: string) => string | null;
+
+/** the heading-id maker one render shares; `uid` numbers tab groups */
+interface Slugger {
+  (text: string): string;
+  uid: number;
+}
+
+interface TocHead { level: number; id: string; html: string }
+interface TocSpec { lo: number; hi: number }
+interface FootnoteDef { text: string; line: number }
+
+const ESC: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
+const esc = (s: unknown) => String(s).replace(/[&<>"]/g, (c) => ESC[c]);
 
 // Vet what a browser would actually navigate to, and hand back only that:
 // the URL parser drops tabs and newlines ANYWHERE and C0 controls / spaces
@@ -27,7 +61,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ESC[c]);
 // leading \x01) IS javascript: — checking the raw string let it through.
 // Any other control character is refused outright. `link` is for an href:
 // a data: URL is fine for a picture but never something to navigate to.
-function safeUrl(u, link) {
+function safeUrl(u: string, link?: boolean): string | null {
   const t = String(u).replace(/[\t\n\r]/g, '').replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, '');
   if (/[\u0000-\u001f\u007f]/.test(t)) return null;
   if (/^data:/i.test(t)) return !link && /^data:image\//i.test(t) ? t : null;
@@ -71,29 +105,29 @@ const TAG = /<(\/?)([a-zA-Z][a-zA-Z0-9]*)((?:\s+[^\s"'>/=]+(?:\s*=\s*(?:"[^"]*"|
 const ATTR = /([^\s"'>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
 const HTML_OPEN = /^ {0,3}<\/?([a-zA-Z][a-zA-Z0-9]*)(?=[\s/>]|$)/;
 const COMMENT_OPEN = /^ {0,3}<!--/;
-const htmlStart = (l) => {
+const htmlStart = (l: string) => {
   if (!EXT.html) return false;
   if (COMMENT_OPEN.test(l)) return true;
   const m = l.match(HTML_OPEN);
   return !!m && BLOCK_TAGS.has(m[1].toLowerCase());
 };
 
-const ENT = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
-const unent = (v) => v.replace(/&(#x[\da-f]+|#\d+|[a-z]+);/gi, (m, e) => {
+const ENT: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+const unent = (v: string) => v.replace(/&(#x[\da-f]+|#\d+|[a-z]+);/gi, (m, e: string) => {
   if (e[0] !== '#') return ENT[e.toLowerCase()] ?? m;
   const n = e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : +e.slice(1);
   return n > 0 && n < 0x110000 ? String.fromCodePoint(n) : m;
 });
 // HTML's own text keeps its entities (&nbsp; &copy; &#8594;); a bare & or
 // < is escaped like everywhere else
-const escHtmlText = (s) => String(s)
+const escHtmlText = (s: string) => String(s)
   .replace(/&(?!(?:#x[\da-f]+|#\d+|[a-z][a-z\d]*);)/gi, '&amp;')
   .replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-const ONE_OF = (re) => (v) => (re.test(v) ? v.toLowerCase() : null);
-const SIZE = (v) => (/^\d+(?:\.\d+)?(?:%|px)?$/.test(v) ? v : null);
-const INT = (v) => (/^-?\d+$/.test(v) ? v : null);
-const ANY = (v) => v;
+const ONE_OF = (re: RegExp): AttrCheck => (v) => (re.test(v) ? v.toLowerCase() : null);
+const SIZE: AttrCheck = (v) => (/^\d+(?:\.\d+)?(?:%|px)?$/.test(v) ? v : null);
+const INT: AttrCheck = (v) => (/^-?\d+$/.test(v) ? v : null);
+const ANY: AttrCheck = (v) => v;
 // style= keeps LAYOUT only — grid, flex, spacing, alignment, sizes — so
 // a README's two-column grid of cards still lays out. Nothing that could
 // lift content out of the preview (position, z-index, transform, negative
@@ -114,8 +148,8 @@ const CSS_PROPS = new Set(['display', 'gap', 'row-gap', 'column-gap',
   'padding-inline', 'padding-block']);
 const CSS_BAD = /url\s*\(|image-set|expression|var\s*\(|env\s*\(|attr\s*\(|javascript:|[\\<>{}@"'`]/i;
 const DISPLAY_OK = /^(?:block|inline|inline-block|flex|inline-flex|grid|inline-grid|contents|none|flow-root|table|table-row|table-cell)$/i;
-function cleanStyle(v) {
-  const out = [];
+function cleanStyle(v: string) {
+  const out: string[] = [];
   for (const decl of v.split(';')) {
     const c = decl.indexOf(':');
     if (c < 0) continue;
@@ -128,14 +162,14 @@ function cleanStyle(v) {
   }
   return out.length ? out.join('; ') : null;
 }
-const ATTRS_ALL = {
+const ATTRS_ALL: Record<string, AttrCheck> = {
   style: cleanStyle,
   align: ONE_OF(/^(?:left|center|right|justify)$/i),
   dir: ONE_OF(/^(?:ltr|rtl|auto)$/i),
-  lang: (v) => (/^[\w-]+$/.test(v) ? v : null),
+  lang: (v: string) => (/^[\w-]+$/.test(v) ? v : null),
   title: ANY,
 };
-const ATTRS_BY_TAG = {
+const ATTRS_BY_TAG: Record<string, Record<string, AttrCheck>> = {
   img: { alt: ANY, width: SIZE, height: SIZE },
   td: { colspan: INT, rowspan: INT, valign: ONE_OF(/^(?:top|middle|bottom|baseline)$/i), width: SIZE },
   th: { colspan: INT, rowspan: INT, valign: ONE_OF(/^(?:top|middle|bottom|baseline)$/i), width: SIZE },
@@ -149,10 +183,10 @@ const ATTRS_BY_TAG = {
 };
 
 // One tag, written afresh. `orig` (inline only) is how it was spelled.
-function openTag(t, attrs, orig) {
-  const ok = { ...ATTRS_ALL, ...(ATTRS_BY_TAG[t] || {}) };
-  const out = [];
-  let m;
+function openTag(t: string, attrs: string | undefined, orig?: string) {
+  const ok: Record<string, AttrCheck> = { ...ATTRS_ALL, ...(ATTRS_BY_TAG[t] || {}) };
+  const out: string[] = [];
+  let m: RegExpExecArray | null;
   ATTR.lastIndex = 0;
   while ((m = ATTR.exec(attrs || ''))) {
     const name = m[1].toLowerCase();
@@ -183,12 +217,12 @@ function openTag(t, attrs, orig) {
 
 // A run of HTML text, every tag rewritten; `stack` is the open-tag state
 // shared across a whole region, so a close in a later chunk finds its open.
-function cleanHtml(text, stack) {
+function cleanHtml(text: string, stack: string[]) {
   let out = '';
   let last = 0;
   const s = text.replace(/<!--[\s\S]*?(?:-->|$)/g, '');
   TAG.lastIndex = 0;
-  let m;
+  let m: RegExpExecArray | null;
   while ((m = TAG.exec(s))) {
     out += escHtmlText(s.slice(last, m.index));
     last = TAG.lastIndex;
@@ -210,7 +244,7 @@ function cleanHtml(text, stack) {
 // How far a block of HTML reaches: to the blank line after its depth comes
 // back to zero. Never closed at all, it gets CommonMark's own rule — up to
 // the first blank line — rather than swallowing the rest of the document.
-function htmlRegion(lines, i) {
+function htmlRegion(lines: string[], i: number): { end: number; comment?: boolean } {
   if (COMMENT_OPEN.test(lines[i])) {
     let j = i;
     while (j < lines.length - 1 && !lines[j].includes('-->')) j++;
@@ -222,7 +256,7 @@ function htmlRegion(lines, i) {
     const l = lines[j];
     if (!l.trim()) { if (depth <= 0) break; continue; }
     TAG.lastIndex = 0;
-    let m;
+    let m: RegExpExecArray | null;
     while ((m = TAG.exec(l.replace(/<!--[\s\S]*?-->/g, '')))) {
       if (DEPTH_TAGS.has(m[2].toLowerCase())) depth += m[1] ? -1 : 1;
     }
@@ -237,13 +271,13 @@ function htmlRegion(lines, i) {
 // The inside of a region: HTML chunks (an HTML line to the next blank
 // line — a <pre> to its close) and the Markdown between them, which is
 // rendered as Markdown, as GitHub does.
-function htmlBlock(lines, slug) {
-  const stack = [];
+function htmlBlock(lines: string[], slug: Slugger) {
+  const stack: string[] = [];
   let out = '';
   let k = 0;
   while (k < lines.length) {
     if (!lines[k].trim()) { k++; continue; }
-    const buf = [];
+    const buf: string[] = [];
     if (htmlStart(lines[k])) {
       // a blank line ends the chunk — unless a <pre> is open across it
       const inPre = () => stack.includes('pre') || (buf.join('\n').match(/<pre[\s>]/gi) || []).length
@@ -261,7 +295,7 @@ function htmlBlock(lines, slug) {
 
 // ------------------------------------------------------------ inline text
 
-function emphasis(s) {
+function emphasis(s: string) {
   s = s.replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>');
   s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
   s = s.replace(/__([^_]+)__/g, '<strong>$1</strong>');
@@ -272,27 +306,27 @@ function emphasis(s) {
   return s;
 }
 
-function inline(raw) {
-  const stash = [];
-  const keep = (html) => '\uE000' + (stash.push(html) - 1) + '\uE001';
+function inline(raw: string) {
+  const stash: string[] = [];
+  const keep = (html: string) => '\uE000' + (stash.push(html) - 1) + '\uE001';
   let s = String(raw);
 
   // code spans first, on the raw text — nothing inside them is markdown
-  s = s.replace(/(`{1,3})([\s\S]+?)\1(?!`)/g, (_, _t, code) =>
+  s = s.replace(/(`{1,3})([\s\S]+?)\1(?!`)/g, (_, _t, code: string) =>
     keep('<code>' + esc(code.replace(/^ (.+) $/s, '$1')) + '</code>'));
 
   // backslash escapes: \* renders a literal *
-  s = s.replace(/\\([\\`*_{}[\]()#+\-.!~|<>$])/g, (_, c) => keep(esc(c)));
+  s = s.replace(/\\([\\`*_{}[\]()#+\-.!~|<>$])/g, (_, c: string) => keep(esc(c)));
 
   // inline HTML (see "raw HTML" above): comments hidden, allowlisted tags
   // rewritten, every other tag left as text. Opens still open at the end
   // of the paragraph are closed there, and a close with no open is dropped,
   // so nothing leaks into the next block.
-  const opened = [];
+  const opened: string[] = [];
   if (EXT.html) {
-    s = s.replace(/<!--[\s\S]*?-->/g, (m) =>
+    s = s.replace(/<!--[\s\S]*?-->/g, (m: string) =>
       keep(`<span class="hcom" contenteditable="false" data-text="${esc(m)}"></span>`));
-    s = s.replace(TAG, (m, close, name, attrs) => {
+    s = s.replace(TAG, (m, close: string, name: string, attrs: string) => {
       const t = name.toLowerCase();
       if (!INLINE_TAGS.has(t)) return m;
       if (close) {
@@ -311,14 +345,14 @@ function inline(raw) {
   // The TeX rides in data-text; the <code> child is the look until
   // Temml swaps in MathML (doc.ts decorates when the pref is on).
   if (EXT.math) {
-    s = s.replace(/\$(\S(?:[^$\n]*\S)?)\$/g, (_, tex) =>
+    s = s.replace(/\$(\S(?:[^$\n]*\S)?)\$/g, (_, tex: string) =>
       keep(`<span class="math" data-kind="math" contenteditable="false"` +
            ` data-text="${esc(tex)}"><code>${esc(tex)}</code></span>`));
   }
 
   // [^id] footnote references, numbered in order of first use
   if (EXT.footnotes) {
-    s = s.replace(/\[\^([^\]\s]+)\](?!:)/g, (_, id) => {
+    s = s.replace(/\[\^([^\]\s]+)\](?!:)/g, (_, id: string) => {
       let n = fnRefs.indexOf(id);
       if (n < 0) n = fnRefs.push(id) - 1;
       return keep(`<sup class="fnref" data-fn="${esc(id)}">` +
@@ -338,7 +372,7 @@ function inline(raw) {
   // which is how a path with spaces or parentheses has to be written —
   // `![](</assets/image (14).png>)`. By this point the text has been escaped,
   // so the brackets are entities. ANG matches one lazily, up to its own >.
-  s = s.replace(/!\[([^\]]*)\]\(\s*(?:&lt;((?:(?!&gt;).)*)&gt;|([^)\s]+))\s*\)/g, (m, alt, ang, bare) => {
+  s = s.replace(/!\[([^\]]*)\]\(\s*(?:&lt;((?:(?!&gt;).)*)&gt;|([^)\s]+))\s*\)/g, (m, alt: string, ang: string | undefined, bare: string) => {
     const src = ang === undefined ? bare : ang;
     const u = safeUrl(src);
     if (!u) return m;
@@ -350,7 +384,7 @@ function inline(raw) {
 
   // links — the label keeps its emphasis ([**bold** link](url) works), and
   // the same two spellings of the target as images above
-  s = s.replace(/\[([^\]]+)\]\(\s*(?:&lt;((?:(?!&gt;).)*)&gt;|([^)\s]+))\s*\)/g, (m, label, ang, bare) => {
+  s = s.replace(/\[([^\]]+)\]\(\s*(?:&lt;((?:(?!&gt;).)*)&gt;|([^)\s]+))\s*\)/g, (m, label: string, ang: string | undefined, bare: string) => {
     const url = ang === undefined ? bare : ang;
     const u = safeUrl(url, true);
     if (!u) return m;
@@ -358,10 +392,10 @@ function inline(raw) {
   });
 
   // autolinks: <https://…> (angle brackets are entities by now)
-  s = s.replace(/&lt;(https?:\/\/[^\s<>]+?)&gt;/g, (_, u) => keep(`<a href="${u}">${u}</a>`));
+  s = s.replace(/&lt;(https?:\/\/[^\s<>]+?)&gt;/g, (_, u: string) => keep(`<a href="${u}">${u}</a>`));
 
   // bare URLs, minus trailing punctuation
-  s = s.replace(/(^|[\s(])(https?:\/\/[^\s<>\uE000]+)/g, (_, pre, u) => {
+  s = s.replace(/(^|[\s(])(https?:\/\/[^\s<>\uE000]+)/g, (_, pre: string, u: string) => {
     const trail = (u.match(/[.,;:!?)]+$/) || [''])[0];
     const clean = trail ? u.slice(0, -trail.length) : u;
     return pre + keep(`<a href="${clean}">${clean}</a>`) + trail;
@@ -370,7 +404,7 @@ function inline(raw) {
   // :shortcode: emoji — emoji.ts owns the name → glyph table. The code
   // rides in data-text so a Live round-trip hands back what was typed.
   if (EXT.emojiCodes && emojiByCode) {
-    s = s.replace(/:([a-z0-9_+-]+):/g, (m, code) => {
+    s = s.replace(/:([a-z0-9_+-]+):/g, (m, code: string) => {
       const g = emojiByCode[code];
       return g ? keep(`<span class="emo" data-text="${esc(m)}">${g}</span>`) : m;
     });
@@ -381,7 +415,7 @@ function inline(raw) {
   while (opened.length) s += `</${opened.pop()}>`;
 
   while (/\uE000/.test(s)) {
-    s = s.replace(/\uE000(\d+)\uE001/g, (_, n) => stash[+n]);
+    s = s.replace(/\uE000(\d+)\uE001/g, (_, n: string) => stash[+n]);
   }
   return s;
 }
@@ -402,7 +436,7 @@ const CB_CLOSE = /^ {0,3}:{3,}\s*$/;
 // else about a container is ordinary Markdown, nesting included. The icons
 // live in CSS (themes.ts) rather than the DOM, so the title stays plain
 // text that Live mode can edit and unmd.ts can read straight back.
-const CB = {
+const CB: Record<string, string> = {
   note: 'Note', info: 'Info', tip: 'Tip', hint: 'Hint',
   important: 'Important', warning: 'Warning', caution: 'Caution',
   danger: 'Danger', success: 'Success', bug: 'Bug',
@@ -413,10 +447,10 @@ const CB = {
 // path with spaces.
 const CARD = /^\[(.+)\]\(\s*(?:<([^>]*)>|([^)\s]+))\s*\)$/;
 // the cards' icons, inline SVG so exported HTML keeps them
-const DLC_SVG = (body) => '<svg class="dlc-ico" viewBox="0 0 24 24" fill="none"'
+const DLC_SVG = (body: string) => '<svg class="dlc-ico" viewBox="0 0 24 24" fill="none"'
   + ' stroke="currentColor" stroke-width="2" stroke-linecap="round"'
   + ' stroke-linejoin="round" aria-hidden="true">' + body + '</svg>';
-const DLC_ICONS = {
+const DLC_ICONS: Record<string, string> = {
   download: DLC_SVG('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>'
     + '<polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>'),
   pagelink: DLC_SVG('<path d="M15 3h6v6"/><path d="M10 14 21 3"/>'
@@ -431,38 +465,38 @@ let hrBreaks = false;
 // hrBreaks. Math and mermaid render as data-text ISLANDS here — doc.ts
 // decorates them with Temml / Mermaid when their libraries are loaded, so
 // this file stays dependency-free and help.html degrades to showing source.
-const EXT_DEFAULTS = { alerts: true, emojiCodes: true, footnotes: true, math: true, mermaid: true,
+const EXT_DEFAULTS: MdExtensions = { alerts: true, emojiCodes: true, footnotes: true, math: true, mermaid: true,
   carousel: true, download: true, embed: true, pagelink: true, toc: true, html: false };
-let EXT = { ...EXT_DEFAULTS };
+let EXT: MdExtensions = { ...EXT_DEFAULTS };
 // ::: toc — per render: every heading as it is emitted (the same set the
 // outline shows, containers included), and each toc block's settings. The
 // block is written as a placeholder where it stands and filled in once the
 // whole document has been read, so a toc at the top sees the headings below.
-let tocHeads = [];
-let tocSpecs = [];
+let tocHeads: TocHead[] = [];
+let tocSpecs: TocSpec[] = [];
 const TOC_MARK = /\u0001TOC(\d+)\u0001/g;
 // `::: toc [title] [N | N-M]` — a trailing level or range of levels
 const TOC_ARG = /^(.*?)\s*(?:(?:^|\s)([1-6])(?:\s*-\s*([1-6]))?)?$/;
 const ALERT = /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*$/;
 const FNDEF = /^\[\^([^\]\s]+)\]:\s?(.*)$/;
 // per-render footnote state: refs in order of first use, defs by id
-let fnRefs = [];
-let fnDefs = new Map();
+let fnRefs: string[] = [];
+let fnDefs = new Map<string, FootnoteDef>();
 
-const isTableStart = (lines, i) =>
+const isTableStart = (lines: string[], i: number) =>
   lines[i].includes('|') && i + 1 < lines.length &&
   lines[i + 1].includes('-') && TABLE_SEP.test(lines[i + 1]);
 
-const blockStart = (lines, i) => {
+const blockStart = (lines: string[], i: number) => {
   const l = lines[i];
   return FENCE.test(l) || HEADING.test(l) || HR.test(l) || PGBRK.test(l) ||
          QUOTE.test(l) || ITEM.test(l) || CB_OPEN.test(l) || isTableStart(lines, i) ||
          (EXT.math && /^\s*\$\$/.test(l)) || (EXT.footnotes && FNDEF.test(l)) || htmlStart(l);
 };
 
-function slugger() {
-  const used = new Set();
-  const slug = (text) => {
+function slugger(): Slugger {
+  const used = new Set<string>();
+  const slug = (text: string) => {
     let s = text.toLowerCase().replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '-') || 'section';
     let out = s, n = 2;
     while (used.has(out)) out = s + '-' + n++;
@@ -478,12 +512,12 @@ function slugger() {
 // far this slice of lines sits into the document — containers pass their
 // own start so task boxes and outline entries inside one still point at the
 // right source line.
-function renderBlocks(lines, slug, track, off = 0) {
-  const out = [];
+function renderBlocks(lines: string[], slug: Slugger, track: boolean, off = 0): string {
+  const out: string[] = [];
   let i = 0;
   // every block remembers where it came from — that's what lets the outline
   // jump, and the editor and preview show each other's cursor
-  const at = (n) => (track ? ` data-line="${off + n}"` : '');
+  const at = (n: number) => (track ? ` data-line="${off + n}"` : '');
 
   while (i < lines.length) {
     const line = lines[i];
@@ -493,7 +527,7 @@ function renderBlocks(lines, slug, track, off = 0) {
     const fence = line.match(FENCE);
     if (fence) {
       const [, , ticks, lang] = fence;
-      const buf = [];
+      const buf: string[] = [];
       const from = i;
       i++;
       while (i < lines.length && !(lines[i].trim().startsWith(ticks[0].repeat(3)) && lines[i].trim().replace(/[`~]/g, '') === '')) {
@@ -529,12 +563,12 @@ function renderBlocks(lines, slug, track, off = 0) {
     if (EXT.math && /^\s*\$\$/.test(line)) {
       const from = i;
       const one = line.trim().match(/^\$\$(.+?)\$\$\s*$/);
-      let tex;
+      let tex: string;
       if (one) {
         tex = one[1].trim();
         i++;
       } else {
-        const buf = [];
+        const buf: string[] = [];
         const lead = line.trim().replace(/^\$\$/, '');
         if (lead) buf.push(lead);
         i++;
@@ -577,7 +611,7 @@ function renderBlocks(lines, slug, track, off = 0) {
     // The label span is real content so it survives export; unmd.ts never
     // walks into a .pgbrk (data-text answers first), so it can't leak back
     // into the document.
-    const brk = (text) =>
+    const brk = (text: string) =>
       `<div class="pgbrk" data-kind="pagebreak" contenteditable="false" data-text="${esc(text)}"${at(i)}><span>page break</span></div>`;
     if (PGBRK.test(line)) { out.push(brk(line.trim())); i++; continue; }
 
@@ -611,7 +645,7 @@ function renderBlocks(lines, slug, track, off = 0) {
     const cb = line.match(CB_OPEN);
     if (cb) {
       const kind = (cb[1] || 'note').toLowerCase();
-      const buf = [];
+      const buf: string[] = [];
       const from = i + 1;
       let depth = 1;
       i++;
@@ -646,7 +680,7 @@ function renderBlocks(lines, slug, track, off = 0) {
           const body = buf.some((l) => l.trim()) ? renderBlocks(buf, slug, track, off + from) : '';
           out.push(`<div class="dlc dlc-${kind}" data-kind="${kind}"${at(from - 1)}>` +
                    DLC_ICONS[kind] +
-                   `<div class="dlc-main"><p class="dlc-t"><a href="${esc(u)}">${inline(m[1])}</a></p>` +
+                   `<div class="dlc-main"><p class="dlc-t"><a href="${esc(u)}">${inline(m![1])}</a></p>` +
                    body + '</div></div>');
           continue;
         }
@@ -704,7 +738,7 @@ function renderBlocks(lines, slug, track, off = 0) {
     }
 
     if (QUOTE.test(line)) {
-      const buf = [];
+      const buf: string[] = [];
       const from = i;
       while (i < lines.length && (QUOTE.test(lines[i]) || (buf.length && lines[i].trim()))) {
         buf.push(lines[i].replace(QUOTE, ''));
@@ -756,14 +790,17 @@ function renderBlocks(lines, slug, track, off = 0) {
 
 // ------------------------------------------------------------------- tabs
 //
+interface TabPart { title: string; lines: string[]; from: number }
+interface ListItem { indent: number; ordered: boolean; start: number; text: string[]; line: number }
+
 // `::: tabs` with `== Title` splitting the body. Rendered as hidden radios
 // + labels + panels, switched by CSS alone (:checked ~ .tp) — so tabs keep
 // working in exported HTML, which carries no script, and print can simply
 // show every panel.
 
-function tabs(buf, slug, track, off, at) {
-  const parts = [];
-  let cur = null;
+function tabs(buf: string[], slug: Slugger, track: boolean, off: number, at: string) {
+  const parts: TabPart[] = [];
+  let cur: TabPart | null = null;
   buf.forEach((l, k) => {
     const m = l.match(/^==\s+(.+?)\s*$/);
     if (m) {
@@ -776,7 +813,7 @@ function tabs(buf, slug, track, off, at) {
   if (!parts.length) return `<div class="tabs" data-kind="tabs"${at}></div>`;
 
   const gid = 'tab' + ++slug.uid;
-  const head = [], panes = [];
+  const head: string[] = [], panes: string[] = [];
   parts.forEach((p, k) => {
     const id = `${gid}-${k}`;
     head.push(`<input type="radio" name="${gid}" id="${id}"${k ? '' : ' checked'}>` +
@@ -789,9 +826,9 @@ function tabs(buf, slug, track, off, at) {
 
 // ------------------------------------------------------------------ lists
 
-function list(lines, i, out, slug, track, off = 0) {
+function list(lines: string[], i: number, out: string[], slug: Slugger, track: boolean, off = 0) {
   // flatten the run into { indent, ordered, text, line } items…
-  const items = [];
+  const items: ListItem[] = [];
   while (i < lines.length && lines[i].trim()) {
     const m = lines[i].match(ITEM);
     if (m) {
@@ -809,11 +846,11 @@ function list(lines, i, out, slug, track, off = 0) {
   }
 
   // …then fold them into a tree by indent
-  const render = (from, to, depth) => {
+  const render = (from: number, to: number, depth: number): string => {
     const indent = items[from].indent;
     const ordered = items[from].ordered;
     const start = ordered && items[from].start !== 1 ? ` start="${items[from].start}"` : '';
-    const bits = [];
+    const bits: string[] = [];
     let k = from;
     while (k < to) {
       let next = k + 1;
@@ -844,8 +881,8 @@ function list(lines, i, out, slug, track, off = 0) {
 
 // ----------------------------------------------------------------- tables
 
-function table(lines, i, out, at = '') {
-  const splitRow = (l) =>
+function table(lines: string[], i: number, out: string[], at = '') {
+  const splitRow = (l: string) =>
     l.trim().replace(/^\|/, '').replace(/\|$/, '')
       .split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, '|'));
 
@@ -854,17 +891,17 @@ function table(lines, i, out, at = '') {
     /^:-+:$/.test(c) ? 'center' : /^-+:$/.test(c) ? 'right' : '');
   i += 2;
 
-  const rows = [];
+  const rows: string[][] = [];
   while (i < lines.length && lines[i].includes('|') && lines[i].trim()) {
     rows.push(splitRow(lines[i]));
     i++;
   }
 
-  const cell = (tag, txt, col) => {
+  const cell = (tag: string, txt: string | undefined, col: number) => {
     const a = aligns[col] ? ` style="text-align:${aligns[col]}"` : '';
     return `<${tag}${a}>${inline(txt ?? '')}</${tag}>`;
   };
-  const tr = (cells, tag) => `<tr>${cells.map((c, k) => cell(tag, c, k)).join('')}</tr>`;
+  const tr = (cells: string[], tag: string) => `<tr>${cells.map((c, k) => cell(tag, c, k)).join('')}</tr>`;
 
   out.push(`<table${at}><thead>${tr(head, 'th')}</thead><tbody>${rows.map((r) => tr(r, 'td')).join('')}</tbody></table>`);
   return i;
@@ -875,7 +912,7 @@ function table(lines, i, out, at = '') {
 // YAML front-matter: a --- fence at the very top. Nib doesn't parse it, but
 // it shouldn't render as a rule and a paragraph either — it gets its own
 // block, kept verbatim so it survives the trip back through unmd.ts.
-function frontMatter(lines) {
+function frontMatter(lines: string[]) {
   if (lines[0] !== '---') return null;
   const end = lines.indexOf('---', 1);
   if (end < 1) return null;
@@ -908,11 +945,11 @@ function footnoteSection() {
 // come, so a skipped level (## then ####) nests one deeper, not two; link
 // text is the heading's with its markup stripped, since a link inside a
 // link isn't one.
-function tocList({ lo, hi }) {
+function tocList({ lo, hi }: TocSpec) {
   const heads = tocHeads.filter((h) => h.level >= lo && h.level <= hi);
   if (!heads.length) return '<p class="toc-none">No headings yet.</p>';
   let html = '';
-  const stack = [];
+  const stack: number[] = [];
   for (const h of heads) {
     while (stack.length && stack[stack.length - 1] > h.level) { html += '</li></ul>'; stack.pop(); }
     if (stack.length && stack[stack.length - 1] === h.level) html += '</li>';
@@ -924,7 +961,7 @@ function tocList({ lo, hi }) {
 }
 
 // unmd.ts + help.html read these back
-export const renderMarkdown = (src, opts) => {
+export const renderMarkdown = (src: string, opts?: RenderMarkdownOptions): string => {
   hrBreaks = !!(opts && opts.hrBreaks);
   EXT = { ...EXT_DEFAULTS, ...(opts || {}) };
   fnRefs = [];

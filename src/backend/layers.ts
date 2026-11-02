@@ -23,10 +23,33 @@
 
 export const LAYER_NAMES = ['mine', 'folder', 'local'];   // low → high
 
+/** One layer's settings object as stored: scalars, plus maps such as prefs. */
+export type Layer = Record<string, any>;
+
+/** A layer in play: its name ('mine' | 'folder' | 'local') and its data. */
+export interface StackEntry {
+  name: string;
+  data: Layer | null | undefined;
+}
+
+/** Who wins for one path. */
+export interface Effective {
+  value: unknown;
+  from: string | null;
+  set: string[];
+}
+
+export interface ResolvedSettings<P = Record<string, unknown>, I = Record<string, unknown>> {
+  theme: string;
+  view: string;
+  prefs: P;
+  images: I;
+}
+
 // A setting is addressed by a dotted path: a scalar at the top ('theme') or a
 // member of one of the maps ('prefs.hc', 'images.dest'). Two levels is all
 // this ever needs, and pretending otherwise would buy nothing.
-export function readPath(layer, path) {
+export function readPath(layer: Layer | null | undefined, path: string): unknown {
   if (!layer) return undefined;
   const i = path.indexOf('.');
   if (i < 0) return layer[path];
@@ -34,7 +57,7 @@ export function readPath(layer, path) {
   return outer ? outer[path.slice(i + 1)] : undefined;
 }
 
-export function writePath(layer, path, value) {
+export function writePath(layer: Layer, path: string, value: unknown): Layer {
   const i = path.indexOf('.');
   if (i < 0) { layer[path] = value; return layer; }
   const head = path.slice(0, i);
@@ -46,7 +69,7 @@ export function writePath(layer, path, value) {
 // Clearing is what "reset to inherited" does, and it has to leave NOTHING
 // behind: an empty `prefs: {}` in a folder's settings file is a promise that
 // the folder has an opinion, and it would keep showing up in diffs.
-export function clearPath(layer, path) {
+export function clearPath<L extends Layer | null | undefined>(layer: L, path: string): L {
   if (!layer) return layer;
   const i = path.indexOf('.');
   if (i < 0) { delete layer[path]; return layer; }
@@ -69,10 +92,10 @@ export function clearPath(layer, path) {
  * holding a value, so the UI can say "the folder sets this too, but your
  * local answer is winning" rather than hiding it.
  */
-export function effective(stack, path, fallback) {
+export function effective(stack: StackEntry[], path: string, fallback?: unknown): Effective {
   let value = fallback;
-  let from = null;
-  const set = [];
+  let from: string | null = null;
+  const set: string[] = [];
   for (const { name, data } of stack) {
     const v = readPath(data, path);
     if (v === undefined) continue;
@@ -85,21 +108,23 @@ export function effective(stack, path, fallback) {
 
 // The whole resolved settings object the app runs on: scalars picked, maps
 // merged key by key over their defaults.
-export function resolveAll(stack, { prefDefaults, imageDefaults }) {
-  const prefs = { ...prefDefaults };
-  const images = { ...imageDefaults };
+export function resolveAll<P extends object, I extends object>(stack: StackEntry[], { prefDefaults, imageDefaults }: {
+  prefDefaults: P; imageDefaults: I;
+}): ResolvedSettings<P, I> {
+  const prefs: P = { ...prefDefaults };
+  const images: I = { ...imageDefaults };
   for (const { data } of stack) {
     if (!data) continue;
     if (data.prefs) for (const [k, v] of Object.entries(data.prefs)) {
-      if (v !== undefined && k in prefDefaults) prefs[k] = v;
+      if (v !== undefined && k in prefDefaults) (prefs as Record<string, unknown>)[k] = v;
     }
     if (data.images) for (const [k, v] of Object.entries(data.images)) {
-      if (v !== undefined && k in imageDefaults) images[k] = v;
+      if (v !== undefined && k in imageDefaults) (images as Record<string, unknown>)[k] = v;
     }
   }
   return {
-    theme: effective(stack, 'theme', 'paper').value,
-    view: effective(stack, 'view', 'split').value,
+    theme: effective(stack, 'theme', 'paper').value as string,
+    view: effective(stack, 'view', 'split').value as string,
     prefs,
     images,
   };
@@ -107,8 +132,8 @@ export function resolveAll(stack, { prefDefaults, imageDefaults }) {
 
 // Provenance for every path the settings window draws, in one pass — one
 // object keyed by path, so the page never has to ask per row.
-export function provenance(stack, paths, defaults) {
-  const out = {};
+export function provenance(stack: StackEntry[], paths: string[], defaults: Record<string, unknown>): Record<string, Effective> {
+  const out: Record<string, Effective> = {};
   for (const p of paths) out[p] = effective(stack, p, defaults[p]);
   return out;
 }

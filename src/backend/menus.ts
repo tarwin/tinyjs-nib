@@ -31,16 +31,29 @@ import {
   tokenizeJS, findDeclared, findDefaultExport, findKeyed, keyPath, findImport,
   functionBody, isDyn, parseYAML, frontMatter, titleOf, parseTOMLish, safeKey,
 } from './menuparse.ts';
+import type {
+  Parsed, ParsedArray, Span, Token, DynNode, KeyInfo, ReadResult, FileReader, FrontMatter, JsonPath,
+  Menu, MenuItem, MenuSource, MenuOp, Site, DeadLink, EditResult,
+} from './menuparse.ts';
+
+export type { Site, Menu, MenuItem, MenuOp, EditResult } from './menuparse.ts';
+
+// What readSites / editMenu are handed: the project's files (rel paths, or
+// objects with a `rel`) and a reader that answers text or null.
+export interface MenuIO {
+  files: (string | { rel: string })[];
+  read: (rel: string) => string | null | Promise<string | null>;
+}
 
 // ------------------------------------------------------------------ paths
 
-const dirOf = (p) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
-const baseOf = (p) => p.slice(p.lastIndexOf('/') + 1);
-const extOf = (p) => (baseOf(p).includes('.') ? baseOf(p).slice(baseOf(p).lastIndexOf('.') + 1).toLowerCase() : '');
-const stem = (p) => baseOf(p).replace(/\.[^.]+$/, '');
+const dirOf = (p: string) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
+const baseOf = (p: string) => p.slice(p.lastIndexOf('/') + 1);
+const extOf = (p: string) => (baseOf(p).includes('.') ? baseOf(p).slice(baseOf(p).lastIndexOf('.') + 1).toLowerCase() : '');
+const stem = (p: string) => baseOf(p).replace(/\.[^.]+$/, '');
 
-function norm(p) {
-  const out = [];
+function norm(p: string) {
+  const out: string[] = [];
   for (const seg of p.split('/')) {
     if (!seg || seg === '.') continue;
     if (seg === '..') out.pop();
@@ -48,37 +61,50 @@ function norm(p) {
   }
   return out.join('/');
 }
-const join = (...parts) => norm(parts.filter((x) => x !== undefined && x !== null).join('/'));
+const join = (...parts: (string | null | undefined)[]) => norm(parts.filter((x) => x !== undefined && x !== null).join('/'));
 
-const isExternal = (t) => /^[a-z][\w+.-]*:/i.test(t) || t.startsWith('//');
+const isExternal = (t: string) => /^[a-z][\w+.-]*:/i.test(t) || t.startsWith('//');
 const DOC_EXTS = ['md', 'mdx', 'markdown', 'qmd', 'rmd', 'ipynb', 'rst', 'adoc', 'asciidoc', 'mdoc', 'markdoc', 'mdc', 'txt'];
 const DOC_SET = new Set(DOC_EXTS);
 const INDEX_NAMES = ['index', 'README', 'readme', '_index', 'Index'];
-const isDoc = (rel) => DOC_SET.has(extOf(rel)) && extOf(rel) !== 'txt';
+const isDoc = (rel: string) => DOC_SET.has(extOf(rel)) && extOf(rel) !== 'txt';
 
 // ---------------------------------------------------------------- context
 
 // What every adapter is handed: the project's file list (as relative paths,
 // for listing and existence) and a reader. Lookups ignore case, as the Mac's
 // disk does — a menu that says /Guide/Setup still finds guide/setup.md.
-function makeCtx({ files, read }) {
+interface PageMeta { fm: FrontMatter; title: string | null }
+
+interface Ctx extends FileReader {
+  rels: string[];
+  has(rel: string): string | null;
+  hasNormed(rel: string): string | null;
+  list(dir: string): { files: string[]; dirs: string[] };
+  under(dir: string): string[];
+  fmCache: Map<string, Promise<PageMeta>>;
+  hidden: Set<string>;
+  meta(rel: string): Promise<PageMeta>;
+}
+
+function makeCtx({ files, read }: MenuIO): Ctx {
   const rels = files.map((f) => (typeof f === 'string' ? f : f.rel));
-  const byLc = new Map();
+  const byLc = new Map<string, string>();
   for (const r of rels) if (!byLc.has(r.toLowerCase())) byLc.set(r.toLowerCase(), r);
-  const cache = new Map();
-  const ctx = {
+  const cache = new Map<string, Promise<string | null>>();
+  const ctx: Ctx = {
     rels,
     has: (rel) => byLc.get(norm(rel).toLowerCase()) || null,
     hasNormed: (rel) => byLc.get(rel.toLowerCase()) || null,     // already norm()ed — the hot path
     async read(rel) {
       rel = norm(rel);
       if (!cache.has(rel)) cache.set(rel, Promise.resolve(read(rel)).catch(() => null));
-      return cache.get(rel);
+      return cache.get(rel)!;
     },
     // direct children of a folder: { files: [rel], dirs: [rel] }
     list(dir) {
       const pre = dir ? dir + '/' : '';
-      const fs = [], ds = new Set();
+      const fs: string[] = [], ds = new Set<string>();
       for (const r of rels) {
         if (!r.startsWith(pre)) continue;
         const rest = r.slice(pre.length);
@@ -99,13 +125,13 @@ function makeCtx({ files, read }) {
           return { fm, title: text ? (titleOf(text, fm) || adocTitle(text)) : null };
         })());
       }
-      return ctx.fmCache.get(rel);
+      return ctx.fmCache.get(rel)!;
     },
   };
   return ctx;
 }
 
-const adocTitle = (text) => {
+const adocTitle = (text: string) => {
   const m = /^=\s+(.+)$/m.exec(text);
   return m ? m[1].trim() : null;
 };
@@ -114,7 +140,9 @@ const adocTitle = (text) => {
 // read against (a content root for `/x`, the menu file's folder for `x`).
 // Tries the spellings static-site generators accept: as written, with a
 // docs extension, the folder's index/README, and `.html` mapped back.
-function resolve(ctx, target, { root = '', from = root, exts = DOC_EXTS } = {}) {
+interface ResolveOpts { root?: string; from?: string; exts?: string[] }
+
+function resolve(ctx: Ctx, target: string | null | undefined, { root = '', from = root, exts = DOC_EXTS }: ResolveOpts = {}): string | null {
   if (target === undefined || target === null) return null;
   let t = String(target).trim();
   if (!t || isExternal(t)) return null;
@@ -139,24 +167,25 @@ function resolve(ctx, target, { root = '', from = root, exts = DOC_EXTS } = {}) 
   return null;
 }
 
-const hasDyn = (v) => JSON.stringify(v).includes('"$dyn"');
+const hasDyn = (v: Parsed) => JSON.stringify(v).includes('"$dyn"');
 
 // A YAML list mapped to nodes, each node told the line its `- ` sits on
 // (parseYAML keeps them in $lines) — what menuedit.ts cuts and moves by.
-function yamlItems(list, fn) {
-  const arr = Array.isArray(list) ? list : list ? [list] : [];
+function yamlItems(list: Parsed, fn: (e: Parsed, i: number) => MenuItem | null | undefined): MenuItem[] {
+  const arr: ParsedArray = Array.isArray(list) ? list : list ? [list] : [];
   return arr.map((e, i) => {
     const n = fn(e, i);
     if (n && arr.$lines && arr.$lines[i] != null) n.line = arr.$lines[i];
     return n;
-  }).filter(Boolean);
+  }).filter(Boolean) as MenuItem[];
 }
 
-const page = (text, link, file, extra) => ({ text, kind: 'page', link, file, ...extra });
-const group = (text, items, extra) => ({ text, kind: 'group', items, ...extra });
+type Extra = Partial<MenuItem>;
+const page = (text: string, link: string | null | undefined, file: string | null | undefined, extra?: Extra): MenuItem => ({ text, kind: 'page', link, file, ...extra });
+const group = (text: string, items: MenuItem[], extra?: Extra): MenuItem => ({ text, kind: 'group', items, ...extra });
 
 // Fill in any label a menu left out from the page's own title.
-async function fillTitles(ctx, items) {
+async function fillTitles(ctx: Ctx, items: MenuItem[] | undefined) {
   for (const it of items || []) {
     if (!it.text && it.file) {
       const m = await ctx.meta(it.file);
@@ -174,7 +203,10 @@ async function fillTitles(ctx, items) {
 // answer says where the literal lives, so the panel can name the file and a
 // writer could replace it.
 
-async function loadJS(ctx, rel) {
+// a JS/TS module, tokenized — or, from loadImport, a .json one (json + rel only)
+interface JSMod { rel: string; src: string; toks: Token[]; json?: Parsed }
+
+async function loadJS(ctx: Ctx, rel: string): Promise<JSMod | null> {
   const src = await ctx.read(rel);
   if (src == null) return null;
   return { rel, src, toks: tokenizeJS(src) };
@@ -182,7 +214,7 @@ async function loadJS(ctx, rel) {
 
 const JS_EXTS = ['', '.ts', '.mts', '.js', '.mjs', '.cjs', '.json', '/index.ts', '/index.js'];
 
-async function loadImport(ctx, fromRel, spec) {
+async function loadImport(ctx: Ctx, fromRel: string, spec: string): Promise<JSMod | null> {
   if (!spec.startsWith('.')) return null;           // a package — not ours to read
   const base = join(dirOf(fromRel), spec);
   for (const e of JS_EXTS) {
@@ -190,7 +222,7 @@ async function loadImport(ctx, fromRel, spec) {
     if (!hit) continue;
     if (hit.endsWith('.json')) {
       const text = await ctx.read(hit);
-      try { return { json: JSON.parse(text), rel: hit }; } catch { return null; }
+      try { return { json: JSON.parse(text!), rel: hit } as JSMod; } catch { return null; }
     }
     return loadJS(ctx, hit);
   }
@@ -198,7 +230,9 @@ async function loadImport(ctx, fromRel, spec) {
 }
 
 // -> { v, rel, span:[s,e], via } or { v: $dyn node, via } when it can't
-async function follow(ctx, mod, value, depth = 0) {
+interface Followed { v: Parsed; rel?: string; span?: Span; via?: string; json?: boolean }
+
+async function follow(ctx: Ctx, mod: JSMod, value: Parsed, depth = 0): Promise<Followed> {
   if (!isDyn(value) || depth > 4) return { v: value, rel: mod.rel };
   if (value.$ref) {
     const d = findDeclared(mod.src, mod.toks, value.$ref);
@@ -243,7 +277,7 @@ async function follow(ctx, mod, value, depth = 0) {
 // plain JSON-able data. Throws when any piece really needs running — a
 // call, a computed key, a template with ${} — because a menu with a hole in
 // it must never be written out as if it were whole (menu eject relies on it).
-async function plain(ctx, mod, v, depth = 0) {
+async function plain(ctx: Ctx, mod: JSMod, v: Parsed, depth = 0): Promise<Parsed> {
   if (depth > 12) throw new Error('too deep');
   if (isDyn(v)) {
     if (!v.$ref) throw new Error('built by code: ' + v.$dyn);
@@ -251,10 +285,10 @@ async function plain(ctx, mod, v, depth = 0) {
     if (r.json) return r.v;
     if (isDyn(r.v)) throw new Error('built by code: ' + v.$dyn);
     const home = r.rel && r.rel !== mod.rel ? await loadJS(ctx, r.rel) : mod;
-    return plain(ctx, home, r.v, depth + 1);
+    return plain(ctx, home!, r.v, depth + 1);
   }
   if (Array.isArray(v)) {
-    const out = [];
+    const out: Parsed[] = [];
     for (const x of v) {
       const sp = isDyn(x) && /^\.\.\.\s*([A-Za-z_$][\w$]*)$/.exec(x.$dyn);
       if (sp) {
@@ -267,7 +301,7 @@ async function plain(ctx, mod, v, depth = 0) {
   }
   if (v && typeof v === 'object') {
     if (v.$spread && v.$spread.length) throw new Error('object spread');
-    const out = {};
+    const out: Record<string, Parsed> = {};
     for (const [k, x] of Object.entries(v)) {
       if (!safeKey(k) || k.startsWith('[')) throw new Error('computed key');
       out[k] = await plain(ctx, mod, x, depth + 1);
@@ -278,7 +312,7 @@ async function plain(ctx, mod, v, depth = 0) {
 }
 
 // follow() for a findKeyed hit: a literal written right there keeps its own span
-async function followAt(ctx, mod, hit) {
+async function followAt(ctx: Ctx, mod: JSMod, hit: ReadResult): Promise<Followed> {
   const r = await follow(ctx, mod, hit.v);
   if (!isDyn(hit.v) && !r.span) r.span = [hit.s, hit.e];
   return r;
@@ -287,35 +321,36 @@ async function followAt(ctx, mod, hit) {
 // Where a code-written entry sits, for menuedit.ts: its own span in the
 // array, its `items` array's span (a group), and the span of the string its
 // label lives in — for { text: { en, ja } } the locale's own string.
-function spanInfo(node, arr, i, it, textKeys, lang) {
+function spanInfo(node: MenuItem, arr: ParsedArray, i: number, it?: Parsed, textKeys?: string[], lang?: string | null): MenuItem {
   if (arr && arr.$spans && arr.$spans[i]) node.span = arr.$spans[i];
   if (!it || typeof it !== 'object' || !it.$keys) return node;
-  const ik = it.$keys.find((k) => k.key === 'items');
+  const ik = it.$keys.find((k: KeyInfo) => k.key === 'items');
   if (ik && Array.isArray(it.items)) node.itemsSpan = [ik.s, ik.e];
-  for (const tk of textKeys) {
-    const k = it.$keys.find((x) => x.key === tk);
+  // (every caller passing `it` passes its label keys too)
+  for (const tk of textKeys!) {
+    const k = it.$keys.find((x: KeyInfo) => x.key === tk);
     if (!k) continue;
     node.textKey = tk;
     if (typeof it[tk] === 'string') node.textSpan = [k.s, k.e];
     else if (it[tk] && it[tk].$keys) {
-      const lk = it[tk].$keys.find((x) => x.key === lang) || it[tk].$keys.find((x) => x.key === 'en') || it[tk].$keys[0];
+      const lk = it[tk].$keys.find((x: KeyInfo) => x.key === lang) || it[tk].$keys.find((x: KeyInfo) => x.key === 'en') || it[tk].$keys[0];
       if (lk) node.textSpan = [lk.s, lk.e];
     }
     break;
   }
   return node;
 }
-const keySpan = (obj, key) => {
-  const k = obj && obj.$keys && obj.$keys.find((x) => x.key === key);
+const keySpan = (obj: Parsed, key: string): Span | null => {
+  const k = obj && obj.$keys && obj.$keys.find((x: KeyInfo) => x.key === key);
   return k ? [k.s, k.e] : null;
 };
 
-const dynItem = (node, what) => ({ text: what || 'Built by code', kind: 'dyn', note: node.$dyn });
+const dynItem = (node: DynNode, what?: string): MenuItem => ({ text: what || 'Built by code', kind: 'dyn', note: node.$dyn });
 
 // A label written as { en: 'Welcome', ja: 'ようこそ' } (i18n done by hand,
 // mapped by a helper at build time): pick the locale's, else English, else
 // the first.
-function pickText(t, lang) {
+function pickText(t: Parsed, lang?: string | null): string | null {
   if (typeof t === 'string') return t;
   if (t && typeof t === 'object' && !isDyn(t)) {
     if (lang && typeof t[lang] === 'string') return t[lang];
@@ -332,26 +367,49 @@ function pickText(t, lang) {
 // A project may hold several sites (a monorepo's docs/ and website/) — every
 // one found is read.
 
+interface Stub { config: string; root: string }
+
+// what an adapter reads; readAll fills in the rest of a Site
+interface SiteRead {
+  menus: Menu[];
+  notes: string[];
+  content?: string;
+  implicit?: string[];
+  rewrites?: [string, string][];
+}
+
+interface Adapter {
+  id: string;
+  label: string;
+  find(ctx: Ctx): Stub[];
+  read(ctx: Ctx, stub: Stub): Promise<SiteRead | null>;
+}
+
+// what a sort hands back: the node, and the position it was sorted by
+interface OrderEntry { pos: number | null; name: string; node: MenuItem }
+
+
 // ----------------------------------------------------------------- VitePress
 
-const vitepress = {
+const vitepress: Adapter = {
   id: 'vitepress', label: 'VitePress',
   find: (ctx) => ctx.rels.filter((r) => /(^|\/)\.vitepress\/config\.(m?[jt]s)$/.test(r))
     .map((config) => ({ config, root: dirOf(dirOf(config)) })),
   async read(ctx, { config, root }) {
-    const mod = await loadJS(ctx, config);
-    const site = { menus: [], notes: [] };
+    // (find() only offers configs that are there)
+    const mod = (await loadJS(ctx, config))!;
+    const site: SiteRead = { menus: [], notes: [] };
     const srcDir = findKeyed(mod.src, mod.toks, 'srcDir')[0];
     const content = join(root, typeof (srcDir && srcDir.v) === 'string' ? srcDir.v : '');
     site.content = content;
     // `rewrites: { 'en/:rest*': ':rest*' }` — a page's URL isn't its path.
     // Inverted, so a menu link can be walked back to the file.
     const rw = findKeyed(mod.src, mod.toks, 'rewrites')[0];
-    const rewrites = [];
+    const rewrites: [string, string][] = [];
     if (rw && rw.v && typeof rw.v === 'object' && !isDyn(rw.v)) {
       for (const [from, to] of Object.entries(rw.v)) if (typeof to === 'string') rewrites.push([from, to]);
     }
-    const res = (link, lang) => vpResolve(ctx, content, rewrites, link, lang);
+    const res = (link: string, lang: string | null) => vpResolve(ctx, content, rewrites, link, lang);
     site.rewrites = rewrites;
 
     const sidebars = findKeyed(mod.src, mod.toks, 'sidebar');
@@ -371,10 +429,11 @@ const vitepress = {
       let val = r.v, flat = false;
       if (!r.via && !json && (isDyn(val) || hasDyn(val))) {
         const home = r.rel && r.rel !== mod.rel ? await loadJS(ctx, r.rel) : mod;
-        try { val = await plain(ctx, home, val); flat = true; } catch { /* stays partly read */ }
+        try { val = await plain(ctx, home!, val); flat = true; } catch { /* stays partly read */ }
       }
       r.v = val;
-      const src = json ? { file: r.rel, kind: 'json' } : { file: r.rel || config, via: r.via || null, span: flat ? null : r.span || null };
+      // (a JSON sidebar was reached through an import, so it has its file)
+      const src: MenuSource = json ? { file: r.rel!, kind: 'json' } : { file: r.rel || config, via: r.via || null, span: flat ? null : r.span || null };
       const label = locale ? (locale === 'root' ? 'Sidebar' : 'Sidebar · ' + locale) : 'Sidebar';
       // ejecting replaces this `sidebar:` value, wherever it pointed
       const eject = flat ? { config, locale } : null;
@@ -388,7 +447,7 @@ const vitepress = {
       const base = lang ? '/' + lang : '';
       // …and when a helper builds it, the helper is what adds the prefix: the
       // page as written would be the wrong locale's, so it doesn't count
-      const resL = (l) => (base && !l.startsWith(base + '/') && res(base + l, lang))
+      const resL = (l: string) => (base && !l.startsWith(base + '/') && res(base + l, lang))
         || (base && r.via && !l.startsWith(base + '/') ? null : res(l, lang));
       if (Array.isArray(r.v)) {
         site.menus.push({ id: 'sidebar' + (locale ? ':' + locale : ''), label, scope: lang ? '/' + lang + '/' : null,
@@ -399,7 +458,8 @@ const vitepress = {
         // multi-sidebar: { '/guide/': [...], '/api/': { base, items } }
         for (const [scope, raw] of Object.entries(r.v)) {
           // '/api/': apiSidebar — each entry may be its own import
-          const fr = isDyn(raw) && !flat && !json ? await follow(ctx, { rel: r.rel, ...(await loadJS(ctx, r.rel)) }, raw) : { v: raw };
+          // (r.v is a literal here, so it came from a file: r.rel is set)
+          const fr: Followed = isDyn(raw) && !flat && !json ? await follow(ctx, { rel: r.rel, ...(await loadJS(ctx, r.rel!)) } as JSMod, raw) : { v: raw };
           const val = fr.v;
           const arr = Array.isArray(val) ? val : val && Array.isArray(val.items) ? val.items : null;
           const same = !(fr.rel && fr.rel !== r.rel);
@@ -440,8 +500,8 @@ const vitepress = {
 
 // jp: where `arr` sits in a sidebar kept as JSON — each entry then carries
 // its own JSON path (jpath) and a group its children's (listPath)
-function vpItems(arr, base, res, lang, jp = null) {
-  const out = [];
+function vpItems(arr: ParsedArray, base: string, res: (link: string) => string | null, lang?: string | null, jp: JsonPath | null = null): MenuItem[] {
+  const out: MenuItem[] = [];
   for (let i = 0; i < arr.length; i++) {
     const it = arr[i];
     if (isDyn(it)) { out.push(spanInfo(dynItem(it), arr, i)); continue; }
@@ -456,16 +516,17 @@ function vpItems(arr, base, res, lang, jp = null) {
     const b = typeof it.base === 'string' ? it.base : base;
     const link = typeof it.link === 'string' ? it.link : null;
     const full = link === null ? null : isExternal(link) ? link : b + link;
-    const node = link === null ? { text, kind: 'group' }
-      : isExternal(full) ? { text, kind: 'link', href: full }
-        : page(text, full, res(full));
+    // (full is set whenever link is)
+    const node: MenuItem = link === null ? { text, kind: 'group' }
+      : isExternal(full!) ? { text, kind: 'link', href: full! }
+        : page(text, full, res(full!));
     if (jp) node.jpath = [...jp, i];
     if (Array.isArray(it.items)) {
       if (jp) node.listPath = [...jp, i, 'items'];
       node.items = vpItems(it.items, b, res, lang, jp ? [...jp, i, 'items'] : null);
       if (b) node.childBase = b;                     // VitePress prefixes it to every link inside
       if (node.kind === 'page') node.kind = 'group';
-      if (link !== null) { node.link = full; node.file = res(full); }
+      if (link !== null) { node.link = full; node.file = res(full!); }
     } else if (isDyn(it.items)) node.items = [dynItem(it.items)];
     if (it.collapsed !== undefined) node.collapsed = !!it.collapsed;
     spanInfo(node, arr, i, it, ['text'], lang);
@@ -474,7 +535,7 @@ function vpItems(arr, base, res, lang, jp = null) {
   return out;
 }
 
-function vpResolve(ctx, content, rewrites, link, lang) {
+function vpResolve(ctx: Ctx, content: string, rewrites: [string, string][], link: string, lang: string | null | undefined): string | null {
   if (!link || isExternal(link)) return null;
   const direct = resolve(ctx, link, { root: content });
   if (direct) return direct;
@@ -487,7 +548,7 @@ function vpResolve(ctx, content, rewrites, link, lang) {
     // token by token: every literal escaped (the old escape list let * ? [ ]
     // through as regex), and no more params than real rewrites use — two
     // adjacent (.*) groups already backtrack polynomially.
-    const names = [];
+    const names: string[] = [];
     const src = to.split(/(:\w+\*?)/).map((s, i) => {
       if (i % 2 === 0) return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const star = s.endsWith('*');
@@ -509,15 +570,15 @@ function vpResolve(ctx, content, rewrites, link, lang) {
 
 // --------------------------------------------------------------- Docusaurus
 
-const docusaurus = {
+const docusaurus: Adapter = {
   id: 'docusaurus', label: 'Docusaurus',
   find: (ctx) => ctx.rels.filter((r) => /(^|\/)docusaurus\.config\.(m?[jt]s|cjs)$/.test(r))
     .map((config) => ({ config, root: dirOf(config) })),
   async read(ctx, { config, root }) {
-    const site = { menus: [], notes: [] };
-    const mod = await loadJS(ctx, config);
+    const site: SiteRead = { menus: [], notes: [] };
+    const mod = (await loadJS(ctx, config))!;
     // the docs plugin's options, wherever they sit (preset or plugin)
-    let docsPath = 'docs', sidebarPath = null;
+    let docsPath = 'docs', sidebarPath: string | false | null = null;
     for (const d of findKeyed(mod.src, mod.toks, 'docs')) {
       if (!d.v || typeof d.v !== 'object' || isDyn(d.v)) continue;
       if (typeof d.v.path === 'string') docsPath = d.v.path;
@@ -531,9 +592,9 @@ const docusaurus = {
     const content = join(root, docsPath);
     site.content = content;
     const ids = await docIds(ctx, content);
-    const byId = (id) => ids.get(String(id).replace(/^\//, '').toLowerCase()) || null;
+    const byId = (id: Parsed) => ids.get(String(id).replace(/^\//, '').toLowerCase()) || null;
 
-    let file = null;
+    let file: string | null = null;
     if (sidebarPath) file = ctx.has(join(root, sidebarPath));
     if (!file && sidebarPath !== false) {
       for (const n of ['sidebars.ts', 'sidebars.js', 'sidebars.mjs', 'sidebars.cjs', 'sidebars.json']) {
@@ -546,11 +607,12 @@ const docusaurus = {
         editable: true, complete: true, auto: true, items: await docuAuto(ctx, content, content, ids) });
       return site;
     }
-    let value, span = null;
+    let value: Parsed, span: Span | null = null;
     if (file.endsWith('.json')) {
-      try { value = JSON.parse(await ctx.read(file)); } catch { value = null; }
+      // (null reads as null — no sidebars)
+      try { value = JSON.parse((await ctx.read(file))!); } catch { value = null; }
     } else {
-      const sm = await loadJS(ctx, file);
+      const sm = (await loadJS(ctx, file))!;
       let got = findDeclared(sm.src, sm.toks, 'sidebars') || findDefaultExport(sm.src, sm.toks);
       if (got && isDyn(got.v)) { const r = await follow(ctx, sm, got.v); got = { ...got, v: r.v }; }
       value = got && got.v;
@@ -573,8 +635,8 @@ const docusaurus = {
 
 // Docusaurus doc ids: the path under docs/, extension and number prefixes
 // (`01-intro`) off, with front matter `id:` replacing the last segment.
-async function docIds(ctx, content) {
-  const ids = new Map();
+async function docIds(ctx: Ctx, content: string): Promise<Map<string, string>> {
+  const ids = new Map<string, string>();
   for (const rel of ctx.under(content)) {
     if (!/\.mdx?$/.test(rel)) continue;
     const sub = rel.slice(content ? content.length + 1 : 0);
@@ -587,20 +649,20 @@ async function docIds(ctx, content) {
   return ids;
 }
 
-async function docuLabel(ctx, rel) {
+async function docuLabel(ctx: Ctx, rel: string): Promise<string> {
   const { fm, title } = await ctx.meta(rel);
   return fm.sidebar_label || title || stem(rel);
 }
 
-async function docuItems(ctx, v, content, ids, byId) {
+async function docuItems(ctx: Ctx, v: Parsed, content: string, ids: Map<string, string>, byId: (id: Parsed) => string | null): Promise<MenuItem[]> {
   // shorthand: { 'Category': ['a', 'b'] } — keys are categories
   if (v && !Array.isArray(v) && typeof v === 'object' && !isDyn(v)) {
-    const out = [];
+    const out: MenuItem[] = [];
     for (const [label, kids] of Object.entries(v)) out.push(group(label, await docuItems(ctx, kids, content, ids, byId)));
     return out;
   }
   if (!Array.isArray(v)) return isDyn(v) ? [dynItem(v)] : [];
-  const out = [];
+  const out: MenuItem[] = [];
   for (let i = 0; i < v.length; i++) {
     const it = v[i];
     if (isDyn(it)) { out.push(spanInfo(dynItem(it), v, i)); continue; }
@@ -611,7 +673,7 @@ async function docuItems(ctx, v, content, ids, byId) {
     }
     if (!it || typeof it !== 'object') continue;
     const type = it.type || (it.items ? 'category' : it.href ? 'link' : it.id ? 'doc' : null);
-    let node = null;
+    let node: MenuItem | null = null;
     if (type === 'doc' || type === 'ref') {
       const f = byId(it.id);
       node = page(it.label || (f ? await docuLabel(ctx, f) : it.id), it.id, f);
@@ -643,9 +705,9 @@ async function docuItems(ctx, v, content, ids, byId) {
 // Docusaurus's own autogeneration: number prefixes and sidebar_position
 // order things, _category_.json / .yml names and orders folders, and a
 // folder's index/README (or its same-named doc) becomes the category's page.
-async function docuAuto(ctx, dir, content, ids) {
+async function docuAuto(ctx: Ctx, dir: string, content: string, ids: Map<string, string>): Promise<MenuItem[]> {
   const { files, dirs } = ctx.list(dir);
-  const entries = [];
+  const entries: OrderEntry[] = [];
   for (const f of files) {
     if (!/\.mdx?$/.test(f) || baseOf(f).startsWith('_')) continue;
     const { fm } = await ctx.meta(f);
@@ -654,7 +716,7 @@ async function docuAuto(ctx, dir, content, ids) {
   }
   for (const d of dirs) {
     if (baseOf(d).startsWith('_') || baseOf(d).startsWith('.')) continue;
-    let cat = {};
+    let cat: Parsed = {};
     for (const n of ['_category_.json', '_category_.yml', '_category_.yaml']) {
       const t = await ctx.read(join(d, n));
       if (t == null) continue;
@@ -677,11 +739,11 @@ async function docuAuto(ctx, dir, content, ids) {
   return orderBy(entries);
 }
 
-const num = (v) => (typeof v === 'number' ? v : typeof v === 'string' && v.trim() && !isNaN(+v) ? +v : null);
+const num = (v: Parsed): number | null => (typeof v === 'number' ? v : typeof v === 'string' && v.trim() && !isNaN(+v) ? +v : null);
 
 // Explicit positions first (ascending), then the rest by name — with
 // numeric awareness, so 2-x sorts before 10-x.
-function orderBy(entries, { desc = false } = {}) {
+function orderBy(entries: OrderEntry[], { desc = false } = {}): MenuItem[] {
   entries.sort((a, b) => {
     const pa = a.pos, pb = b.pos;
     if (pa !== null && pb !== null && pa !== pb) return desc ? pb - pa : pa - pb;
@@ -696,24 +758,24 @@ function orderBy(entries, { desc = false } = {}) {
 
 // ---------------------------------------------------------------- Starlight
 
-const starlight = {
+const starlight: Adapter = {
   id: 'starlight', label: 'Starlight',
   find: (ctx) => ctx.rels.filter((r) => /(^|\/)astro\.config\.(m?[jt]s)$/.test(r))
     .map((config) => ({ config, root: dirOf(config) })),
   async read(ctx, { config, root }) {
-    const mod = await loadJS(ctx, config);
+    const mod = (await loadJS(ctx, config))!;
     if (!/starlight/.test(mod.src)) return null;
     const content = join(root, 'src/content/docs');
-    const site = { menus: [], notes: [], content };
+    const site: SiteRead = { menus: [], notes: [], content };
     const sb = findKeyed(mod.src, mod.toks, 'sidebar').find((s) => keyPath(mod.toks, s.at).some((k) => k === 'starlight()'));
-    const slugs = new Map();
+    const slugs = new Map<string, string>();
     for (const rel of ctx.under(content)) {
       if (!/\.mdx?$|\.mdoc$/.test(rel)) continue;
       let slug = rel.slice(content.length + 1).replace(/\.(mdx?|mdoc)$/, '').toLowerCase();
       slug = slug.replace(/(^|\/)index$/, '');
       slugs.set(slug, rel);
     }
-    const bySlug = (s) => slugs.get(String(s).replace(/^\/|\/$/g, '').toLowerCase()) ?? null;
+    const bySlug = (s: Parsed) => slugs.get(String(s).replace(/^\/|\/$/g, '').toLowerCase()) ?? null;
     if (!sb) {
       site.menus.push({ id: 'auto', label: 'Sidebar (autogenerated)', scope: null, source: { file: content, kind: 'folders' },
         editable: true, complete: true, auto: true, items: await starAuto(ctx, content) });
@@ -734,13 +796,13 @@ const starlight = {
   },
 };
 
-async function starLabel(ctx, rel) {
+async function starLabel(ctx: Ctx, rel: string): Promise<string> {
   const { fm, title } = await ctx.meta(rel);
   return (fm.sidebar && fm.sidebar.label) || title || stem(rel);
 }
 
-async function starItems(ctx, arr, content, bySlug) {
-  const out = [];
+async function starItems(ctx: Ctx, arr: ParsedArray, content: string, bySlug: (s: Parsed) => string | null): Promise<MenuItem[]> {
+  const out: MenuItem[] = [];
   for (let i = 0; i < arr.length; i++) {
     const it = arr[i];
     if (isDyn(it)) { out.push(spanInfo(dynItem(it), arr, i)); continue; }
@@ -750,7 +812,7 @@ async function starItems(ctx, arr, content, bySlug) {
       continue;
     }
     if (!it || typeof it !== 'object') continue;
-    let node;
+    let node: MenuItem;
     const label = pickText(it.label) || '';
     if (it.slug) { const f = bySlug(it.slug); node = page(label || (f ? await starLabel(ctx, f) : it.slug), it.slug, f); }
     else if (typeof it.link === 'string') {
@@ -769,9 +831,9 @@ async function starItems(ctx, arr, content, bySlug) {
   return out;
 }
 
-async function starAuto(ctx, dir) {
+async function starAuto(ctx: Ctx, dir: string): Promise<MenuItem[]> {
   const { files, dirs } = ctx.list(dir);
-  const entries = [];
+  const entries: OrderEntry[] = [];
   for (const f of files) {
     if (!/\.(mdx?|mdoc)$/.test(f)) continue;
     const { fm } = await ctx.meta(f);
@@ -787,14 +849,15 @@ async function starAuto(ctx, dir) {
 
 // ------------------------------------------------------------------- MkDocs
 
-const mkdocs = {
+const mkdocs: Adapter = {
   id: 'mkdocs', label: 'MkDocs',
   find: (ctx) => ctx.rels.filter((r) => /(^|\/)mkdocs\.ya?ml$/.test(r)).map((config) => ({ config, root: dirOf(config) })),
   async read(ctx, { config, root }) {
-    let y;
-    try { y = parseYAML(await ctx.read(config)) || {}; } catch { y = {}; }
+    let y: Parsed;
+    // (an unreadable file throws, and reads as {})
+    try { y = parseYAML((await ctx.read(config))!) || {}; } catch { y = {}; }
     const content = join(root, typeof y.docs_dir === 'string' ? y.docs_dir : 'docs');
-    const site = { menus: [], notes: [], content };
+    const site: SiteRead = { menus: [], notes: [], content };
     if (Array.isArray(y.nav)) {
       const items = mkItems(ctx, y.nav, content);
       await fillTitles(ctx, items);
@@ -802,13 +865,13 @@ const mkdocs = {
       // be handed out depth-first, and menuedit.ts edits them like a list
       const lines = ((await ctx.read(config)) || '').split('\n');
       const at = lines.findIndex((l) => /^nav\s*:\s*$/.test(l));
-      const dash = [];
+      const dash: number[] = [];
       for (let n = at + 1; at >= 0 && n < lines.length; n++) {
         if (/^\S/.test(lines[n]) && !/^-/.test(lines[n])) break;
         if (/^\s*-\s/.test(lines[n])) dash.push(n);
       }
       let k = 0;
-      const give = (list) => { for (const it of list) { it.line = dash[k++]; give(it.items || []); } };
+      const give = (list: MenuItem[]): void => { for (const it of list) { it.line = dash[k++]; give(it.items || []); } };
       give(items);
       const ok = at >= 0 && k === dash.length;
       site.menus.push({ id: 'nav', label: 'Navigation', scope: null, source: { file: config, kind: ok ? 'yamllist' : 'yaml', key: 'nav' },
@@ -821,8 +884,8 @@ const mkdocs = {
   },
 };
 
-function mkItems(ctx, list, content) {
-  const out = [];
+function mkItems(ctx: Ctx, list: Parsed, content: string): MenuItem[] {
+  const out: MenuItem[] = [];
   for (const it of list || []) {
     if (typeof it === 'string') {
       out.push(isExternal(it) ? { text: it, kind: 'link', href: it } : page('', it, resolve(ctx, it, { root: content })));
@@ -841,12 +904,12 @@ function mkItems(ctx, list, content) {
 
 // No nav: MkDocs lists the folders alphabetically, index/README first —
 // and the awesome-pages plugin's `.pages` files reorder and retitle them.
-async function mkAuto(ctx, dir) {
+async function mkAuto(ctx: Ctx, dir: string): Promise<MenuItem[]> {
   const { files, dirs } = ctx.list(dir);
-  let pages = null;
+  let pages: Parsed = null;
   const t = await ctx.read(join(dir, '.pages'));
   if (t) { try { pages = parseYAML(t); } catch { pages = null; } }
-  const nodes = new Map();
+  const nodes = new Map<string, MenuItem>();
   for (const f of files) {
     if (!/\.md$/i.test(f)) continue;
     const { title } = await ctx.meta(f);
@@ -867,37 +930,40 @@ async function mkAuto(ctx, dir) {
     return ia !== ib ? (ia ? -1 : 1) : a.localeCompare(b);
   });
   if (pages && Array.isArray(pages.nav)) {
-    const out = [];
-    const used = new Set();
+    const out: MenuItem[] = [];
+    const used = new Set<string>();
     let rest = -1;
     for (const e of pages.nav) {
       if (e === '...') { rest = out.length; continue; }
-      if (typeof e === 'string' && nodes.has(e)) { out.push(nodes.get(e)); used.add(e); }
+      if (typeof e === 'string' && nodes.has(e)) { out.push(nodes.get(e)!); used.add(e); }
       else if (e && typeof e === 'object') {
+        // (a string `v` came with its title)
         const [title, v] = Object.entries(e)[0] || [];
-        if (typeof v === 'string' && nodes.has(v)) { const n = nodes.get(v); n.text = title; out.push(n); used.add(v); }
-        else if (typeof v === 'string' && isExternal(v)) out.push({ text: title, kind: 'link', href: v });
+        if (typeof v === 'string' && nodes.has(v)) { const n = nodes.get(v)!; n.text = title!; out.push(n); used.add(v); }
+        else if (typeof v === 'string' && isExternal(v)) out.push({ text: title!, kind: 'link', href: v });
       }
     }
-    if (rest >= 0) out.splice(rest, 0, ...names.filter((n) => !used.has(n)).map((n) => nodes.get(n)));
+    if (rest >= 0) out.splice(rest, 0, ...names.filter((n) => !used.has(n)).map((n) => nodes.get(n)!));
     return out;
   }
-  return names.map((n) => nodes.get(n));
+  return names.map((n) => nodes.get(n)!);
 }
+
 
 // ----------------------------------------------------------------- Mintlify
 
-const mintlify = {
+const mintlify: Adapter = {
   id: 'mintlify', label: 'Mintlify',
   find: (ctx) => ctx.rels.filter((r) => /(^|\/)(docs|mint)\.json$/.test(r)).map((config) => ({ config, root: dirOf(config) })),
   async read(ctx, { config, root }) {
-    let j;
-    try { j = JSON.parse(await ctx.read(config)); } catch { return null; }
+    let j: Parsed;
+    // (null parses to null, which is turned away below)
+    try { j = JSON.parse((await ctx.read(config))!); } catch { return null; }
     if (!j || !j.navigation) return null;
-    const site = { menus: [], notes: [], content: root };
-    const res = (p) => resolve(ctx, '/' + p, { root, exts: ['mdx', 'md'] });
+    const site: SiteRead = { menus: [], notes: [], content: root };
+    const res = (p: string) => resolve(ctx, '/' + p, { root, exts: ['mdx', 'md'] });
     // jpath: where each entry sits in the JSON, for menuedit.ts
-    const pagesOf = (list, jp) => (list || []).map((p, i) => {
+    const pagesOf = (list: Parsed, jp: JsonPath): MenuItem[] => (list || []).map((p: Parsed, i: number) => {
       if (typeof p === 'string') return page('', p, res(p), { jpath: [...jp, i] });
       if (p && typeof p === 'object' && p.group) {
         const g = group(p.group, pagesOf(p.pages, [...jp, i, 'pages']), { jpath: [...jp, i], listPath: [...jp, i, 'pages'] });
@@ -909,7 +975,7 @@ const mintlify = {
     }).filter(Boolean);
     const LEVELS = [['tabs', 'tab'], ['anchors', 'anchor'], ['dropdowns', 'dropdown'],
       ['versions', 'version'], ['languages', 'language'], ['products', 'product']];
-    const walk = (nav, trail, jp) => {
+    const walk = (nav: Parsed, trail: string[], jp: JsonPath): boolean => {
       let found = false;
       for (const [key, name] of LEVELS) {
         if (!Array.isArray(nav[key])) continue;
@@ -939,8 +1005,8 @@ const mintlify = {
     // mint.json: navigation is the array of groups itself
     if (Array.isArray(j.navigation)) {
       walk({ groups: j.navigation }, [], []);
-      const fix = (items) => { for (const it of items || []) {
-        for (const k of ['jpath', 'listPath']) if (it[k] && it[k][0] === 'groups') it[k] = ['navigation', ...it[k].slice(1)];
+      const fix = (items: MenuItem[] | undefined): void => { for (const it of items || []) {
+        for (const k of ['jpath', 'listPath'] as const) if (it[k] && it[k][0] === 'groups') it[k] = ['navigation', ...it[k]!.slice(1)];
         fix(it.items);
       } };
       for (const m of site.menus) fix(m.items);
@@ -957,10 +1023,10 @@ const mintlify = {
 // _Sidebar.md: a Markdown list of links, nested by indent, with headings as
 // part titles. One reader; each system only differs in where links point.
 
-function parseMdList(text, res, { wiki = false } = {}) {
+function parseMdList(text: string, res: (t: string) => string | null, { wiki = false } = {}): MenuItem[] {
   const lines = text.replace(/\r\n?/g, '\n').split('\n');
-  const root = [];
-  const stack = [{ ind: -1, items: root }];
+  const root: MenuItem[] = [];
+  const stack: { ind: number; items: MenuItem[]; node?: MenuItem }[] = [{ ind: -1, items: root }];
   let firstH1 = true;
   for (let n = 0; n < lines.length; n++) {
     const line = lines[n];
@@ -969,19 +1035,19 @@ function parseMdList(text, res, { wiki = false } = {}) {
     if (h) {
       // GitBook's "# Table of contents" (or mdBook's "# Summary") names the file, not a part
       if (h[1].length === 1 && firstH1 && !root.length) { firstH1 = false; continue; }
-      const g = { text: h[2], kind: 'sep', line: n };
+      const g: MenuItem = { text: h[2], kind: 'sep', line: n };
       root.push(g);
       stack.length = 1;
       continue;
     }
     if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { root.push({ text: '', kind: 'sep', line: n }); stack.length = 1; continue; }
-    let li = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/.exec(line);
+    let li: string[] | null = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/.exec(line);
     // mdBook's prefix/suffix chapters: a bare link on its own line
     if (!li && /^\[[^\]]*\]\([^)]*\)\s*$/.test(line)) { stack.length = 1; li = [line, '', '', line.trim()]; }
     if (!li) continue;
     const ind = li[1].replace(/\t/g, '    ').length;
     const body = li[3].trim();
-    let node;
+    let node: MenuItem;
     // the (target) is taken whole by a linear regex and picked apart by
     // hand: the old one-regex form overlapped \s*, a lazy target and more
     // \s* — an unclosed `[a](` + spaces backtracked for seconds, freezing
@@ -1010,22 +1076,22 @@ function parseMdList(text, res, { wiki = false } = {}) {
     stack.push({ ind, items: node.items, node });
   }
   // a part heading's following items belong to it, for display
-  const out = [];
-  let cur = null;
+  const out: MenuItem[] = [];
+  let cur: MenuItem | null = null;
   for (const it of root) {
     if (it.kind === 'sep' && it.text) { cur = group(it.text, [], { part: true, line: it.line }); out.push(cur); continue; }
     if (it.kind === 'sep') { cur = null; out.push(it); continue; }
-    (cur ? cur.items : out).push(it);
+    (cur ? cur.items! : out).push(it);
   }
-  const tidy = (items) => { for (const it of items) { if (it.items && !it.items.length && it.kind !== 'group') delete it.items; else if (it.items) tidy(it.items); } };
+  const tidy = (items: MenuItem[]): void => { for (const it of items) { if (it.items && !it.items.length && it.kind !== 'group') delete it.items; else if (it.items) tidy(it.items); } };
   tidy(out);
   return out;
 }
 
-const gitbook = {
+const gitbook: Adapter = {
   id: 'gitbook', label: 'GitBook',
   find(ctx) {
-    const out = [];
+    const out: Stub[] = [];
     const seen = new Set();
     // .gitbook.yaml can move the root and rename the summary
     for (const r of ctx.rels.filter((x) => /(^|\/)SUMMARY\.md$/.test(x))) {
@@ -1052,7 +1118,7 @@ const gitbook = {
   },
 };
 
-const mdbook = {
+const mdbook: Adapter = {
   id: 'mdbook', label: 'mdBook',
   find: (ctx) => ctx.rels.filter((r) => /(^|\/)book\.toml$/.test(r)).map((config) => ({ config, root: dirOf(config) })),
   async read(ctx, { config, root }) {
@@ -1060,14 +1126,14 @@ const mdbook = {
     const src = join(root, (toml.book && toml.book.src) || 'src');
     const file = ctx.has(join(src, 'SUMMARY.md'));
     if (!file) return { content: src, menus: [], notes: ['No src/SUMMARY.md — mdBook needs one.'] };
-    const items = parseMdList(await ctx.read(file), (t) => resolve(ctx, t, { root: src, from: src }));
+    const items = parseMdList((await ctx.read(file))!, (t) => resolve(ctx, t, { root: src, from: src }));
     await fillTitles(ctx, items);
     return { content: src, notes: [], menus: [{ id: 'summary', label: 'Summary', scope: null,
       source: { file, kind: 'mdlist' }, editable: true, complete: true, items, flavor: 'relative' }] };
   },
 };
 
-const docsify = {
+const docsify: Adapter = {
   id: 'docsify', label: 'Docsify',
   find(ctx) {
     const side = ctx.rels.filter((r) => /(^|\/)_sidebar\.md$/.test(r));
@@ -1079,11 +1145,11 @@ const docsify = {
     return tops.map((root) => ({ root, config: join(root, '_sidebar.md') }));
   },
   async read(ctx, { root }) {
-    const menus = [];
+    const menus: Menu[] = [];
     for (const r of ctx.rels.filter((x) => /(^|\/)_(sidebar|navbar)\.md$/.test(x) && (!root || x.startsWith(root + '/') || dirOf(x) === root))) {
       const dir = dirOf(r);
       const nav = /_navbar\.md$/.test(r);
-      const items = parseMdList(await ctx.read(r), (t) => resolve(ctx, t, { root, from: root }));
+      const items = parseMdList((await ctx.read(r))!, (t) => resolve(ctx, t, { root, from: root }));
       await fillTitles(ctx, items);
       const scope = dir === root ? null : '/' + dir.slice(root ? root.length + 1 : 0) + '/';
       menus.push({ id: r, label: nav ? 'Navbar' : scope ? 'Sidebar ' + scope : 'Sidebar', scope, top: nav,
@@ -1093,11 +1159,11 @@ const docsify = {
   },
 };
 
-const ghwiki = {
+const ghwiki: Adapter = {
   id: 'wiki', label: 'GitHub Wiki',
   find: (ctx) => ctx.rels.filter((r) => /(^|\/)_Sidebar\.md$/.test(r)).map((config) => ({ config, root: dirOf(config) })),
   async read(ctx, { config, root }) {
-    const items = parseMdList(await ctx.read(config), (t) => resolve(ctx, t, { root, from: root }), { wiki: true });
+    const items = parseMdList((await ctx.read(config))!, (t) => resolve(ctx, t, { root, from: root }), { wiki: true });
     await fillTitles(ctx, items);
     return { content: root, notes: [], menus: [{ id: 'sidebar', label: 'Sidebar', scope: null,
       source: { file: config, kind: 'mdlist' }, editable: true, complete: true, items, flavor: 'wiki' }] };
@@ -1106,13 +1172,13 @@ const ghwiki = {
 
 // ------------------------------------------------------------------ Antora
 
-const antora = {
+const antora: Adapter = {
   id: 'antora', label: 'Antora',
   find: (ctx) => ctx.rels.filter((r) => /(^|\/)antora\.ya?ml$/.test(r)).map((config) => ({ config, root: dirOf(config) })),
   async read(ctx, { config, root }) {
-    let y;
-    try { y = parseYAML(await ctx.read(config)) || {}; } catch { y = {}; }
-    const site = { content: join(root, 'modules'), menus: [], notes: [] };
+    let y: Parsed;
+    try { y = parseYAML((await ctx.read(config))!) || {}; } catch { y = {}; }
+    const site: SiteRead = { content: join(root, 'modules'), menus: [], notes: [] };
     for (const navRel of Array.isArray(y.nav) ? y.nav : []) {
       const file = ctx.has(join(root, navRel));
       if (!file) { site.notes.push('Missing nav file ' + navRel); continue; }
@@ -1125,10 +1191,10 @@ const antora = {
   },
 };
 
-async function antoraNav(ctx, text, root, module) {
-  const out = [];
-  const stack = [{ depth: 0, items: out }];
-  let title = null;
+async function antoraNav(ctx: Ctx, text: string | null, root: string, module: string): Promise<MenuItem[] & { $title?: string }> {
+  const out: MenuItem[] & { $title?: string } = [];
+  const stack: { depth: number; items: MenuItem[] }[] = [{ depth: 0, items: out }];
+  let title: string | null = null;
   for (const line of (text || '').split('\n')) {
     const t = /^\.(\S.*)$/.exec(line);
     if (t && !title) { title = t[1].trim(); continue; }
@@ -1136,7 +1202,7 @@ async function antoraNav(ctx, text, root, module) {
     if (!m) continue;
     const depth = m[1].length;
     const body = m[2].trim();
-    let node;
+    let node: MenuItem;
     const x = /^xref:(?:([^:[\]]+):)?([^[\]]+)\[([^\]]*)\]/.exec(body);
     const l = /^(?:link:)?(https?:\/\/[^[\s]+)\[([^\]]*)\]/.exec(body);
     if (x) {
@@ -1149,7 +1215,7 @@ async function antoraNav(ctx, text, root, module) {
     node.items = node.items || [];
     stack.push({ depth, items: node.items });
   }
-  const tidy = (items) => { for (const it of items) { if (it.items && !it.items.length && it.kind !== 'group') delete it.items; else if (it.items) { if (it.kind === 'page') it.kind = 'group'; tidy(it.items); } } };
+  const tidy = (items: MenuItem[]): void => { for (const it of items) { if (it.items && !it.items.length && it.kind !== 'group') delete it.items; else if (it.items) { if (it.kind === 'page') it.kind = 'group'; tidy(it.items); } } };
   tidy(out);
   if (title) Object.defineProperty(out, '$title', { value: title, enumerable: false });
   return out;
@@ -1157,7 +1223,7 @@ async function antoraNav(ctx, text, root, module) {
 
 // --------------------------------------------------------------- Writerside
 
-const writerside = {
+const writerside: Adapter = {
   id: 'writerside', label: 'Writerside',
   find: (ctx) => ctx.rels.filter((r) => /\.tree$/.test(r)).map((config) => ({ config, root: dirOf(config) })),
   async read(ctx, { config, root }) {
@@ -1166,22 +1232,23 @@ const writerside = {
     const cfg = await ctx.read(join(root, 'writerside.cfg'));
     const td = cfg && /<topics\s+dir="([^"]+)"/.exec(cfg);
     const topics = join(root, td ? td[1] : 'topics');
-    const out = [];
+    const out: MenuItem[] = [];
     const stack = [out];
     const re = /<toc-element\b([^>]*?)(\/?)>|<\/toc-element>/g;
-    let m;
+    let m: RegExpExecArray | null;
     while ((m = re.exec(xml))) {
       if (m[0].startsWith('</')) { if (stack.length > 1) stack.pop(); continue; }
-      const attr = (n) => { const a = new RegExp('\\b' + n + '="([^"]*)"').exec(m[1]); return a ? a[1] : null; };
+      const attr = (n: string) => { const a = new RegExp('\\b' + n + '="([^"]*)"').exec(m![1]); return a ? a[1] : null; };
       const topic = attr('topic');
       const href = attr('href');
-      const node = topic ? page(attr('toc-title') || '', topic, ctx.has(join(topics, topic)))
+      const node: MenuItem = topic ? page(attr('toc-title') || '', topic, ctx.has(join(topics, topic)))
         : href ? { text: attr('toc-title') || href, kind: 'link', href } : group(attr('toc-title') || '', []);
       node.items = [];
       stack[stack.length - 1].push(node);
       if (!m[2]) stack.push(node.items);
     }
-    const tidy = (items) => { for (const it of items) { if (!it.items.length && it.kind !== 'group') delete it.items; else { if (it.kind === 'page') it.kind = 'group'; tidy(it.items); } } };
+    // (every node here was given an `items`)
+    const tidy = (items: MenuItem[]): void => { for (const it of items) { if (!it.items!.length && it.kind !== 'group') delete it.items; else { if (it.kind === 'page') it.kind = 'group'; tidy(it.items!); } } };
     tidy(out);
     await fillTitles(ctx, out);
     const name = /<instance-profile[^>]*\bname="([^"]+)"/.exec(xml);
@@ -1192,17 +1259,17 @@ const writerside = {
 
 // ------------------------------------------------------------------- Quarto
 
-const quarto = {
+const quarto: Adapter = {
   id: 'quarto', label: 'Quarto',
   find: (ctx) => ctx.rels.filter((r) => /(^|\/)_quarto\.ya?ml$/.test(r)).map((config) => ({ config, root: dirOf(config) })),
   async read(ctx, { config, root }) {
-    let y;
-    try { y = parseYAML(await ctx.read(config)) || {}; } catch { y = {}; }
-    const site = { content: root, menus: [], notes: [] };
-    const res = (p) => resolve(ctx, p, { root, from: root });
+    let y: Parsed;
+    try { y = parseYAML((await ctx.read(config))!) || {}; } catch { y = {}; }
+    const site: SiteRead = { content: root, menus: [], notes: [] };
+    const res = (p: string) => resolve(ctx, p, { root, from: root });
     // ylabel / ychild: the keys an entry's name and children live under,
     // for menuedit.ts (a bare `- page.qmd` has neither until it's renamed)
-    const items = (list) => yamlItems(list, (c) => {
+    const items = (list: Parsed): MenuItem[] => yamlItems(list, (c) => {
       if (typeof c === 'string') {
         if (c === 'auto') return { text: 'Everything (auto)', kind: 'auto' };
         if (/^-{3,}$/.test(c)) return { text: '', kind: 'sep' };
@@ -1226,7 +1293,7 @@ const quarto = {
     });
     const w = y.website || {};
     const sbs = Array.isArray(w.sidebar) ? w.sidebar : w.sidebar ? [w.sidebar] : [];
-    sbs.forEach((sb, k) => {
+    sbs.forEach((sb: Parsed, k: number) => {
       site.menus.push({ id: sb.id || 'sidebar' + k, label: sb.title || (sbs.length > 1 ? 'Sidebar ' + (k + 1) : 'Sidebar'),
         scope: null, source: { file: config, kind: 'yamlmap' }, editable: true, flavor: 'quarto',
         complete: !JSON.stringify(sb.contents || '').includes('auto'), items: items(sb.contents) });
@@ -1251,19 +1318,19 @@ const quarto = {
 
 // ------------------------------------------------------------ Jupyter Book
 
-const jupyterbook = {
+const jupyterbook: Adapter = {
   id: 'jupyterbook', label: 'Jupyter Book',
   find: (ctx) => ctx.rels.filter((r) => /(^|\/)(_toc\.ya?ml|myst\.ya?ml)$/.test(r)).map((config) => ({ config, root: dirOf(config) })),
   async read(ctx, { config, root }) {
-    let y;
-    try { y = parseYAML(await ctx.read(config)) || {}; } catch { return null; }
-    const res = (p) => resolve(ctx, p, { root, from: root, exts: ['md', 'ipynb', 'rst', 'myst'] });
-    const site = { content: root, menus: [], notes: [] };
+    let y: Parsed;
+    try { y = parseYAML((await ctx.read(config))!) || {}; } catch { return null; }
+    const res = (p: string) => resolve(ctx, p, { root, from: root, exts: ['md', 'ipynb', 'rst', 'myst'] });
+    const site: SiteRead = { content: root, menus: [], notes: [] };
     if (/myst\.ya?ml$/.test(config)) {
       // Jupyter Book 2 / MyST: project.toc
       const toc = y.project && y.project.toc;
       if (!Array.isArray(toc)) return null;
-      const items = (list) => yamlItems(list, (e) => {
+      const items = (list: Parsed): MenuItem[] => yamlItems(list, (e) => {
         if (!e || typeof e !== 'object') return null;
         if (e.file) {
           const p = page(e.title || '', e.file, res(e.file), { ylabel: 'title', ychild: 'children' });
@@ -1278,9 +1345,9 @@ const jupyterbook = {
       site.menus.push({ id: 'toc', label: 'Table of contents', scope: null, source: { file: config, kind: 'yamlmap' },
         editable: true, flavor: 'myst', complete: !JSON.stringify(toc).includes('pattern'), items: items(toc) });
     } else {
-      const entries = (list) => yamlItems(list, (e) => {
+      const entries = (list: Parsed): MenuItem[] => yamlItems(list, (e) => {
         if (!e || typeof e !== 'object') return null;
-        let node;
+        let node: MenuItem;
         if (e.file) node = page(e.title || '', e.file, res(e.file), { ylabel: 'title', ychild: 'sections' });
         else if (e.url) return { text: e.title || e.url, kind: 'link', href: e.url, ylabel: 'title' };
         else if (e.glob) return { text: e.glob, kind: 'auto' };
@@ -1289,7 +1356,7 @@ const jupyterbook = {
         if (kids) { node.items = entries(kids); node.kind = 'group'; node.ychild = e.sections ? 'sections' : 'chapters'; }
         return node;
       });
-      const items = [];
+      const items: MenuItem[] = [];
       if (y.root) items.push(page('', y.root, res(y.root)));
       if (Array.isArray(y.parts)) {
         items.push(...yamlItems(y.parts, (p) => group(p.caption || '', entries(p.chapters || p.sections),
@@ -1310,7 +1377,7 @@ const jupyterbook = {
 // root document and followed page by page. Read-only — the "menu" is spread
 // through the documents themselves.
 
-const sphinx = {
+const sphinx: Adapter = {
   id: 'sphinx', label: 'Sphinx',
   find: (ctx) => ctx.rels.filter((r) => /(^|\/)conf\.py$/.test(r)).map((config) => ({ config, root: dirOf(config) })),
   async read(ctx, { config, root }) {
@@ -1320,12 +1387,12 @@ const sphinx = {
     const start = resolve(ctx, (rd ? rd[1] : 'index'), { root, from: root, exts });
     if (!start) return null;
     const seen = new Set([start]);
-    const walk = async (rel, depth) => {
+    const walk = async (rel: string, depth: number): Promise<MenuItem[]> => {
       if (depth > 8) return [];
       const text = (await ctx.read(rel)) || '';
-      const out = [];
+      const out: MenuItem[] = [];
       for (const tt of toctrees(text, extOf(rel) === 'rst')) {
-        const kids = [];
+        const kids: MenuItem[] = [];
         for (const e of tt.entries) {
           if (e.glob) { kids.push({ text: e.target, kind: 'auto' }); continue; }
           if (e.target === 'self') continue;
@@ -1351,25 +1418,28 @@ const sphinx = {
   },
 };
 
-function toctrees(text, rst) {
-  const out = [];
+interface TocTree { caption: string | null; entries: { title: string | null; target: string; glob: boolean }[] }
+
+function toctrees(text: string, rst: boolean): TocTree[] {
+  const out: TocTree[] = [];
   const lines = text.split('\n');
   for (let i = 0; i < lines.length; i++) {
-    let body = null;
+    let body: string[] | null = null;
     if (rst && /^\s*\.\.\s+toctree::/.test(lines[i])) {
       body = [];
-      const ind0 = lines[i].match(/^\s*/)[0].length;
+      const ind0 = lines[i].match(/^\s*/)![0].length;
       for (i++; i < lines.length; i++) {
-        if (lines[i].trim() && lines[i].match(/^\s*/)[0].length <= ind0) { i--; break; }
+        if (lines[i].trim() && lines[i].match(/^\s*/)![0].length <= ind0) { i--; break; }
         body.push(lines[i].trim());
       }
     } else if (!rst && /^\s*(`{3,}|:{3,})\s*\{toctree\}/.test(lines[i])) {
-      const fence = lines[i].trim().match(/^(`{3,}|:{3,})/)[1];
+      const fence = lines[i].trim().match(/^(`{3,}|:{3,})/)![1];
       body = [];
       for (i++; i < lines.length && !lines[i].trim().startsWith(fence); i++) body.push(lines[i].trim());
     }
     if (!body) continue;
-    const tt = { caption: null, entries: [] };
+    const tt: TocTree = { caption: null, entries: [] };
+
     let glob = false;
     let inYaml = false;
     for (const l of body) {
@@ -1395,7 +1465,7 @@ function toctrees(text, rst) {
 // Fumadocs' meta.json, Nextra's _meta.json / _meta.js and Rspress's
 // _meta.json: each folder says how its own children are ordered and named.
 
-const fumadocs = {
+const fumadocs: Adapter = {
   id: 'fumadocs', label: 'Fumadocs',
   find(ctx) {
     const metas = ctx.rels.filter((r) => /(^|\/)meta\.json$/.test(r)
@@ -1414,16 +1484,16 @@ const fumadocs = {
   },
 };
 
-async function readJSON(ctx, rel) {
+async function readJSON(ctx: Ctx, rel: string): Promise<Parsed> {
   const t = await ctx.read(rel);
   if (t == null) return null;
   try { return JSON.parse(t); } catch { return null; }
 }
 
-async function fumaDir(ctx, dir) {
+async function fumaDir(ctx: Ctx, dir: string): Promise<MenuItem[]> {
   const { files, dirs } = ctx.list(dir);
   const meta = (await readJSON(ctx, join(dir, 'meta.json'))) || {};
-  const nodes = new Map();
+  const nodes = new Map<string, MenuItem>();
   // meta: { dir, key } — the folder whose meta.json lists this entry and the
   // string it's listed as (menutree.ts rewrites `pages` from these)
   for (const f of files) {
@@ -1442,10 +1512,10 @@ async function fumaDir(ctx, dir) {
     nodes.set(baseOf(d), g);
   }
   const all = [...nodes.keys()].sort((a, b) => (a === 'index' ? -1 : b === 'index' ? 1 : a.localeCompare(b)));
-  if (!Array.isArray(meta.pages)) return all.map((k) => nodes.get(k));
-  const out = [];
-  const used = new Set();
-  const excluded = new Set(meta.pages.filter((p) => typeof p === 'string' && p.startsWith('!')).map((p) => p.slice(1)));
+  if (!Array.isArray(meta.pages)) return all.map((k) => nodes.get(k)!);
+  const out: MenuItem[] = [];
+  const used = new Set<string>();
+  const excluded = new Set<string>(meta.pages.filter((p: Parsed) => typeof p === 'string' && p.startsWith('!')).map((p: string) => p.slice(1)));
   for (const x of excluded) { const n = nodes.get(x); if (n && n.file) ctx.hidden.add(n.file); }
   let rest = -1, restRev = false;
   for (const p of meta.pages) {
@@ -1461,33 +1531,34 @@ async function fumaDir(ctx, dir) {
     }
     if (p.startsWith('...') && nodes.has(p.slice(3))) {
       // a folder spread into this one: its pages belong to ITS meta.json
-      const g = nodes.get(p.slice(3));
+      const g = nodes.get(p.slice(3))!;
       out.push(...(g.items || []));
       used.add(p.slice(3));
       continue;
     }
     const key = p.replace(/\.mdx?$/, '');
-    if (nodes.has(key)) { const n = nodes.get(key); n.meta = { dir, key: p }; out.push(n); used.add(key); }
+    if (nodes.has(key)) { const n = nodes.get(key)!; n.meta = { dir, key: p }; out.push(n); used.add(key); }
     else out.push(page(p, p, null, { meta: { dir, key: p } }));      // listed, but no such page
   }
   if (rest >= 0) {
     let left = all.filter((k) => !used.has(k) && !excluded.has(k));
     if (restRev) left = left.reverse();
     // marked, so a rewrite of this list can keep `...` where they were
-    for (const k of left) nodes.get(k).meta = { ...nodes.get(k).meta, rest: true };
-    out.splice(rest, 0, ...left.map((k) => nodes.get(k)));
+    for (const k of left) nodes.get(k)!.meta = { ...nodes.get(k)!.meta!, rest: true };
+    out.splice(rest, 0, ...left.map((k) => nodes.get(k)!));
   }
   return out;
 }
 
-const nextra = {
+const nextra: Adapter = {
   id: 'nextra', label: 'Nextra',
   find(ctx) {
     const metas = ctx.rels.filter((r) => /(^|\/)_meta\.(json|[jt]sx?)$/.test(r));
     if (!metas.length) return [];
     const tops = metas.map(dirOf).sort((a, b) => a.length - b.length)
       .filter((d, i, all) => !all.slice(0, i).some((t) => !t || d.startsWith(t + '/')));
-    return tops.map((root) => ({ root, config: metas.find((m) => dirOf(m) === root) }));
+    // (each root is the folder of one of the metas)
+    return tops.map((root) => ({ root, config: metas.find((m) => dirOf(m) === root)! }));
   },
   async read(ctx, { root, config }) {
     // Rspress also uses _meta.json, but as an ARRAY — let that adapter have it
@@ -1496,7 +1567,7 @@ const nextra = {
     const items = await nextraDir(ctx, root);
     const pages = items.filter((i) => !i.top);
     const tops = items.filter((i) => i.top);
-    const menus = [{ id: 'sidebar', label: 'Sidebar', scope: null, source: { file: config, kind: 'meta-tree' },
+    const menus: Menu[] = [{ id: 'sidebar', label: 'Sidebar', scope: null, source: { file: config, kind: 'meta-tree' },
       editable: !first.dyn, flavor: 'nextra', metaRoot: root, complete: !first.dyn, items: pages }];
     if (tops.length) menus.push({ id: 'nav', label: 'Top bar', top: true, scope: null, source: { file: config },
       editable: false, complete: true, items: tops });
@@ -1504,24 +1575,24 @@ const nextra = {
   },
 };
 
-async function nextraMeta(ctx, dir) {
+async function nextraMeta(ctx: Ctx, dir: string): Promise<{ rel: string | null; value: Parsed; dyn?: boolean }> {
   for (const n of ['_meta.json', '_meta.js', '_meta.ts', '_meta.jsx', '_meta.tsx']) {
     const rel = ctx.has(join(dir, n));
     if (!rel) continue;
     if (n.endsWith('.json')) return { rel, value: await readJSON(ctx, rel) };
-    const mod = await loadJS(ctx, rel);
-    let got = findDefaultExport(mod.src, mod.toks);
+    const mod = (await loadJS(ctx, rel))!;
+    let got: { v: Parsed } | null = findDefaultExport(mod.src, mod.toks);
     if (got && isDyn(got.v)) got = { v: (await follow(ctx, mod, got.v)).v };
     return { rel, value: got && !isDyn(got.v) ? got.v : null, dyn: !got || isDyn(got.v) };
   }
   return { rel: null, value: null };
 }
 
-async function nextraDir(ctx, dir) {
+async function nextraDir(ctx: Ctx, dir: string): Promise<MenuItem[]> {
   const { files, dirs } = ctx.list(dir);
   const m = await nextraMeta(ctx, dir);
-  const meta = m.value && typeof m.value === 'object' && !Array.isArray(m.value) ? m.value : {};
-  const nodes = new Map();
+  const meta: Record<string, Parsed> = m.value && typeof m.value === 'object' && !Array.isArray(m.value) ? m.value : {};
+  const nodes = new Map<string, MenuItem>();
   for (const f of files) {
     if (!/\.mdx?$/.test(f) || baseOf(f).startsWith('_')) continue;
     const key = /^page\.mdx?$/.test(baseOf(f)) ? 'index' : stem(f);   // app router: page.mdx
@@ -1536,12 +1607,12 @@ async function nextraDir(ctx, dir) {
     if (idx >= 0) { g.file = kids[idx].file; kids.splice(idx, 1); }
     nodes.set(baseOf(d), g);
   }
-  const out = [];
-  const used = new Set();
+  const out: MenuItem[] = [];
+  const used = new Set<string>();
   for (const [key, v] of Object.entries(meta)) {
     if (key === '*') continue;
-    const o = typeof v === 'string' ? { title: v } : v && typeof v === 'object' && !isDyn(v) ? v : {};
-    if (o.display === 'hidden') { used.add(key); if (nodes.get(key) && nodes.get(key).file) ctx.hidden.add(nodes.get(key).file); continue; }
+    const o: Parsed = typeof v === 'string' ? { title: v } : v && typeof v === 'object' && !isDyn(v) ? v : {};
+    if (o.display === 'hidden') { used.add(key); if (nodes.get(key) && nodes.get(key)!.file) ctx.hidden.add(nodes.get(key)!.file!); continue; }
     if (o.type === 'separator') { out.push({ text: typeof o.title === 'string' ? o.title : '', kind: 'sep', meta: { dir, key } }); continue; }
     if (o.href) { out.push({ text: typeof o.title === 'string' ? o.title : key, kind: 'link', href: o.href, top: o.type === 'page' || o.type === 'menu', meta: { dir, key } }); continue; }
     const n = nodes.get(key);
@@ -1555,14 +1626,14 @@ async function nextraDir(ctx, dir) {
   return out;
 }
 
-const rspress = {
+const rspress: Adapter = {
   id: 'rspress', label: 'Rspress',
   find: (ctx) => ctx.rels.filter((r) => /(^|\/)rspress\.config\.(m?[jt]s)$/.test(r)).map((config) => ({ config, root: dirOf(config) })),
   async read(ctx, { config, root }) {
-    const mod = await loadJS(ctx, config);
+    const mod = (await loadJS(ctx, config))!;
     const rk = findKeyed(mod.src, mod.toks, 'root')[0];
     const content = join(root, rk && typeof rk.v === 'string' ? rk.v : 'docs');
-    const site = { content, menus: [], notes: [] };
+    const site: SiteRead = { content, menus: [], notes: [] };
     // a sidebar in the config wins, and has VitePress's shape
     const sb = findKeyed(mod.src, mod.toks, 'sidebar').find((s) => keyPath(mod.toks, s.at).includes('themeConfig'));
     if (sb) {
@@ -1585,19 +1656,19 @@ const rspress = {
   },
 };
 
-async function rsDir(ctx, dir) {
+async function rsDir(ctx: Ctx, dir: string): Promise<MenuItem[]> {
   const meta = await readJSON(ctx, join(dir, '_meta.json'));
   const { files, dirs } = ctx.list(dir);
   // meta: { dir, entry } — the folder's _meta.json and the element (string
   // or object) that lists this entry, which menutree.ts moves as written
-  const mk = async (name, label, entry) => {
+  const mk = async (name: string, label: Parsed, entry: Parsed): Promise<MenuItem> => {
     const d = ctx.has(join(dir, name)) ? null : dirs.find((x) => baseOf(x) === name);
     if (d) return group(label || baseOf(d), await rsDir(ctx, d), { meta: { dir, entry, key: name, isDir: true }, dir: d });
     const f = resolve(ctx, name, { root: dir, from: dir });
     return page(label || (f ? (await ctx.meta(f)).title : '') || name, name, f, { meta: { dir, entry, key: name } });
   };
   if (!Array.isArray(meta)) {
-    const out = [];
+    const out: MenuItem[] = [];
     for (const f of files) if (/\.mdx?$/.test(f)) out.push(page((await ctx.meta(f)).title || stem(f), null, f, { meta: { dir, entry: stem(f), key: stem(f) } }));
     for (const d of dirs) {
       const k = await rsDir(ctx, d);
@@ -1605,7 +1676,7 @@ async function rsDir(ctx, dir) {
     }
     return out;
   }
-  const out = [];
+  const out: MenuItem[] = [];
   for (const e of meta) {
     if (typeof e === 'string') out.push(await mk(e, undefined, e));
     else if (e && e.type === 'divider') out.push({ text: '', kind: 'sep', meta: { dir, entry: e } });
@@ -1620,23 +1691,23 @@ async function rsDir(ctx, dir) {
 
 // --------------------------------------------- front-matter-ordered sites
 
-const hugo = {
+const hugo: Adapter = {
   id: 'hugo', label: 'Hugo',
   find: (ctx) => ctx.rels.filter((r) => /(^|\/)(hugo|config)\.(toml|ya?ml|json)$/.test(r)
     && !/(^|\/)_config\.ya?ml$/.test(r)).map((config) => ({ config, root: dirOf(config) })),
   async read(ctx, { config, root }) {
     const text = (await ctx.read(config)) || '';
     // config.toml is a common name — only a Hugo site has content/ beside it
-    let cfg = {};
+    let cfg: Parsed = {};
     try { cfg = config.endsWith('.toml') ? parseTOMLish(text) : config.endsWith('.json') ? JSON.parse(text) : parseYAML(text) || {}; } catch { cfg = {}; }
     const content = join(root, cfg.contentDir || 'content');
     if (!ctx.rels.some((r) => r.startsWith(content + '/') && /\.md$/.test(r))) return null;
     if (/^config\./.test(baseOf(config)) && !/baseURL|baseurl|theme/.test(text)) return null;
-    const site = { content, menus: [], notes: [] };
-    const label = async (rel) => { const { fm, title } = await ctx.meta(rel); return fm.linkTitle || fm.linktitle || title || stem(rel); };
-    const tree = async (dir) => {
+    const site: SiteRead = { content, menus: [], notes: [] };
+    const label = async (rel: string): Promise<string> => { const { fm, title } = await ctx.meta(rel); return fm.linkTitle || fm.linktitle || title || stem(rel); };
+    const tree = async (dir: string): Promise<MenuItem[]> => {
       const { files, dirs } = ctx.list(dir);
-      const entries = [];
+      const entries: OrderEntry[] = [];
       for (const f of files) {
         if (!/\.md$/.test(f) || /^_index\.md$/.test(baseOf(f))) continue;
         const { fm } = await ctx.meta(f);
@@ -1658,32 +1729,32 @@ const hugo = {
     site.menus.push({ id: 'sections', label: 'Sections (by weight)', scope: null, source: { file: content, kind: 'frontmatter', key: 'weight' },
       editable: true, complete: true, auto: true, items: await tree(content) });
     // front-matter menus: `menu: main` / `menu: { main: { weight, parent } }`
-    const named = new Map();
+    const named = new Map<string, { rel: string; o: Parsed }[]>();
     for (const rel of ctx.under(content)) {
       if (!/\.md$/.test(rel)) continue;
       const { fm } = await ctx.meta(rel);
       if (!fm.menu) continue;
-      const add = (name, o = {}) => {
+      const add = (name: string, o: Parsed = {}) => {
         if (!named.has(name)) named.set(name, []);
-        named.get(name).push({ rel, o });
+        named.get(name)!.push({ rel, o });
       };
       if (typeof fm.menu === 'string') add(fm.menu);
-      else if (Array.isArray(fm.menu)) fm.menu.forEach((n) => add(String(n)));
+      else if (Array.isArray(fm.menu)) fm.menu.forEach((n: Parsed) => add(String(n)));
       else if (typeof fm.menu === 'object') for (const [n, o] of Object.entries(fm.menu)) add(n, o || {});
     }
     for (const [name, list] of named) {
-      const nodes = [];
+      const nodes: HugoEntry[] = [];
       for (const { rel, o } of list) {
         nodes.push({ pos: num(o.weight ?? (await ctx.meta(rel)).fm.weight), name: rel,
           node: page(o.name || await label(rel), null, rel), parent: o.parent, id: o.identifier || o.name || (await label(rel)) });
       }
-      const top = [];
-      const byId = new Map(nodes.map((n) => [n.id, n]));
+      const top: HugoEntry[] = [];
+      const byId = new Map(nodes.map((n): [Parsed, HugoEntry] => [n.id, n]));
       for (const n of nodes) {
         const p = n.parent && byId.get(n.parent);
         if (p) { (p.kids ||= []).push(n); } else top.push(n);
       }
-      const build = (ns) => orderBy(ns.map((n) => { if (n.kids) { n.node.kind = 'group'; n.node.items = build(n.kids); } return n; }));
+      const build = (ns: HugoEntry[]): MenuItem[] => orderBy(ns.map((n) => { if (n.kids) { n.node.kind = 'group'; n.node.items = build(n.kids); } return n; }));
       site.menus.push({ id: 'menu:' + name, label: 'Menu “' + name + '”', scope: null, source: { file: content, kind: 'frontmatter', key: 'menu' },
         editable: false, complete: false, top: name === 'main', items: build(top) });
     }
@@ -1692,23 +1763,30 @@ const hugo = {
   },
 };
 
-const jekyll = {
+// a Hugo front-matter menu entry, before it's sorted into place
+interface HugoEntry extends OrderEntry { parent: Parsed; id: Parsed; kids?: HugoEntry[] }
+
+// a Just the Docs page, and its entry in the tree
+interface JtdDoc { rel: string; fm: FrontMatter; title: Parsed }
+interface JtdEntry extends OrderEntry { d: JtdDoc; kids?: JtdEntry[] }
+
+const jekyll: Adapter = {
   id: 'jekyll', label: 'Jekyll',
   find: (ctx) => ctx.rels.filter((r) => /(^|\/)_config\.ya?ml$/.test(r)).map((config) => ({ config, root: dirOf(config) })),
   async read(ctx, { config, root }) {
-    let cfg;
-    try { cfg = parseYAML(await ctx.read(config)) || {}; } catch { cfg = {}; }
-    const site = { content: root, menus: [], notes: [] };
+    let cfg: Parsed;
+    try { cfg = parseYAML((await ctx.read(config))!) || {}; } catch { cfg = {}; }
+    const site: SiteRead = { content: root, menus: [], notes: [] };
     // _data/navigation.yml (Minimal Mistakes and friends): { name: [ {title, url, children} ] }
     const navData = await ctx.read(join(root, '_data/navigation.yml'));
     if (navData) {
-      let y = {};
+      let y: Parsed = {};
       try { y = parseYAML(navData) || {}; } catch { y = {}; }
-      const res = (u) => resolve(ctx, String(u).replace(/\/$/, '') || '/', { root });
-      const items = (list) => yamlItems(list, (e) => {
+      const res = (u: Parsed) => resolve(ctx, String(u).replace(/\/$/, '') || '/', { root });
+      const items = (list: Parsed): MenuItem[] => yamlItems(list, (e) => {
         if (!e || typeof e !== 'object') return null;
         const y = { ylabel: 'title', ychild: 'children' };
-        const n = e.children ? group(e.title || '', items(e.children), y) : e.url && isExternal(e.url)
+        const n: MenuItem = e.children ? group(e.title || '', items(e.children), y) : e.url && isExternal(e.url)
           ? { text: e.title || e.url, kind: 'link', href: e.url, ...y } : page(e.title || '', e.url || '', e.url ? res(e.url) : null, y);
         if (e.children && e.url) { n.link = e.url; n.file = res(e.url); }
         return n;
@@ -1722,16 +1800,16 @@ const jekyll = {
     // Just the Docs: parent / grand_parent titles and nav_order in front matter
     const theme = String(cfg.theme || cfg.remote_theme || '');
     if (/just-the-docs/.test(theme)) {
-      const docs = [];
+      const docs: JtdDoc[] = [];
       for (const rel of ctx.under(root)) {
         if (!/\.(md|markdown)$/.test(rel) || /(^|\/)(_site|vendor|node_modules|_includes|_layouts)\//.test(rel)) continue;
         const { fm, title } = await ctx.meta(rel);
         if (!fm.title || fm.nav_exclude) { if (fm.nav_exclude) ctx.hidden.add(rel); continue; }
         docs.push({ rel, fm, title: fm.title || title });
       }
-      const key = (d) => [d.fm.grand_parent || '', d.fm.parent || '', d.title].join('\u0000');
-      const nodes = new Map(docs.map((d) => [key(d), { pos: num(d.fm.nav_order), name: d.title, node: page(d.title, null, d.rel, { fm: 'jtd' }), d }]));
-      const top = [];
+      const key = (d: JtdDoc) => [d.fm.grand_parent || '', d.fm.parent || '', d.title].join('\u0000');
+      const nodes = new Map(docs.map((d): [string, JtdEntry] => [key(d), { pos: num(d.fm.nav_order), name: d.title, node: page(d.title, null, d.rel, { fm: 'jtd' }), d }]));
+      const top: JtdEntry[] = [];
       for (const n of nodes.values()) {
         const fm = n.d.fm;
         const p = fm.parent && (nodes.get([fm.grand_parent ? '' : '', fm.grand_parent || '', fm.parent].join('\u0000'))
@@ -1739,7 +1817,7 @@ const jekyll = {
         if (p) (p.kids ||= []).push(n);
         else top.push(n);
       }
-      const build = (ns) => orderBy(ns.map((n) => { if (n.kids) { n.node.kind = 'group'; n.node.items = build(n.kids); } return n; }));
+      const build = (ns: JtdEntry[]): MenuItem[] => orderBy(ns.map((n) => { if (n.kids) { n.node.kind = 'group'; n.node.items = build(n.kids); } return n; }));
       site.menus.push({ id: 'jtd', label: 'Navigation (Just the Docs)', scope: null, source: { file: root, kind: 'frontmatter', key: 'nav_order' },
         editable: true, complete: true, auto: true, items: build(top) });
     }
@@ -1747,31 +1825,31 @@ const jekyll = {
   },
 };
 
-const retype = {
+const retype: Adapter = {
   id: 'retype', label: 'Retype',
   find: (ctx) => ctx.rels.filter((r) => /(^|\/)retype\.ya?ml$/.test(r)).map((config) => ({ config, root: dirOf(config) })),
   async read(ctx, { config, root }) {
-    let cfg;
-    try { cfg = parseYAML(await ctx.read(config)) || {}; } catch { cfg = {}; }
+    let cfg: Parsed;
+    try { cfg = parseYAML((await ctx.read(config))!) || {}; } catch { cfg = {}; }
     const content = join(root, cfg.input || '.');
     // Retype: higher `order` first; folders read index.yml for label/order
-    const tree = async (dir) => {
+    const tree = async (dir: string): Promise<MenuItem[]> => {
       const { files, dirs } = ctx.list(dir);
-      const entries = [];
+      const entries: OrderEntry[] = [];
       for (const f of files) {
         if (!/\.md$/.test(f)) continue;
         const { fm, title } = await ctx.meta(f);
         if (fm.visibility === 'hidden') continue;
-        entries.push({ pos: num(fm.order) === null ? null : -num(fm.order), name: baseOf(f), node: page(fm.label || title || stem(f), null, f, { fm: 'retype' }) });
+        entries.push({ pos: num(fm.order) === null ? null : -num(fm.order)!, name: baseOf(f), node: page(fm.label || title || stem(f), null, f, { fm: 'retype' }) });
       }
       for (const d of dirs) {
         if (/(^|\/)(node_modules|\.retype)$/.test(d)) continue;
         const kids = await tree(d);
         if (!kids.length) continue;
-        let meta = {};
+        let meta: Parsed = {};
         const t = await ctx.read(join(d, 'index.yml'));
         if (t) { try { meta = parseYAML(t) || {}; } catch { meta = {}; } }
-        entries.push({ pos: num(meta.order) === null ? null : -num(meta.order), name: baseOf(d), node: group(meta.label || baseOf(d), kids, { fm: 'retype', dir: d }) });
+        entries.push({ pos: num(meta.order) === null ? null : -num(meta.order)!, name: baseOf(d), node: group(meta.label || baseOf(d), kids, { fm: 'retype', dir: d }) });
       }
       return orderBy(entries);
     };
@@ -1782,7 +1860,7 @@ const retype = {
 
 // Docusaurus first: a Docusaurus site's docs folder also has _category_
 // files, and a Nextra/Fumadocs check would otherwise claim it.
-export const ADAPTERS = [vitepress, docusaurus, starlight, mkdocs, mintlify, mdbook, gitbook, docsify, ghwiki,
+export const ADAPTERS: Adapter[] = [vitepress, docusaurus, starlight, mkdocs, mintlify, mdbook, gitbook, docsify, ghwiki,
   antora, writerside, quarto, jupyterbook, sphinx, rspress, fumadocs, nextra, hugo, jekyll, retype];
 
 // ============================================================== the API
@@ -1794,14 +1872,14 @@ const DOT_DIR = /(^|\/)\.(?!vitepress\/|gitbook\/|github\/|nib\/)[^/]+\//;
 
 // Every site in the project, with its menus. `files` is the project's file
 // list (rel paths or {rel}); `read(rel)` returns text or null.
-export async function readSites(io) {
+export async function readSites(io: MenuIO): Promise<Site[]> {
   return (await readAll(io)).sites;
 }
 
 // A list link's (target) minus an optional "title" and <angle brackets> —
 // by hand, not by regex: `\s*"[^"]*"$` is quadratic on a long run of spaces
 // before an unclosed quote.
-function mdTarget(raw) {
+function mdTarget(raw: string): string {
   let t = raw.trim();
   if (t.endsWith('"')) {
     const q = t.lastIndexOf('"', t.length - 2);
@@ -1811,21 +1889,21 @@ function mdTarget(raw) {
   return t;
 }
 
-async function readAll({ files, read }) {
+async function readAll({ files, read }: MenuIO): Promise<{ sites: Site[]; ctx: Ctx }> {
   const ctx = makeCtx({ files: files.filter((f) => { const r = typeof f === 'string' ? f : f.rel; return !SKIP.test(r) && !DOT_DIR.test(r); }), read });
-  const sites = [];
-  const claimed = [];       // content roots already owned by a site found earlier
+  const sites: Site[] = [];
+  const claimed: string[] = [];       // content roots already owned by a site found earlier
   for (const a of ADAPTERS) {
     for (const stub of a.find(ctx)) {
-      let site;
+      let site: SiteRead | null;
       try { site = await a.read(ctx, stub); } catch (e) {
-        site = { menus: [], notes: ['Couldn’t read ' + stub.config + ': ' + (e && e.message)], content: stub.root };
+        site = { menus: [], notes: ['Couldn’t read ' + stub.config + ': ' + (e && (e as Error).message)], content: stub.root };
       }
       if (!site) continue;
       // a Nextra/Fumadocs guess inside a site we already know is that site's furniture
       if ((a.id === 'nextra' || a.id === 'fumadocs' || a.id === 'gitbook' || a.id === 'docsify')
           && claimed.some((c) => stub.root === c || stub.root.startsWith(c ? c + '/' : ''))) continue;
-      const s = { system: a.id, label: a.label, root: stub.root, config: stub.config, content: site.content ?? stub.root,
+      const s: Site = { system: a.id, label: a.label, root: stub.root, config: stub.config, content: site.content ?? stub.root,
         menus: site.menus || [], notes: site.notes || [], implicit: site.implicit || [], rewrites: site.rewrites || [] };
       for (const m of s.menus) { m.key = s.system + ':' + s.root + ':' + m.id; }
       sites.push(s);
@@ -1839,12 +1917,13 @@ async function readAll({ files, read }) {
 
 // How one menu reads a link it holds — the same rules its reader used —
 // so an added page's link can be checked before it's written.
-function resolverFor(ctx, site, menu) {
+function resolverFor(ctx: Ctx, site: Site, menu: Menu): (t: string) => string | null {
   const content = site.content || '';
   const lang = menu.scope && /^\/[a-z]{2}(-[A-Za-z]+)?\/$/.test(menu.scope) ? menu.scope.slice(1, -1) : null;
+  // (readAll gives every site its rewrites)
   switch (menu.flavor) {
-    case 'vitepress': return (t) => (lang && !t.startsWith('/' + lang + '/') && vpResolve(ctx, content, site.rewrites, '/' + lang + t, lang))
-      || vpResolve(ctx, content, site.rewrites, t, lang);
+    case 'vitepress': return (t) => (lang && !t.startsWith('/' + lang + '/') && vpResolve(ctx, content, site.rewrites!, '/' + lang + t, lang))
+      || vpResolve(ctx, content, site.rewrites!, t, lang);
     case 'relative': { const d = dirOf(menu.source.file); return (t) => resolve(ctx, t, { root: d, from: d }); }
     case 'docsify': return (t) => resolve(ctx, t, { root: content, from: content });
     case 'wiki': return (t) => resolve(ctx, t.replace(/ /g, '-'), { root: content, from: content });
@@ -1853,23 +1932,24 @@ function resolverFor(ctx, site, menu) {
     case 'quarto': case 'myst': return (t) => resolve(ctx, t, { root: site.root, from: site.root });
     case 'jbook': return (t) => resolve(ctx, t, { root: site.root, from: site.root, exts: ['md', 'ipynb', 'rst', 'myst'] });
     case 'jekyll': return (t) => resolve(ctx, String(t).replace(/\/$/, '') || '/', { root: site.root });
-    case 'docusaurus': { const back = new Map(Object.entries(menu.ids || {}).map(([f, id]) => [id, f])); return (t) => back.get(t) || null; }
-    case 'starlight': { const back = new Map(Object.entries(menu.slugs || {}).map(([f, sl]) => [sl || '/', f])); return (t) => back.get(t) || null; }
+    case 'docusaurus': { const back = new Map(Object.entries(menu.ids || {}).map(([f, id]): [string, string] => [id, f])); return (t) => back.get(t) || null; }
+    case 'starlight': { const back = new Map(Object.entries(menu.slugs || {}).map(([f, sl]): [string, string] => [sl || '/', f])); return (t) => back.get(t) || null; }
     default: return () => null;
   }
 }
 
 // The `base:` in force for entries landing at index path `to` (`where`
 // 'inside' = among its children) — undefined when none.
-function locateItem(menu, to, where) {
+function locateItem(menu: Menu, to: string, where: string | undefined): string | undefined {
   const ids = String(to).split('.').map(Number);
-  let list = menu.items, base = menu.base, item = null;
+  let list: MenuItem[] | undefined = menu.items, base = menu.base, item: MenuItem | null | undefined = null;
   for (let k = 0; k < ids.length; k++) {
     item = list && list[ids[k]];
     if (!item) return base;
     if (k < ids.length - 1) { base = item.childBase || base; list = item.items; }
   }
-  return where === 'inside' ? (item.childBase || base) : base;
+  // (ids is never empty, so the loop found an item)
+  return where === 'inside' ? (item!.childBase || base) : base;
 }
 
 // One edit to one menu. `op` is
@@ -1880,9 +1960,10 @@ function locateItem(menu, to, where) {
 // null means the end of the menu. Returns { writes: [{ file, text }] } —
 // usually one file (the menu's own), several for a menu spread across front
 // matter or per-folder meta files — or { error }.
-export async function editMenu({ files, read, key, op }) {
+export async function editMenu({ files, read, key, op }: MenuIO & { key: string; op: MenuOp }): Promise<EditResult> {
   const { sites, ctx } = await readAll({ files, read });
-  let site = null, menu = null;
+  // (found together: site is set whenever menu is)
+  let site: Site | null = null, menu: Menu | null = null;
   for (const s of sites) for (const m of s.menus) if (m.key === key) { site = s; menu = m; }
   if (!menu) return { error: 'That menu isn’t there any more.' };
   if (op.kind === 'eject') return ejectMenu(ctx, menu);
@@ -1893,7 +1974,7 @@ export async function editMenu({ files, read, key, op }) {
     if (op.kind === 'move' && op.to != null && (!target || !target.fm)) return { error: 'An autogenerated entry can only move among its own folder’s entries.' };
     return fmEdit(ctx, menu, op);
   }
-  if (op.kind === 'move' && op.to != null && (locateIn(menu, op.to) || {}).fm) {
+  if (op.kind === 'move' && op.to != null && (locateIn(menu, op.to) || {} as Partial<MenuItem>).fm) {
     return { error: 'That part of the menu is generated from the folder — add the page there by moving its file.' };
   }
   if (menu.source && menu.source.kind === 'meta-tree') return metaEdit(ctx, menu, op);
@@ -1902,7 +1983,8 @@ export async function editMenu({ files, read, key, op }) {
   if (text == null) return { error: 'Couldn’t read ' + file + '.' };
   let o = { ...op };
   if (o.kind === 'add') {
-    let link = linkFor(site, menu, o.file, resolverFor(ctx, site, menu));
+    // (an add always names its file — main.ts checks it's a string)
+    let link = linkFor(site!, menu, o.file!, resolverFor(ctx, site!, menu));
     if (!link) return { error: 'Couldn’t work out a link this menu would follow to ' + o.file + '.' };
     // a VitePress `base:` on the list it lands in is prefixed to the link
     // at build time — so the link is written without it
@@ -1910,19 +1992,20 @@ export async function editMenu({ files, read, key, op }) {
     const base = dest === null ? menu.base : dest;
     if (base && link.startsWith(base)) link = link.slice(base.length) || 'index';
     o.link = link;
-    if (o.text === undefined) o.text = (await ctx.meta(o.file)).title || stem(o.file);
+    if (o.text === undefined) o.text = (await ctx.meta(o.file!)).title || stem(o.file!);
   }
-  const r = applyEdit(site, menu, text, o);
+  const r = applyEdit(site!, menu, text, o);
   if (r.error) return r;
   if (r.text === text) return { error: 'Nothing changed.' };
-  return { writes: [{ file, text: r.text }] };
+  // (an edit without an error has its text)
+  return { writes: [{ file, text: r.text! }] };
 }
 
 // VitePress: a sidebar assembled from pieces (spreads, named parts, other
 // files) moves into a JSON file next to the config, which then imports it —
 // one literal-free file Nib edits as JSON from then on. Written out from the
 // sidebar as the site builds it, and refused if any piece needs running.
-async function ejectMenu(ctx, menu) {
+async function ejectMenu(ctx: Ctx, menu: Menu): Promise<EditResult> {
   if (!menu.eject) return { error: 'Only a sidebar put together from pieces can be moved to a JSON file.' };
   const { config, locale } = menu.eject;
   const mod = await loadJS(ctx, config);
@@ -1935,9 +2018,9 @@ async function ejectMenu(ctx, menu) {
   if (!sb) return { error: 'The sidebar isn’t in ' + config + ' any more.' };
   const r = await followAt(ctx, mod, sb);
   const home = r.rel && r.rel !== mod.rel ? await loadJS(ctx, r.rel) : mod;
-  let value;
-  try { value = await plain(ctx, home, r.v); } catch (e) {
-    return { error: 'Part of this sidebar is built by code (' + e.message.replace(/^built by code: /, '') + '), so it can’t be written out whole.' };
+  let value: Parsed;
+  try { value = await plain(ctx, home!, r.v); } catch (e) {
+    return { error: 'Part of this sidebar is built by code (' + (e as Error).message.replace(/^built by code: /, '') + '), so it can’t be written out whole.' };
   }
   // names that don't collide: sidebar.json (sidebar.ja.json), sidebarJson
   const dir = dirOf(config);
@@ -1972,8 +2055,8 @@ async function ejectMenu(ctx, menu) {
   return { writes: [{ file: config, text: src }, { file, text: JSON.stringify(value, null, 2) + '\n' }] };
 }
 
-function locateIn(menu, at) {
-  let list = menu.items, it = null;
+function locateIn(menu: Menu, at: string): MenuItem | null | undefined {
+  let list: MenuItem[] | undefined = menu.items, it: MenuItem | null | undefined = null;
   for (const k of String(at).split('.')) { it = list && list[+k]; if (!it) return null; list = it.items; }
   return it;
 }
@@ -1981,7 +2064,7 @@ function locateIn(menu, at) {
 // Source offsets -> line numbers, so a right-click can open the menu's file
 // AT an entry. Markdown-list readers already know their lines; code ones
 // know character spans. Spans are dropped after — the page has no use for them.
-async function addLines(sites, ctx) {
+async function addLines(sites: Site[], ctx: Ctx) {
   for (const s of sites) {
     for (const m of s.menus) {
       const f = m.source && m.source.file;
@@ -1989,13 +2072,13 @@ async function addLines(sites, ctx) {
       if (!text) continue;
       const starts = [0];
       for (let i = 0; i < text.length; i++) if (text[i] === '\n') starts.push(i + 1);
-      const lineOf = (off) => {
+      const lineOf = (off: number) => {
         let lo = 0, hi = starts.length - 1;
         while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (starts[mid] <= off) lo = mid; else hi = mid - 1; }
         return lo;
       };
       if (m.source.span) m.source.line = lineOf(m.source.span[0]);
-      const walk = (items) => {
+      const walk = (items: MenuItem[] | undefined): void => {
         for (const it of items || []) {
           if (it.span) it.line = lineOf(it.span[0]);
           walk(it.items);
@@ -2009,10 +2092,10 @@ async function addLines(sites, ctx) {
 // Dead entries (a link that lands on nothing) and orphans (a page under the
 // site's content folder that no menu reaches). Orphans are only claimed when
 // every menu of the site was read whole.
-function annotate(site, ctx) {
-  const reached = new Set();
-  const dead = [];
-  const walk = (items, trail, menu) => {
+function annotate(site: Site, ctx: Ctx) {
+  const reached = new Set<string>();
+  const dead: DeadLink[] = [];
+  const walk = (items: MenuItem[] | undefined, trail: string[], menu: Menu): void => {
     for (const it of items || []) {
       if (it.file) reached.add(it.file);
       if ((it.kind === 'page' || (it.kind === 'group' && it.link)) && !it.file && it.link && !it.draft) {
@@ -2026,7 +2109,7 @@ function annotate(site, ctx) {
   // a whole folder of dead entries whose folder doesn't exist at all is
   // almost always generated at build time (typedoc, an API reference) —
   // said once, not as a hundred red rows
-  const gone = new Map();
+  const gone = new Map<string, number>();
   for (const d of dead) {
     const seg = String(d.link).replace(/^\.?\//, '').split('/')[0];
     if (!seg || /\./.test(seg) || d.link.split('/').filter(Boolean).length < 2) continue;
@@ -2037,7 +2120,7 @@ function annotate(site, ctx) {
   site.generated = [...gone].filter(([, n]) => n >= 3).map(([seg, n]) => ({ dir: seg, count: n }));
   const gen = new Set(site.generated.map((g) => g.dir));
   for (const d of dead) d.generated = gen.has(String(d.link).replace(/^\.?\//, '').split('/')[0]);
-  const markGen = (items) => { for (const it of items || []) {
+  const markGen = (items: MenuItem[] | undefined): void => { for (const it of items || []) {
     if (it.missing && gen.has(String(it.link).replace(/^\.?\//, '').split('/')[0])) it.generated = true;
     markGen(it.items);
   } };
@@ -2061,11 +2144,12 @@ function annotate(site, ctx) {
 }
 
 // Where `rel` sits in every menu that has it: [{ site, menu, trail }].
-export function whereIs(sites, rel) {
-  const out = [];
+export function whereIs(sites: Site[], rel: string) {
+  const out: { system: string; menu: string; key: string | undefined; trail: string[] }[] = [];
   for (const s of sites) {
     for (const m of s.menus) {
-      const walk = (items, trail) => {
+      const walk = (items: MenuItem[] | undefined, trail: string[]): void => {
+
         for (const it of items || []) {
           if (it.file === rel) out.push({ system: s.label, menu: m.label, key: m.key, trail: [...trail, it.text] });
           if (it.items) walk(it.items, [...trail, it.text]);

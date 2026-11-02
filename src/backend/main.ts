@@ -32,6 +32,7 @@ import {
 import { trustState, grantTrust, revokeTrust, listTrust } from './trust.ts';
 import { oembedGet } from './oembed.ts';
 import { readSites, editMenu } from './menus.ts';
+import type { EditResult, MenuOp, Site as MenuSite } from './menus.ts';
 import { smokeOn, smokeApi, runSmoke } from './smoke.ts';
 import {
   LAYER_NAMES, readPath, writePath, clearPath, effective, resolveAll,
@@ -39,6 +40,156 @@ import {
 import {
   aiConfig, setAiConfig, aiStatus, setKey, deleteKey, listModels, providerState,
 } from './ai.ts';
+
+import type { StackEntry } from './layers.ts';
+import type { Action, ActionCtx, ActionHost } from './actions.ts';
+import type { TidyAction } from './aitools.ts';
+
+// ---------------------------------------------------------------- the shapes
+
+/** The reading preferences (PREF_DEFAULTS below), whole. */
+type Prefs = typeof PREF_DEFAULTS;
+/** The picture settings (IMAGE_DEFAULTS below), whole. */
+type ImageSettings = typeof IMAGE_DEFAULTS;
+/** Settings for one scope, every layer resolved (resolveAll). */
+interface Resolved {
+  theme: string;
+  view: string;
+  prefs: Prefs;
+  images: ImageSettings;
+}
+/** A folder-shaped layer: the `.nib` file, or its this-machine twin. A type
+ *  alias rather than an interface so it passes as a layers.ts Layer. */
+type FolderSettings = {
+  prefs?: Partial<Prefs>;
+  images?: Partial<ImageSettings>;
+  pins?: Record<string, PinKind>;
+};
+type PinKind = 'all' | 'docs' | 'images';
+/** Which layer a setting is written to (layers.ts LAYER_NAMES). */
+type LayerName = 'mine' | 'folder' | 'local';
+
+/** One open document — see `sheets`. */
+interface Sheet {
+  id: string;
+  /** the window holding it; set by whoever made the sheet, straight away */
+  win: string;
+  path: string | null;
+  name: string;
+  kind: 'doc' | 'image' | 'diff';
+  preview: boolean;
+  savedText: string;
+  liveText: string;
+  restored: boolean;
+}
+/** One document window — see `wins`. */
+interface Win {
+  active: string;
+  order: string[];
+  closing?: boolean;
+}
+type FileKind = 'doc' | 'image' | 'other';
+/** A node of the sidebar's tree: a folder (dir, kids) or a file (kind). */
+interface TreeNode {
+  name: string;
+  path: string;
+  dir?: true;
+  kids?: TreeNode[];
+  kind?: FileKind;
+}
+/** The flat list of the folder's files, for the palettes and searches. */
+interface FileEntry {
+  name: string;
+  path: string;
+  rel: string;
+  kind: FileKind;
+}
+interface Heading { level: number; text: string; slug: string; line: number }
+interface HeadIndex { title: string | null; heads: Heading[] }
+/** The open folder. */
+interface Project {
+  root: string;
+  name: string;
+  settings: FolderSettings;
+  tree: TreeNode[];
+  files: FileEntry[];
+  truncated: boolean;
+  pins: Record<string, PinKind>;
+  pinsOn: boolean;
+  /** rel path -> its headings; null until the background build lands */
+  heads: Record<string, HeadIndex> | null;
+  /** the git repo it lives in: undefined until asked, null for none */
+  gitTop?: string | null;
+}
+/** A Recent Files / Recent Folders entry in the store. */
+interface Recent { path: string; at: number }
+/** The per-folder memory in the store under fstateKey(root). */
+interface FolderState {
+  windows?: { files: string[]; active: string }[];
+  pins?: Record<string, string>;
+  pinsOn?: boolean;
+  paneW?: Record<string, number>;
+}
+/** A draft a window left behind when it died dirty. */
+interface Draft { text: string; at: number; path?: string | null }
+interface SizeRec { width: number; height: number }
+interface GitResult { code: number; out: string }
+/** What openDoc may be told. */
+interface OpenOpts {
+  draftText?: string;
+  from?: string | null;
+  forceWindow?: boolean;
+  preview?: boolean;
+  bare?: boolean;
+  withFolder?: boolean;
+}
+/** An icon drawing, cached by its Iconify name. */
+interface IconRec { body: string; width: number; height: number }
+/** One file a site-menu edit wrote, and what it said before. */
+interface MenuWrite { path: string; file: string; before: string | null; after: string | null }
+interface MenuStep { files: MenuWrite[]; label: string }
+/** One row of the palette's > list (commandList). */
+interface Command {
+  id: string; label: string; path: string | undefined; key: string | null; checked: boolean;
+  icon: string | null; iconSvg: IconRec | null;
+}
+/** Insert ▸ — one row of the focused window's "/" catalogue. */
+interface InsertItem { id: string; label: string; group: string }
+/** One Settings-window change, waiting for Save (simulateStaged). */
+interface StagedOp {
+  op?: string;
+  layer?: string;
+  path?: string;
+  value?: unknown;
+  flavor?: string;
+  name?: string;
+  params?: Record<string, unknown>;
+}
+/** A docs site as the page gets it: menus.ts's Site after slimSites has
+ *  replaced its spans and paths with flags (so it is looser than MenuSite). */
+interface SiteMenuItem { items?: SiteMenuItem[]; [k: string]: unknown }
+interface SiteMenu {
+  ids?: unknown; slugs?: unknown; arraySpan?: unknown; listPath?: unknown;
+  source?: { span?: unknown; [k: string]: unknown };
+  items?: SiteMenuItem[];
+  [k: string]: unknown;
+}
+interface Site { rewrites?: unknown; menus: SiteMenu[]; [k: string]: unknown }
+/** The actions as actions.ts loads them. */
+type ActionSet = Awaited<ReturnType<typeof loadActions>>;
+/** A file Clean Up Unused Files… offers to remove. */
+interface UnusedRow { path: string; rel: string; name: string; size: number; kind: 'image' | 'other' }
+/** The ☰ Menu face's answer: the folder's docs-site menus. */
+interface SiteMenusResult { root?: string; sites: Site[] }
+/** One Find in Folder match. */
+interface SearchHit { line: number; col: number; len: number; text: string }
+/** api.iconify.design's answer to /<prefix>.json?icons=… */
+interface IconifyIcons {
+  width?: number; height?: number;
+  icons?: Record<string, { body: string; width?: number; height?: number }>;
+}
+/** Where an api handler was called from — the internal callers pass less. */
+type Meta = Partial<TinyApiMeta>;
 
 const dec = new TextDecoder();
 const enc = new TextEncoder();
@@ -94,7 +245,7 @@ const LINK_SEPS = [['chev', '›'], ['gt', '>'], ['slash', '/'],
 // set even though GitHub shows ::: as literal text — Nib has always rendered
 // ::: containers regardless of flavor, and a preset that hid the new ones
 // while note/tabs stayed up would be a stranger rule than this one.
-const FLAVORS = {
+const FLAVORS: Record<string, Partial<Prefs>> = {
   github: { alerts: true, emojiCodes: true, footnotes: true, math: true, mermaid: true,
     carousel: true, download: true, embed: true, pagelink: true, toc: true, html: true },
   commonmark: { alerts: false, emojiCodes: false, footnotes: false, math: false, mermaid: false,
@@ -167,31 +318,31 @@ let speechOk = false;   // does this build's webview have a speech recogniser?
 let seq = 1;              // doc window ids: doc1, doc2, …
 let untitled = 0;         // Untitled, Untitled 2, …
 let opened = 0;           // cascade slot counter
-let screen = { width: 1440, height: 900 };
+let screen: { width: number; height: number } = { width: 1440, height: 900 };
 // A window holds a STACK of open documents — one visible, the rest tabs. The
 // two maps are the whole model: a sheet is a document (its text, what's on
 // disk, whether it died dirty), a win is which sheets it holds and which one
 // is showing. Files opened from inside a window join that window; Finder, the
 // Dock and the Welcome screen still get a window of their own.
-const sheets = new Map();  // sheetId -> { id, win, path, name, savedText, liveText, restored, closing }
-const wins = new Map();    // winId -> { active, order: [sheetId] }
+const sheets = new Map<string, Sheet>();  // sheetId -> { id, win, path, name, savedText, liveText, restored, closing }
+const wins = new Map<string, Win>();    // winId -> { active, order: [sheetId] }
 // Windows that opted out of the app-wide folder (File ▸ New Window). They
 // boot without the project and every project push skips them — until the
 // window itself opens a folder, which takes it off the list.
-const bareWins = new Set();
+const bareWins = new Set<string>();
 let sheetSeq = 1;
 // The document window a menu-driven open should land in. Pages ping the
 // backend when they take focus (setView & co carry meta.window), so this is
 // the last window that had the keyboard — which is the one an Open Recent
 // pick belongs in, as a tab, exactly like a click in the file tree.
-let lastDocWin = null;
+let lastDocWin: string | null = null;
 
-const sheetsOf = (winId) => (wins.get(winId)?.order || []).map((s) => sheets.get(s)).filter(Boolean);
-const activeSheet = (winId) => sheets.get(wins.get(winId)?.active);
-const sheetFor = (meta, id) => sheets.get(id) || activeSheet(meta && meta.window);
+const sheetsOf = (winId: string) => (wins.get(winId)?.order || []).map((s) => sheets.get(s)).filter(Boolean) as Sheet[];
+const activeSheet = (winId: string | null | undefined) => sheets.get(wins.get(winId!)?.active!);
+const sheetFor = (meta: Meta | undefined, id: string | undefined) => sheets.get(id!) || activeSheet(meta && meta.window);
 // A diff tab wears the file's path but is not the file — opening the
 // document must never land on it, and nothing that edits text should find it.
-const findSheetByPath = (path) =>
+const findSheetByPath = (path: string) =>
   [...sheets.values()].find((s) => s.path === path && s.kind !== 'diff');
 
 // Per-folder session memory — which files were open, in which windows, which
@@ -201,23 +352,23 @@ const findSheetByPath = (path) =>
 // positive events (open, close-tab, select, reorder) and deliberately NOT
 // when a window closes — so quitting, or shutting the window, leaves the
 // last working set behind for the next visit.
-const fstateKey = (root) => 'fstate:' + root;
+const fstateKey = (root: string) => 'fstate:' + root;
 let restoringFolder = false;
-async function saveFolderState(app) {
+async function saveFolderState(app: TinyApp) {
   if (!project || restoringFolder) return;
   try {
-    const windows = [];
+    const windows: { files: string[]; active: string }[] = [];
     for (const [id, w] of wins) {
       if (bareWins.has(id) || w.closing) continue;
       // diff tabs are of the moment — they don't come back on the next visit
       const files = sheetsOf(id)
-        .filter((s) => s.path && !s.preview && s.kind !== 'diff').map((s) => s.path);
+        .filter((s) => s.path && !s.preview && s.kind !== 'diff').map((s) => s.path!);
       if (!files.length) continue;
       const act = sheets.get(w.active);
       windows.push({ files, active: (act && act.path) || files[0] });
     }
     const k = fstateKey(project.root);
-    const cur = (await app.store.get(k)) || {};
+    const cur: FolderState = (await app.store.get(k)) || {};
     await app.store.set(k, { ...cur, windows });
   } catch { /* a missed snapshot is just a slightly staler memory */ }
 }
@@ -231,28 +382,28 @@ async function saveFolderState(app) {
 // the pins stay set but scope nothing, so a shared arrangement can be parked
 // on this machine without unpinning it for everyone.
 const PIN_KINDS = new Set(['all', 'docs', 'images']);
-async function readPinState(app, root, tree, settings) {
-  let saved = {};
+async function readPinState(app: TinyApp, root: string, tree: TreeNode[], settings: FolderSettings | null) {
+  let saved: FolderState = {};
   try { saved = (await app.store.get(fstateKey(root))) || {}; } catch { /* none */ }
   const fromNib = folderOwns(root) && settings && settings.pins;
   const raw = fromNib
-    ? Object.fromEntries(Object.entries(settings.pins).map(([d, k]) =>
+    ? Object.fromEntries(Object.entries(settings!.pins!).map(([d, k]) =>
         [d.startsWith('/') ? d : root + '/' + d, k]))
     : (saved.pins || {});
-  const dirs = new Set();
-  (function walk(ns) {
-    for (const n of ns) if (n.dir) { dirs.add(n.path); walk(n.kids); }
+  const dirs = new Set<string>();
+  (function walk(ns: TreeNode[]) {
+    for (const n of ns) if (n.dir) { dirs.add(n.path); walk(n.kids!); }
   })(tree);
-  const pins = {};
+  const pins: Record<string, PinKind> = {};
   for (const [d, k] of Object.entries(raw)) {
-    if (dirs.has(d) && PIN_KINDS.has(k)) pins[d] = k;  // moved or gone: unpinned
+    if (dirs.has(d) && PIN_KINDS.has(k)) pins[d] = k as PinKind;  // moved or gone: unpinned
   }
   return { pins, pinsOn: saved.pinsOn !== false };
 }
 
 // Recheck the pins against a fresh tree or fresh settings — a refresh, a
 // settings toggle, or the settings file itself being edited in a tab.
-async function reloadPins(app) {
+async function reloadPins(app: TinyApp) {
   if (!project) return;
   const { pins, pinsOn } = await readPinState(app, project.root, project.tree, project.settings);
   project.pins = pins;
@@ -265,16 +416,16 @@ async function reloadPins(app) {
 // under no pin sees every pinned folder of that kind together, so pinning
 // assets/ for pictures works from anywhere. No pins at all: the whole
 // project (null).
-function pinScope(kind, docPath) {
+function pinScope(kind: string, docPath: string | null | undefined) {
   if (!project || !project.pinsOn) return null;
   const dirs = Object.keys(project.pins || {})
-    .filter((d) => project.pins[d] === 'all' || project.pins[d] === kind);
+    .filter((d) => project!.pins[d] === 'all' || project!.pins[d] === kind);
   if (!dirs.length) return null;
   const above = dirs.filter((d) => docPath && docPath.startsWith(d + '/'));
   if (above.length) return [above.sort((a, b) => b.length - a.length)[0]];
   return dirs;
 }
-const inScope = (scope, p) => !scope || scope.some((d) => p.startsWith(d + '/'));
+const inScope = (scope: string[] | null, p: string) => !scope || scope.some((d) => p.startsWith(d + '/'));
 
 // ------------------------------------------------------------------------ git
 //
@@ -285,7 +436,7 @@ const inScope = (scope, p) => !scope || scope.some((d) => p.startsWith(d + '/'))
 // /usr/bin/git is a shim that answers with the CLT installer DIALOG when the
 // tools are missing, so xcode-select (which just fails quietly) is asked
 // first and git is never poked on a machine that would prompt.
-let gitOk = null;                        // does this machine have a usable git?
+let gitOk: boolean | null = null;                        // does this machine have a usable git?
 //
 // A repository is a stranger's config file. `.git/config` travels in every
 // zip of a project folder, and git RUNS some of what it says: core.fsmonitor
@@ -311,20 +462,20 @@ const GIT_SAFE = ['-c', 'core.fsmonitor=false',
 // programs you installed. A name git's -c can't carry intact (an `=` in it)
 // can't be blanked, so that repo gets no answer at all — null, the same as
 // no git, and the panel hides.
-async function gitFilterOffs(cwd) {
+async function gitFilterOffs(cwd: string): Promise<string[] | null> {
   const r = await gitSpawn(cwd, [...GIT_SAFE, 'config', '-z', '--show-scope',
     '--name-only', '--get-regexp', '^filter\\.']);
   if (!r) return null;
   if (r.code === 1 && !r.out) return [];            // no filters anywhere
   if (r.code !== 0) return null;
   const f = r.out.split('\0');
-  const names = new Set();
+  const names = new Set<string>();
   for (let i = 0; i + 1 < f.length; i += 2) {
     if (f[i] === 'global' || f[i] === 'system') continue;
     const m = /^filter\.([\s\S]+)\.[^.]+$/.exec(f[i + 1]);
     if (m) names.add(m[1]);
   }
-  const offs = [];
+  const offs: string[] = [];
   for (const n of names) {
     if (/[=\n\0]/.test(n)) return null;
     for (const k of ['clean', 'smudge', 'process']) offs.push('-c', 'filter.' + n + '.' + k + '=');
@@ -332,19 +483,19 @@ async function gitFilterOffs(cwd) {
   }
   return offs;
 }
-async function runGit(cwd, args) {
+async function runGit(cwd: string, args: string[]): Promise<GitResult | null> {
   if (args[0] === '--version') return gitSpawn(cwd, args);
   const offs = await gitFilterOffs(cwd);
   if (!offs) return null;
   return gitSpawn(cwd, [...GIT_SAFE, ...offs, ...args]);
 }
-async function gitSpawn(cwd, args) {
+async function gitSpawn(cwd: string, args: string[]): Promise<GitResult | null> {
   try {
     const proc = tjs.spawn(['git', '-C', cwd, ...args],
       { stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' });
     let out = '';
     const d = new TextDecoder();         // own decoder: chunks can split UTF-8
-    const reader = proc.stdout.getReader();
+    const reader = proc.stdout!.getReader();
     try {
       while (true) {
         const { value, done } = await reader.read();
@@ -357,7 +508,7 @@ async function gitSpawn(cwd, args) {
     return { code: st.exit_status, out };
   } catch { return null; }               // no git at all
 }
-async function haveGit() {
+async function haveGit(): Promise<boolean> {
   if (gitOk !== null) return gitOk;
   if (IS_MAC) {
     try {
@@ -373,7 +524,7 @@ async function haveGit() {
 async function gitTop() {
   if (!project) return null;
   if (project.gitTop !== undefined) return project.gitTop;
-  let top = null;
+  let top: string | null = null;
   if (await haveGit()) {
     const r = await runGit(project.root, ['rev-parse', '--show-toplevel']);
     if (r && r.code === 0 && r.out.trim()) top = r.out.trim();
@@ -383,7 +534,7 @@ async function gitTop() {
 }
 
 // What the page draws in its tab strip.
-const tabsPayload = (winId) => {
+const tabsPayload = (winId: string) => {
   const w = wins.get(winId);
   if (!w) return null;
   return {
@@ -394,13 +545,13 @@ const tabsPayload = (winId) => {
     })),
   };
 };
-const pushTabs = (app, winId) => {
+const pushTabs = (app: TinyApp, winId: string) => {
   const t = tabsPayload(winId);
   if (t) app.window(winId).push('tabs', t);
 };
 
 // The whole document, for a page that is about to show it.
-const sheetPayload = (s) => ({
+const sheetPayload = (s: Sheet) => ({
   id: s.id, path: s.path, name: s.name, kind: s.kind, preview: !!s.preview,
   text: s.liveText, savedText: s.savedText, restored: s.restored,
   config: configKind(s.path),
@@ -409,8 +560,8 @@ const sheetPayload = (s) => ({
 // Is this file one of NIB'S OWN? The page treats those differently — it lays
 // them out again on save and refuses to write a broken one — and it has no
 // business working out where the data directory is to find out.
-let dataDir = null;                      // filled in by init()
-function configKind(path) {
+let dataDir: string | null = null;                      // filled in by init()
+function configKind(path: string | null) {
   if (!path) return null;
   if (dataDir && path === dataDir + '/actions.json') return 'actions';
   if (/\/\.nib\/actions\.json$/.test(path)) return 'actions';
@@ -418,9 +569,9 @@ function configKind(path) {
   return null;
 }
 
-const base = (p) => p.split('/').pop();
-const ext = (p) => (p.split('.').pop() || '').toLowerCase();
-const draftKey = (d) => 'draft:' + (d.path || 'untitled');
+const base = (p: string) => p.split('/').pop()!;
+const ext = (p: string) => (p.split('.').pop() || '').toLowerCase();
+const draftKey = (d: Sheet) => 'draft:' + (d.path || 'untitled');
 
 // A path as the app should keep it. Everything inside Nib compares paths by
 // prefix — `startsWith(project.root + '/')` decides what's in the project, what
@@ -430,11 +581,13 @@ const draftKey = (d) => 'draft:' + (d.path || 'untitled');
 // `/work/notes/.` matches none of its own files. Separators are normalised
 // too, since Windows hands back backslashes and the rest of this file cuts
 // paths on '/'.
-function tidyPath(p) {
+function tidyPath(p: string): string;
+function tidyPath(p: string | null | undefined): string | null | undefined;
+function tidyPath(p: string | null | undefined) {
   if (!p) return p;
   const s = String(p).replace(/\\/g, '/');
   const abs = s.startsWith('/');
-  const segs = [];
+  const segs: string[] = [];
   for (const seg of s.split('/')) {
     if (!seg || seg === '.') continue;
     if (seg === '..' && segs.length && segs[segs.length - 1] !== '..') { segs.pop(); continue; }
@@ -443,9 +596,9 @@ function tidyPath(p) {
   return (abs ? '/' : '') + segs.join('/') || (abs ? '/' : '.');
 }
 
-const readText = async (path) => dec.decode(await tjs.readFile(path));
-const writeText = (path, text) => tjs.writeFile(path, enc.encode(text));
-const exists = async (path) => { try { await tjs.stat(path); return true; } catch { return false; } };
+const readText = async (path: string) => dec.decode(await tjs.readFile(path));
+const writeText = (path: string, text: string) => tjs.writeFile(path, enc.encode(text));
+const exists = async (path: string) => { try { await tjs.stat(path); return true; } catch { return false; } };
 
 // ---------------------------------------------------------------- documents
 
@@ -458,7 +611,7 @@ const exists = async (path) => { try { await tjs.stat(path); return true; } catc
 // The position goes IN with the open request. Setting it afterwards, from the
 // page's boot call, is what made a window paint in one place and jump to
 // another — tinyjs applies x/y before the first paint precisely so it doesn't.
-async function placeWindow(app, from, slot, w, h) {
+async function placeWindow(app: TinyApp, from: string | null | undefined, slot: number, w: number, h: number): Promise<{ x?: number; y?: number }> {
   if (from && wins.has(from)) {
     try {
       const st = await app.window(from).getState();
@@ -476,7 +629,7 @@ async function placeWindow(app, from, slot, w, h) {
 // while there is nothing else to look at. hide({ app: false }) is the whole
 // reason this works — a plain hide() on the main window is NSApp hide, which
 // would take the document windows' app down with it (tinyjs 0.30.0).
-function syncWelcome(app) {
+function syncWelcome(app: TinyApp) {
   if (wins.size) app.window('main').hide({ app: false });
   else app.show();
 }
@@ -484,14 +637,14 @@ function syncWelcome(app) {
 // Read a document off disk (or start an empty one), with the draft a window
 // that died dirty may have left behind. A picture is a sheet too — same tab,
 // same rename, no text: the page shows a viewer instead of the two panes.
-async function makeSheet(app, path, draftText) {
-  let savedText = '', liveText = draftText ?? '', restored = draftText != null, name;
+async function makeSheet(app: TinyApp, path: string | null, draftText?: string) {
+  let savedText = '', liveText = draftText ?? '', restored = draftText != null, name: string;
   const kind = path && IMAGES.has(ext(path)) ? 'image' : 'doc';
   if (path) {
     if (kind === 'doc') {
       savedText = await readText(path);       // throws -> caller reports
       liveText = savedText;
-      const draft = await app.store.get('draft:' + path);
+      const draft: Draft | null = await app.store.get('draft:' + path);
       if (draft && typeof draft.text === 'string' && draft.text !== savedText) {
         liveText = draft.text;                // a window died dirty here before
         restored = true;
@@ -504,7 +657,7 @@ async function makeSheet(app, path, draftText) {
     name = 'Untitled' + (++untitled > 1 ? ' ' + untitled : '');
   }
   const id = 'sh' + sheetSeq++;
-  const s = { id, win: null, path, name, kind, preview: false, savedText, liveText, restored };
+  const s: Sheet = { id, win: null!, path, name, kind, preview: false, savedText, liveText, restored };
   sheets.set(id, s);
   return s;
 }
@@ -512,8 +665,8 @@ async function makeSheet(app, path, draftText) {
 // The size a new window opens at: whatever the last one was left at, so the
 // app stops insisting on its own idea of a good size. Clamped to the screen in
 // case the last window came from a bigger display.
-async function windowSize(app) {
-  const saved = await app.store.get('winSize');
+async function windowSize(app: TinyApp) {
+  const saved: SizeRec | null = await app.store.get('winSize');
   const w = Math.min(saved?.width || 1180, screen.width - 40);
   const h = Math.min(saved?.height || Math.round(screen.height * 0.86), screen.height - 60);
   return { w: Math.max(560, Math.round(w)), h: Math.max(420, Math.round(h)) };
@@ -532,7 +685,7 @@ async function windowSize(app) {
 // once: a double-click in the tree fires click (preview) and then dblclick
 // (keep) while the first is still reading the file, and both would sail past
 // the "already open?" check below and make two tabs of one document.
-const opening = new Map();               // path -> the open in flight
+const opening = new Map<string, Promise<string>>();               // path -> the open in flight
 
 // File ▸ Reopen Closed Tab (⌘⇧T). Every tab closed with a file behind it —
 // one at a time, or a whole window's worth — goes on a stack, and the key
@@ -540,9 +693,9 @@ const opening = new Map();               // path -> the open in flight
 // else the one in front, else a window of its own (with the folder, if it
 // had one). A diff tab is left off: reopening it would open the FILE.
 const CLOSED_MAX = 30;
-const closedTabs = [];                   // [{ path, win, bare }], newest last
+const closedTabs: { path: string; win: string; bare: boolean }[] = [];                   // [{ path, win, bare }], newest last
 
-function rememberClosed(d, winId) {
+function rememberClosed(d: Sheet | undefined, winId: string) {
   if (!d || !d.path || d.kind === 'diff') return;
   const at = closedTabs.findIndex((c) => c.path === d.path);
   if (at >= 0) closedTabs.splice(at, 1);
@@ -550,9 +703,9 @@ function rememberClosed(d, winId) {
   if (closedTabs.length > CLOSED_MAX) closedTabs.shift();
 }
 
-async function reopenClosed(app) {
+async function reopenClosed(app: TinyApp) {
   while (closedTabs.length) {
-    const c = closedTabs.pop();
+    const c = closedTabs.pop()!;
     if (findSheetByPath(c.path)) continue;            // it's open again already
     try { await tjs.stat(c.path); } catch { continue; }   // …or it's gone
     const into = wins.has(c.win) ? c.win : lastDocWin && wins.has(lastDocWin) ? lastDocWin : null;
@@ -564,7 +717,7 @@ async function reopenClosed(app) {
   return false;
 }
 
-async function openDoc(app, path, opts = {}) {
+async function openDoc(app: TinyApp, path: string | null, opts: OpenOpts = {}): Promise<string> {
   if (!path) return openDocNow(app, path, opts);
   const queued = (opening.get(path) || Promise.resolve())
     .catch(() => {})
@@ -574,7 +727,7 @@ async function openDoc(app, path, opts = {}) {
   finally { if (opening.get(path) === queued) opening.delete(path); }
 }
 
-async function openDocNow(app, path, { draftText, from, forceWindow, preview, bare, withFolder } = {}) {
+async function openDocNow(app: TinyApp, path: string | null, { draftText, from, forceWindow, preview, bare, withFolder }: OpenOpts = {}): Promise<string> {
   if (path) {
     const open = findSheetByPath(path);
     if (open) {                              // already open — go to it, don't fork
@@ -599,7 +752,7 @@ async function openDocNow(app, path, { draftText, from, forceWindow, preview, ba
   // Opened from a document window: it becomes a tab there.
   if (!forceWindow && from && wins.has(from)) {
     s.win = from;
-    const w = wins.get(from);
+    const w = wins.get(from)!;
     // A preview replaces the previewing tab, in its place — that slot is the
     // whole point of the mode.
     const old = sheetsOf(from).find((x) => x.preview);
@@ -646,8 +799,8 @@ async function openDocNow(app, path, { draftText, from, forceWindow, preview, ba
   return id;
 }
 
-async function bumpRecent(app, path) {
-  const list = (await app.store.get('recents')) || [];
+async function bumpRecent(app: TinyApp, path: string) {
+  const list: Recent[] = (await app.store.get('recents')) || [];
   const next = [{ path, at: Date.now() }, ...list.filter((r) => r.path !== path)].slice(0, RECENT_MAX);
   await app.store.set('recents', next);
   paintWelcome(app);
@@ -655,15 +808,15 @@ async function bumpRecent(app, path) {
 
 // Folders get their own short list — in project mode it's the folder you
 // reopen, not the file, and a folder is one click to a whole tree.
-async function bumpRecentFolder(app, path) {
-  const list = (await app.store.get('folders')) || [];
+async function bumpRecentFolder(app: TinyApp, path: string) {
+  const list: Recent[] = (await app.store.get('folders')) || [];
   const next = [{ path, at: Date.now() }, ...list.filter((r) => r.path !== path)].slice(0, FOLDER_MAX);
   await app.store.set('folders', next);
   paintWelcome(app);
 }
 
-async function recentFolders(app) {
-  const list = (await app.store.get('folders')) || [];
+async function recentFolders(app: TinyApp) {
+  const list: Recent[] = (await app.store.get('folders')) || [];
   const out = [];
   for (const r of list) {
     out.push({ ...r, exists: await exists(r.path), open: !!project && project.root === r.path });
@@ -674,11 +827,11 @@ async function recentFolders(app) {
 // The welcome page repaints from this push (recents get a liveness check so
 // deleted files show up grayed out instead of erroring on click) — and the
 // File menu's Open Recent is the same two lists, so it is rebuilt here too.
-async function paintWelcome(app) {
-  const list = (await app.store.get('recents')) || [];
+async function paintWelcome(app: TinyApp) {
+  const list: Recent[] = (await app.store.get('recents')) || [];
   const recents = [];
   for (const r of list) recents.push({ ...r, exists: await exists(r.path) });
-  const draft = await app.store.get('draft:untitled');
+  const draft: Draft | null = await app.store.get('draft:untitled');
   app.push('welcome', {
     recents, folders: await recentFolders(app),
     untitledDraft: draft ? { at: draft.at } : null,
@@ -691,7 +844,14 @@ async function paintWelcome(app) {
 // a live value somewhere — some app-wide, some belonging to whichever window
 // has focus — so the ones that aren't derivable are mirrored here and the
 // sync* functions below keep them honest as they patch.
-const menuState = {
+const menuState: {
+  theme: string; view: string; appearance: string;
+  outline: boolean; editable: boolean; editableOk: boolean; files: boolean;
+  viewLock: boolean; jsonSheet: boolean; insert: InsertItem[]; bare: boolean;
+  recents: Recent[]; folders: Recent[];
+  /** the ☰ Menu panel has the keyboard (setSiteMenuFocus) */
+  siteMenuFocus?: boolean;
+} = {
   theme: 'paper', view: 'split', appearance: 'system',
   outline: false, editable: false, editableOk: true, files: false,
   // a JSON sheet locks the window to Editor Only and turns Format JSON on
@@ -706,19 +866,19 @@ const menuState = {
   recents: [], folders: [],
 };
 
-function syncViewMenu(app, view) {
+function syncViewMenu(app: TinyApp, view: string) {
   menuState.view = view;
   for (const [v] of VIEWS) app.menu.update('view:' + v, { checked: v === view });
 }
-function syncThemeMenu(app, theme) {
+function syncThemeMenu(app: TinyApp, theme: string) {
   menuState.theme = theme;
   for (const [t] of THEMES) app.menu.update('theme:' + t, { checked: t === theme });
 }
-function syncAppearanceMenu(app, appearance) {
+function syncAppearanceMenu(app: TinyApp, appearance: string) {
   menuState.appearance = appearance;
   for (const [a] of APPEARANCES) app.menu.update('appear:' + a, { checked: a === appearance });
 }
-function syncPrefsMenu(app, p) {
+function syncPrefsMenu(app: TinyApp, p: Prefs) {
   for (const [w] of WIDTHS) app.menu.update('pw:' + w, { checked: w === p.width });
   app.menu.update('opt:edWidth', { checked: !!p.edWidth });
   app.menu.update('opt:captions', { checked: !!p.captions });
@@ -730,7 +890,7 @@ function syncPrefsMenu(app, p) {
   app.menu.update('opt:hidden', { checked: !!p.hidden });
   app.menu.update('opt:math', { checked: !!p.math });
   app.menu.update('opt:mermaid', { checked: !!p.mermaid });
-  for (const k of ['carousel', 'download', 'embed', 'pagelink', 'toc', 'html']) {
+  for (const k of ['carousel', 'download', 'embed', 'pagelink', 'toc', 'html'] as const) {
     app.menu.update('opt:' + k, { checked: !!p[k] });
   }
   app.menu.update('opt:alerts', { checked: !!p.alerts });
@@ -751,14 +911,14 @@ function syncPrefsMenu(app, p) {
 // a simple merge into a fan of promises.
 let myTheme = 'paper';
 let myView = 'split';
-let prefs = { ...PREF_DEFAULTS };
-const loadPrefs = async (app) => ({ ...PREF_DEFAULTS, ...((await app.store.get('prefs')) || {}) });
-let images = { ...IMAGE_DEFAULTS };
+let prefs: Prefs = { ...PREF_DEFAULTS };
+const loadPrefs = async (app: TinyApp): Promise<Prefs> => ({ ...PREF_DEFAULTS, ...((await app.store.get('prefs')) || {}) });
+let images: ImageSettings = { ...IMAGE_DEFAULTS };
 
 // Anything the page sends back is a settings object from a form, so it's
 // clamped rather than trusted — `folder` especially, which becomes a directory
 // name: one segment, no dots to climb out with.
-function cleanImages(s) {
+function cleanImages(s: Partial<ImageSettings> | null | undefined): ImageSettings {
   const o = { ...IMAGE_DEFAULTS, ...(s || {}) };
   if (!DESTS.has(o.dest)) o.dest = IMAGE_DEFAULTS.dest;
   if (!NAMINGS.has(o.naming)) o.naming = IMAGE_DEFAULTS.naming;
@@ -781,7 +941,7 @@ function cleanImages(s) {
 
 // A root is a path INSIDE the open folder: segments only, no climbing out, no
 // leading or trailing slashes to have to think about later.
-const cleanRoot = (v) => String(v || '').replace(/\\/g, '/').split('/')
+const cleanRoot = (v: unknown) => String(v || '').replace(/\\/g, '/').split('/')
   .filter((s) => s && s !== '.' && s !== '..').join('/').slice(0, 120);
 
 // ------------------------------------------------------------------ projects
@@ -819,10 +979,10 @@ let uiZoom = 1;
 const PROJECT_PREFS = ['alerts', 'emojiCodes', 'footnotes', 'math', 'mermaid',
   'carousel', 'download', 'embed', 'pagelink', 'toc', 'html',
   'hrBreaks', 'linkPath', 'linkSep', 'linkFrom'];
-const isProjectPath = (path) => path === 'images' || path.startsWith('images.')
+const isProjectPath = (path: string) => path === 'images' || path.startsWith('images.')
   || (path.startsWith('prefs.') && PROJECT_PREFS.includes(path.slice(6)));
 
-let project = null;   // { root, name, settings, tree, files }
+let project: Project | null = null;   // { root, name, settings, tree, files }
 
 // File ▸ Save Settings in Folder. On (the default), a project's look lives in
 // its own `.nib/settings.json`; off, Nib never reads or writes anything inside
@@ -834,20 +994,20 @@ let project = null;   // { root, name, settings, tree, files }
 // that has never been asked — so an install that had it off keeps it off, and
 // ticking it for one repo no longer quietly opts in every other.
 let useProjectSettings = true;
-let folderFlags = {};                 // root -> bool, in the app's own store
-const folderOwns = (root) =>
+let folderFlags: Record<string, boolean> = {};                 // root -> bool, in the app's own store
+const folderOwns = (root: string | null | undefined) =>
   (root && folderFlags[root] !== undefined ? !!folderFlags[root] : useProjectSettings);
 const projectOwns = () => !!project && folderOwns(project.root);
 
 // This folder's LOCAL layer: its settings on this machine only, never written
 // inside the folder. Loaded with the project, kept beside it.
-let localSettings = {};
-const localKey = (root) => 'local:' + root;
+let localSettings: FolderSettings = {};
+const localKey = (root: string) => 'local:' + root;
 
 // Only the keys a map actually defines, so a layer can't smuggle in a key the
 // app doesn't know or a default it was never given.
-const onlyKnown = (obj, defaults) => {
-  const out = {};
+const onlyKnown = (obj: object | null | undefined, defaults: object) => {
+  const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(obj || {})) if (k in defaults && v !== undefined) out[k] = v;
   return out;
 };
@@ -855,11 +1015,11 @@ const onlyKnown = (obj, defaults) => {
 // cleanImages fills every default, which is right for the RESOLVED settings
 // and wrong for a layer — see readProjectSettings. This validates the keys
 // that are present and keeps the rest absent.
-const cleanPartialImages = (obj) => {
+const cleanPartialImages = (obj: object | null | undefined): Partial<ImageSettings> => {
   const present = onlyKnown(obj, IMAGE_DEFAULTS);
   const full = cleanImages({ ...IMAGE_DEFAULTS, ...present });
-  const out = {};
-  for (const k of Object.keys(present)) out[k] = full[k];
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(present)) out[k] = full[k as keyof ImageSettings];
   return out;
 };
 
@@ -867,11 +1027,11 @@ const cleanPartialImages = (obj) => {
 // the store) may only carry PROJECT settings. Personal keys found there —
 // old files from when everything was layerable, or hand-edits — are dropped
 // here, once, so nothing downstream has to ask.
-function onlyProjectSettings(raw) {
-  const out = {};
+function onlyProjectSettings(raw: FolderSettings | null | undefined): FolderSettings {
+  const out: FolderSettings = {};
   if (raw && raw.prefs) {
     const known = onlyKnown(raw.prefs, PREF_DEFAULTS);
-    const kept = {};
+    const kept: Record<string, unknown> = {};
     for (const k of PROJECT_PREFS) if (known[k] !== undefined) kept[k] = known[k];
     if (Object.keys(kept).length) out.prefs = kept;
   }
@@ -885,7 +1045,7 @@ function onlyProjectSettings(raw) {
 // The layers in play, low to high. A window with no folder gets one; a folder
 // that isn't keeping its own settings gets two, since the local layer is
 // exactly how you give such a folder different settings anyway.
-function layerStack(bare) {
+function layerStack(bare?: boolean): StackEntry[] {
   const mine = { theme: myTheme, view: myView, prefs, images };
   if (!project || bare) return [{ name: 'mine', data: mine }];
   return [
@@ -895,21 +1055,21 @@ function layerStack(bare) {
   ];
 }
 
-const resolved = (bare) => resolveAll(layerStack(bare),
-  { prefDefaults: PREF_DEFAULTS, imageDefaults: IMAGE_DEFAULTS });
+const resolved = (bare?: boolean) => resolveAll(layerStack(bare),
+  { prefDefaults: PREF_DEFAULTS, imageDefaults: IMAGE_DEFAULTS }) as Resolved;
 
-const relOf = (root, p) => (p.startsWith(root + '/') ? p.slice(root.length + 1) : p);
+const relOf = (root: string, p: string) => (p.startsWith(root + '/') ? p.slice(root.length + 1) : p);
 
 // One walk, breadth-ish, skipping the usual noise. Returns the nested tree for
 // the sidebar and a flat list of files for the palettes.
-async function walkTree(root) {
+async function walkTree(root: string) {
   let count = 0;
-  const files = [];
+  const files: FileEntry[] = [];
   const showHidden = !!prefs.hidden;   // personal, never a folder's — Mine answers
 
-  async function dir(path, depth) {
-    const kids = [];
-    const all = [];
+  async function dir(path: string, depth: number): Promise<TreeNode[]> {
+    const kids: TreeNode[] = [];
+    const all: { name: string; isDir: boolean }[] = [];
     try {
       for await (const e of await tjs.readDir(path)) {
         all.push({ name: e.name, isDir: !!e.isDirectory });
@@ -934,7 +1094,7 @@ async function walkTree(root) {
         kids.push({ name: e.name, path: full, dir: true, kids: depth < 8 ? await dir(full, depth + 1) : [] });
       } else {
         const e2 = ext(e.name);
-        const kind = OPENABLE.has(e2) ? 'doc' : IMAGES.has(e2) ? 'image' : 'other';
+        const kind: FileKind = OPENABLE.has(e2) ? 'doc' : IMAGES.has(e2) ? 'image' : 'other';
         kids.push({ name: e.name, path: full, kind });
         files.push({ name: e.name, path: full, rel: relOf(root, full), kind });
       }
@@ -962,10 +1122,10 @@ const HEADS_EXTS = new Set(['md', 'markdown', 'mdown', 'mkdn', 'mkd', 'mdwn', 'm
   'mdtext', 'mdx', 'qmd', 'rmd', 'mdc', 'markdoc', 'mdoc']);
 const HEADING_RE = /^(#{1,6})\s+(.+?)\s*#*\s*$/;   // md.ts's HEADING, verbatim
 
-function extractHeads(text) {
+function extractHeads(text: string): HeadIndex {
   const lines = text.split('\n');
-  const heads = [];
-  let title = null;
+  const heads: Heading[] = [];
+  let title: string | null = null;
   let i = 0;
   // frontmatter: only a fence on line one counts, like everywhere else
   if (lines[0] === '---') {
@@ -981,7 +1141,7 @@ function extractHeads(text) {
     }
   }
   const used = new Set();
-  let fence = null;
+  let fence: string | null = null;
   for (; i < lines.length; i++) {
     const l = lines[i];
     const f = /^\s*(`{3,}|~{3,})/.exec(l);
@@ -1004,18 +1164,18 @@ function extractHeads(text) {
 }
 
 let headGen = 0;
-async function buildHeadIndex(app) {
+async function buildHeadIndex(app: TinyApp) {
   if (!project) return;
   const gen = ++headGen;
   const root = project.root;
   const files = project.files.filter((f) => HEADS_EXTS.has(ext(f.name)));
-  const out = {};
+  const out: Record<string, HeadIndex> = {};
   let next = 0;
   async function worker() {
     while (next < files.length) {
       const f = files[next++];
       const open = findSheetByPath(f.path);
-      let text;
+      let text: string;
       if (open && open.kind === 'doc') text = open.liveText;
       else {
         try {
@@ -1033,15 +1193,15 @@ async function buildHeadIndex(app) {
   pushHeads(app);
 }
 
-function pushHeads(app) {
+function pushHeads(app: TinyApp) {
   for (const id of wins.keys()) {
-    if (!bareWins.has(id)) app.window(id).push('project-heads', project.heads);
+    if (!bareWins.has(id)) app.window(id).push('project-heads', project!.heads);
   }
 }
 
-const settingsPath = (root) => root + '/.nib/settings.json';
+const settingsPath = (root: string) => root + '/.nib/settings.json';
 
-async function readProjectSettings(root, force = false) {
+async function readProjectSettings(root: string, force = false): Promise<FolderSettings> {
   if (!force && !folderOwns(root)) return {};
   try {
     const raw = JSON.parse(await readText(settingsPath(root)));
@@ -1057,7 +1217,7 @@ async function readProjectSettings(root, force = false) {
     // anything hand-written sloppily — trailing slash, unknown kind — is tidied
     // or dropped rather than let loose on the scoping
     if (out.pins && typeof out.pins === 'object' && !Array.isArray(out.pins)) {
-      const pins = {};
+      const pins: Record<string, PinKind> = {};
       for (const [d, k] of Object.entries(out.pins)) {
         if (typeof d === 'string' && d && PIN_KINDS.has(k)) pins[d.replace(/\/+$/, '')] = k;
       }
@@ -1067,23 +1227,23 @@ async function readProjectSettings(root, force = false) {
   } catch { return {}; }
 }
 
-async function writeProjectSettings(app) {
+async function writeProjectSettings(app: TinyApp) {
   if (!projectOwns()) return;
   // makeDir, not mkdir — txiki has no `mkdir`, and the call was failing
   // silently into the catch below until the write hit ENOENT.
-  try { await tjs.makeDir(project.root + '/.nib', { recursive: true }); } catch { /* there */ }
-  await writeText(settingsPath(project.root), JSON.stringify(project.settings, null, 2) + '\n');
+  try { await tjs.makeDir(project!.root + '/.nib', { recursive: true }); } catch { /* there */ }
+  await writeText(settingsPath(project!.root), JSON.stringify(project!.settings, null, 2) + '\n');
   refreshSettingsSheet(app);
 }
 
 // The settings file can be OPEN IN A TAB while a setting changes elsewhere —
 // a pin from the tree, a theme from the menu. A clean tab catches up with the
 // disk; a dirty one keeps the user's edit, which wins when they save.
-function refreshSettingsSheet(app) {
+function refreshSettingsSheet(app: TinyApp) {
   if (!project) return;
   const open = findSheetByPath(settingsPath(project.root));
   if (!open || open.kind !== 'doc' || open.liveText !== open.savedText) return;
-  readText(open.path).then((text) => {
+  readText(open.path!).then((text) => {
     if (text === open.savedText) return;
     open.savedText = text;
     open.liveText = text;
@@ -1097,8 +1257,8 @@ function refreshSettingsSheet(app) {
 // payloads, roots); pass `bare` when the answer is for a window or the menu
 // bar, because a bare window resolves to Mine alone. Forgetting the argument
 // here was exactly how bare windows ended up wearing the folder's theme.
-const effPrefs = (bare) => resolved(bare).prefs;
-const effImages = (bare) => cleanImages(resolved(bare).images);
+const effPrefs = (bare?: boolean) => resolved(bare).prefs;
+const effImages = (bare?: boolean) => cleanImages(resolved(bare).images);
 
 // Everything that only means something with a folder open. View ▸ Files is
 // NOT in the list: with no folder the panel is how you pick one.
@@ -1116,7 +1276,7 @@ const effImages = (bare) => cleanImages(resolved(bare).images);
 const appScopeBare = () =>
   !lastDocWin || !wins.has(lastDocWin) || bareWins.has(lastDocWin);
 
-async function syncFocusScope(app) {
+async function syncFocusScope(app: TinyApp) {
   const bare = appScopeBare();
   if (bare === menuState.bare) return;
   menuState.bare = bare;
@@ -1149,7 +1309,7 @@ const FOLDER_APP = ['closefolder', 'newwindowsame'];
 const FOLDER_WINDOW = ['insertlink', 'renamefile', 'refreshfolder', 'find:folder', 'cleanassets',
   'brokenlinks', 'sitemenu'];
 
-function syncProjectMenu(app) {
+function syncProjectMenu(app: TinyApp) {
   const on = !!project;
   const here = on && !menuState.bare;
   for (const id of FOLDER_APP) app.menu.update(id, { enabled: on });
@@ -1174,14 +1334,14 @@ function projectPayload() {
 
 // The folder is app-wide, but not every window wants it: bare windows get
 // null where the rest get the payload. Only doc windows listen for 'project'.
-function pushProject(app) {
+function pushProject(app: TinyApp) {
   const payload = projectPayload();
   for (const id of wins.keys()) {
     app.window(id).push('project', bareWins.has(id) ? null : payload);
   }
 }
 
-async function loadProject(app, root) {
+async function loadProject(app: TinyApp, root: string) {
   const settings = await readProjectSettings(root);
   // same filter as the file: the local twin is folder-shaped too
   localSettings = onlyProjectSettings(await app.store.get(localKey(root)));
@@ -1207,21 +1367,21 @@ async function loadProject(app, root) {
 // later, and a rescan that finds the same tree pushes nothing, so Nib's own
 // saves — which land here too — cost a walk and no repaint.
 const WATCH_MAX = 400;
-let folderWatchers = [];
-let watchTimer = null;
+let folderWatchers: tjs.FileWatcher[] = [];
+let watchTimer: ReturnType<typeof setTimeout> | null = null;
 
 function unwatchFolder() {
-  clearTimeout(watchTimer);
+  clearTimeout(watchTimer!);
   for (const w of folderWatchers) { try { w.close(); } catch { /* gone */ } }
   folderWatchers = [];
 }
 
-function watchFolder(app) {
+function watchFolder(app: TinyApp) {
   unwatchFolder();
   if (!project) return;
   const root = project.root;
   const dirs = [root];
-  const walk = (nodes) => {
+  const walk = (nodes: TreeNode[]) => {
     for (const n of nodes) {
       if (!n.dir || dirs.length >= WATCH_MAX) continue;
       dirs.push(n.path);
@@ -1230,7 +1390,7 @@ function watchFolder(app) {
   };
   walk(project.tree);
   const poke = () => {
-    clearTimeout(watchTimer);
+    clearTimeout(watchTimer!);
     watchTimer = setTimeout(() => {
       if (project && project.root === root) rescanFolder(app).catch(() => {});
     }, 400);
@@ -1244,7 +1404,7 @@ function watchFolder(app) {
 // moved (the menu item is a person asking); a watcher's rescan only speaks up
 // when the tree actually changed — and then re-arms, since a new folder needs
 // a handle of its own and a deleted one has lost its.
-async function rescanFolder(app, { force = false } = {}) {
+async function rescanFolder(app: TinyApp, { force = false } = {}) {
   if (!project) return null;
   const root = project.root;
   const { tree, files, truncated } = await walkTree(root);
@@ -1272,7 +1432,7 @@ async function rescanFolder(app, { force = false } = {}) {
 // folder overrides it and the tick would appear to do nothing, which is the
 // worst possible answer.) Nothing set it yet: the folder if it keeps its own
 // settings, else yours.
-function defaultLayerFor(path) {
+function defaultLayerFor(path: string): LayerName {
   // A personal setting has exactly one home, whatever is open.
   if (!isProjectPath(path)) return 'mine';
   // …a project one goes to the layer providing it, within the focused scope:
@@ -1282,32 +1442,32 @@ function defaultLayerFor(path) {
   // twin when it doesn't.
   const bare = appScopeBare();
   const from = effective(layerStack(bare), path).from;
-  if (from) return from;
+  if (from) return from as LayerName;
   if (bare || !project) return 'mine';
   return projectOwns() ? 'folder' : 'local';
 }
 
-async function persistMine(app, head) {
+async function persistMine(app: TinyApp, head: string) {
   if (head === 'theme') await app.store.set('theme', myTheme);
   else if (head === 'view') await app.store.set('view', myView);
   else if (head === 'prefs') await app.store.set('prefs', prefs);
   else if (head === 'images') await app.store.set('images', images);
 }
 
-async function writeSetting(app, layer, path, value) {
+async function writeSetting(app: TinyApp, layer: string | null | undefined, path: string, value: unknown) {
   const target = layer || defaultLayerFor(path);
   // a personal key in a folder-shaped layer would just be dropped on the
   // next load (onlyProjectSettings), so refuse it at the door instead
   if (target !== 'mine' && !isProjectPath(path)) return false;
   const head = path.split('.')[0];
   if (target === 'mine') {
-    if (head === 'theme') myTheme = value;
-    else if (head === 'view') myView = value;
+    if (head === 'theme') myTheme = value as string;
+    else if (head === 'view') myView = value as string;
     else writePath({ prefs, images }, path, value);   // the maps are shared, so this lands
     await persistMine(app, head);
   } else if (target === 'folder') {
     if (!projectOwns()) return false;
-    writePath(project.settings, path, value);
+    writePath(project!.settings, path, value);
     await writeProjectSettings(app);
   } else {
     if (!project) return false;
@@ -1319,7 +1479,7 @@ async function writeSetting(app, layer, path, value) {
 
 // "Reset to inherited". Clearing `mine` puts the built-in default back, since
 // there is nothing underneath it to fall through to.
-async function clearSetting(app, layer, path) {
+async function clearSetting(app: TinyApp, layer: string, path: string) {
   const head = path.split('.')[0];
   if (layer === 'mine') {
     if (head === 'theme') myTheme = 'paper';
@@ -1343,19 +1503,22 @@ async function clearSetting(app, layer, path) {
 // what the window shows before Save is what Save will do, provenance included.
 // Values arrive from the window's own controls, which only offer valid ones;
 // the real setters validate again when they land.
-async function simulateStaged(bare, staged) {
-  const copy = (o) => JSON.parse(JSON.stringify(o || {}));
+async function simulateStaged(bare: boolean, staged: unknown) {
+  const copy = (o: unknown) => JSON.parse(JSON.stringify(o || {}));
   const inScope = !!project && !bare;
   let owns = inScope && projectOwns();
-  const data = {
+  const data: Record<string, Record<string, unknown>> = {
     mine: copy({ theme: myTheme, view: myView, prefs, images }),
-    folder: owns ? copy(project.settings) : {},
+    folder: owns ? copy(project!.settings) : {},
     local: copy(localSettings),
   };
-  const out = { owns };
-  for (const op of Array.isArray(staged) ? staged : []) {
+  const out: {
+    owns: boolean; appearance?: unknown; zoom?: unknown; speech?: boolean; pinsOn?: boolean;
+    stack?: StackEntry[];
+  } = { owns };
+  for (const op of (Array.isArray(staged) ? staged : []) as StagedOp[]) {
     if (!op || typeof op !== 'object') continue;
-    const layer = data[op.layer] && (op.layer === 'mine' || inScope) ? data[op.layer] : null;
+    const layer = data[op.layer!] && (op.layer === 'mine' || inScope) ? data[op.layer!] : null;
     if (op.op === 'set' && layer && typeof op.path === 'string') {
       if (op.layer !== 'mine' && !isProjectPath(op.path)) continue;
       writePath(layer, op.path, op.value);
@@ -1364,11 +1527,11 @@ async function simulateStaged(bare, staged) {
       else if (op.layer === 'mine' && op.path === 'view') layer.view = 'split';
       else clearPath(layer, op.path);
     } else if (op.op === 'clearLayer' && layer && op.layer !== 'mine') {
-      data[op.layer] = {};
-    } else if (op.op === 'flavor' && FLAVORS[op.flavor] && layer) {
-      for (const [k, v] of Object.entries(FLAVORS[op.flavor])) writePath(layer, 'prefs.' + k, v);
+      data[op.layer!] = {};
+    } else if (op.op === 'flavor' && FLAVORS[op.flavor!] && layer) {
+      for (const [k, v] of Object.entries(FLAVORS[op.flavor!])) writePath(layer, 'prefs.' + k, v);
     } else if (op.op === 'call') {
-      const p = op.params || {};
+      const p: Record<string, unknown> = op.params || {};
       if (op.name === 'setAppearance') out.appearance = p.appearance;
       else if (op.name === 'setZoom') out.zoom = p.zoom;
       else if (op.name === 'aiSet' && 'speech' in p) out.speech = !!p.speech;
@@ -1376,7 +1539,7 @@ async function simulateStaged(bare, staged) {
       else if (op.name === 'setProjectSettings' && inScope) {
         owns = !!p.on;
         out.owns = owns;
-        data.folder = owns ? copy(await readProjectSettings(project.root, true)) : {};
+        data.folder = owns ? copy(await readProjectSettings(project!.root, true)) : {};
       }
     }
   }
@@ -1384,10 +1547,10 @@ async function simulateStaged(bare, staged) {
     ? [{ name: 'mine', data: data.mine }, { name: 'folder', data: owns ? data.folder : {} },
       { name: 'local', data: data.local }]
     : [{ name: 'mine', data: data.mine }];
-  return out;
+  return out as typeof out & { stack: StackEntry[] };
 }
 
-async function pushEffective(app) {
+async function pushEffective(app: TinyApp) {
   // The menu ticks answer for the focused scope; each WINDOW keeps its own —
   // a bare window resolves to Mine alone, its folder siblings to all three
   // layers. One broadcast used to send the folder's answer everywhere, which
@@ -1432,14 +1595,14 @@ const LINKS = new Set(['md', 'markdown', 'mdown', 'mkdn', 'mkd', 'mdwn', 'mdtxt'
 const INLINE_RE = /(!?\[(?:[^\][\\\n]|\\.)*\]\(\s*)(<[^<>\n]*>|[^()\s]*)((?:\s+"[^"\n]*")?\s*\))/g;
 const DEFN_RE = /^([ ]{0,3}\[(?:[^\][\\\n]|\\.)+\]:[ \t]*)(<[^<>\n]*>|\S+)/;
 
-const external = (t) => !t || t.startsWith('#') || t.startsWith('//') || /^[a-z][\w+.-]*:/i.test(t);
-const decodeTarget = (t) => { try { return decodeURI(t); } catch { return t; } };
+const external = (t: string) => !t || t.startsWith('#') || t.startsWith('//') || /^[a-z][\w+.-]*:/i.test(t);
+const decodeTarget = (t: string) => { try { return decodeURI(t); } catch { return t; } };
 // only what would break the inline form — re-encoding the whole path would
 // rewrite perfectly good names that merely contain a % or an accent
-const encodeTarget = (t) => t.replace(/[ ()]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+const encodeTarget = (t: string) => t.replace(/[ ()]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
 
-function normPath(p) {
-  const out = [];
+function normPath(p: string) {
+  const out: string[] = [];
   for (const seg of p.split('/')) {
     if (!seg || seg === '.') continue;
     if (seg === '..') { out.pop(); continue; }
@@ -1450,7 +1613,7 @@ function normPath(p) {
 
 // /a/b/c.md seen from /a/x -> ../b/c.md   (the backend's relativeTo; files.ts
 // has the page's copy, which answers the same question for inserted links)
-function relFrom(dir, target) {
+function relFrom(dir: string, target: string) {
   const a = dir.split('/').filter(Boolean), b = target.split('/').filter(Boolean);
   let i = 0;
   while (i < a.length && i < b.length && a[i] === b[i]) i++;
@@ -1462,17 +1625,19 @@ function relFrom(dir, target) {
 // site with its sources in src/ and its pictures under src/assets writes both
 // forms and expects both to work. Empty means the open folder itself, and with
 // no folder open a `/` is what it has always been: a path on the disk.
-const rootsOf = () => (project ? { root: project.root, ...effImages() } : null);
-const rootBase = (o, kind) =>
+/** What a leading `/` means in the open folder (see rootBase). */
+type Roots = ImageSettings & { root: string };
+const rootsOf = (): Roots | null => (project ? { root: project.root, ...effImages() } : null);
+const rootBase = (o: Roots, kind: string) =>
   normPath(o.root + '/' + ((kind === 'image' ? o.imageRoot : o.linkRoot) || ''));
 
 // Both readings of a target, best first. A document that genuinely holds a
 // filesystem path keeps working: the mapped answer is tried, then the literal
 // one — so the mapping adds a meaning rather than taking one away.
-function resolveTarget(target, dir, kind, roots) {
+function resolveTarget(target: string, dir: string, kind: string, roots: Roots | null) {
   if (!target.startsWith('/')) return [normPath(dir + '/' + target)];
   const lit = normPath(target);
-  const out = [];
+  const out: string[] = [];
   // A document under a PINNED folder may write /x meaning "from the pin"
   // (Format ▸ Link Options ▸ Paths from the Pinned Folder) — the language-
   // site pattern, where en/sms/index.md is /sms/index.md to everything in
@@ -1494,9 +1659,9 @@ function resolveTarget(target, dir, kind, roots) {
 
 // Every link in `text` that pointed at `from` (or at anything inside it, so a
 // renamed FOLDER carries its whole subtree), re-aimed at `to`.
-function rewriteLinks(text, docDir, from, to, roots) {
+function rewriteLinks(text: string, docDir: string, from: string, to: string, roots: Roots | null) {
   let count = 0;
-  const aim = (whole, head, written, tail = '') => {
+  const aim = (whole: string, head: string, written: string, tail = '') => {
     // <angle brackets> are a wrapper, not part of the path — and one the
     // rewrite has to put back, or a name with a space in it breaks on write
     const wrapped = written.startsWith('<') && written.endsWith('>');
@@ -1511,7 +1676,7 @@ function rewriteLinks(text, docDir, from, to, roots) {
     const kind = head.includes('![') ? 'image' : 'link';
     const tries = resolveTarget(dec, docDir, kind, roots);
 
-    let abs = null, next = null;
+    let abs: string | null = null, next: string | null = null;
     for (const cand of tries) {
       if (cand === from) { abs = cand; next = to; break; }
       if (cand.startsWith(from + '/')) { abs = cand; next = to + cand.slice(from.length); break; }
@@ -1523,7 +1688,7 @@ function rewriteLinks(text, docDir, from, to, roots) {
     // root-relative (re-derived, in case the file moved within the root), a
     // filesystem path stays one, and a relative path is recomputed — which is
     // what makes a rename ACROSS folders come out with the right ../
-    let out;
+    let out: string;
     if (!dec.startsWith('/')) out = relFrom(docDir, next);
     else if (roots && abs === tries[0] && tries.length > 1) {
       const base = rootBase(roots, kind);
@@ -1553,17 +1718,17 @@ function rewriteLinks(text, docDir, from, to, roots) {
 // they can see — and written back the same way: an unsaved buffer is edited in
 // place and left dirty, never written under them, which is the one thing
 // Replace in Folder can't do because it has no idea what its regex means.
-async function refsWalk(app, from, to, write) {
-  const files = project.files.filter((f) => LINKS.has(ext(f.name)));
+async function refsWalk(app: TinyApp, from: string, to: string, write: boolean) {
+  const files = project!.files.filter((f) => LINKS.has(ext(f.name)));
   const roots = rootsOf();
-  const hits = [];
+  const hits: { rel: string; path: string; name: string; count: number; dirty: boolean }[] = [];
   let total = 0, changed = 0, next = 0;
 
   async function worker() {
     while (next < files.length) {
       const f = files[next++];
       const open = findSheetByPath(f.path);
-      let text;
+      let text: string;
       if (open && open.kind === 'doc') text = open.liveText;
       else {
         try {
@@ -1630,22 +1795,22 @@ const ADOC_RE = /\b(?:image|video|audio|link|xref|include)::?([^\s[\]]+)\[/g;
 const NAME_RE = new RegExp('[^\\s"\'`()<>\\[\\]{}|,*=:;\\\\]+\\.(?:'
   + [...ASSETS].join('|') + ')(?![\\w-])', 'gi');
 
-const lc = (p) => p.toLowerCase();
+const lc = (p: string) => p.toLowerCase();
 
 // Every absolute path `written` could mean, seen from `dir` — as written
 // (for asking the disk, which on Linux minds case) and lowercased (for
 // comparing, which on the Mac doesn't).
-function readingsOf(written, dir, roots) {
+function readingsOf(written: string, dir: string, roots: Roots | null) {
   return rawReadings(written, dir, roots).map(lc);
 }
-function rawReadings(written, dir, roots) {
+function rawReadings(written: string, dir: string, roots: Roots | null) {
   let t = written.trim();
   if (t.startsWith('<') && t.endsWith('>')) t = t.slice(1, -1);
   if (external(t)) return [];
   t = t.replace(/[?#].*$/, '');
   if (!t) return [];
   const dec = decodeTarget(t);
-  const out = new Set();
+  const out = new Set<string>();
   for (const kind of ['image', 'link']) {
     for (const p of resolveTarget(dec, dir, kind, roots)) out.add(p);
   }
@@ -1655,22 +1820,22 @@ function rawReadings(written, dir, roots) {
 // The link targets in one document, and its text with them taken out — so the
 // name scan that follows doesn't count `a/logo.png`'s link as a mention of an
 // unrelated `b/logo.png`.
-function linksIn(text, dir, isAdoc, roots) {
-  const hits = [];
-  const take = (t) => { for (const p of readingsOf(t, dir, roots)) hits.push(p); return ''; };
+function linksIn(text: string, dir: string, isAdoc: boolean, roots: Roots | null) {
+  const hits: string[] = [];
+  const take = (t: string) => { for (const p of readingsOf(t, dir, roots)) hits.push(p); return ''; };
   const lines = text.split('\n');
   let fence = false;
   for (let i = 0; i < lines.length; i++) {
     if (/^\s*(```|~~~)/.test(lines[i])) { fence = !fence; continue; }
     if (fence) continue;              // a code sample isn't a link — but its names still count
     let l = lines[i];
-    if (isAdoc) l = l.replace(ADOC_RE, (w, t) => w.replace(t, take(t)));
+    if (isAdoc) l = l.replace(ADOC_RE, (w, t: string) => w.replace(t, take(t)));
     else {
-      l = l.replace(INLINE_RE, (w, h, t, tl) => h + take(t) + tl)
-        .replace(DEFN_RE, (w, h, t) => h + take(t));
+      l = l.replace(INLINE_RE, (w, h: string, t: string, tl: string) => h + take(t) + tl)
+        .replace(DEFN_RE, (w, h: string, t: string) => h + take(t));
     }
-    l = l.replace(ATTR_RE, (w, a, b) => {
-      const v = a ?? b;
+    l = l.replace(ATTR_RE, (w, a: string | undefined, b: string | undefined) => {
+      const v = (a ?? b)!;
       // srcset is "a.png 1x, b.png 2x"
       for (const part of v.split(',')) take(part.trim().split(/\s+/)[0] || '');
       return '';
@@ -1680,33 +1845,37 @@ function linksIn(text, dir, isAdoc, roots) {
   return { hits, rest: lines.join('\n') };
 }
 
-async function scanUnused(dir, only = null) {
+async function scanUnused(dir?: string | null, only: string[] | null = null) {
   if (!project) return null;
   const root = project.root;
   const scope = normPath(dir || root);
   if (scope !== root && !scope.startsWith(root + '/')) return null;
   const roots = rootsOf();
-  const inScope = (p) => p.startsWith(scope + '/');
+  const inScope = (p: string) => p.startsWith(scope + '/');
   const want = only && new Set(only);
   const candidates = project.files.filter((f) => inScope(f.path) && ASSETS.has(ext(f.name))
     && !f.rel.startsWith('.nib/') && (!want || want.has(f.path)));
-  const result = { scope, rel: scope === root ? '' : relOf(root, scope),
+  const result: {
+    scope: string; rel: string; unused: UnusedRow[];
+    named: (UnusedRow & { where: string[]; more: number })[];
+    checked: number; truncated: boolean;
+  } = { scope, rel: scope === root ? '' : relOf(root, scope),
     unused: [], named: [], checked: candidates.length, truncated: !!project.truncated };
   if (!candidates.length) return result;
 
   const byPath = new Map(candidates.map((f) => [lc(f.path), f]));
-  const byName = new Map();
+  const byName = new Map<string, FileEntry[]>();
   for (const f of candidates) {
     const k = lc(f.name);
     if (!byName.has(k)) byName.set(k, []);
-    byName.get(k).push(f);
+    byName.get(k)!.push(f);
   }
   // a name with a space or a bracket in it never comes out of NAME_RE whole,
   // so those few are looked for as plain text (raw and %-encoded) instead
   const odd = candidates.filter((f) => !new RegExp('^' + NAME_RE.source + '$', 'i').test(f.name))
     .map((f) => ({ f, needles: [lc(f.name), lc(encodeURI(f.name)), lc(encodeTarget(f.name))] }));
-  const linked = new Set();             // lowercased paths some link resolves to
-  const seen = new Map();               // candidate path -> where its name was written
+  const linked = new Set<string>();             // lowercased paths some link resolves to
+  const seen = new Map<string, Set<string>>();               // candidate path -> where its name was written
 
   const readers = project.files.filter((f) => LINKS.has(ext(f.name)) || NAMERS.has(ext(f.name)));
   let next = 0;
@@ -1714,7 +1883,7 @@ async function scanUnused(dir, only = null) {
     while (next < readers.length) {
       const f = readers[next++];
       const open = findSheetByPath(f.path);
-      let text;
+      let text: string;
       if (open && open.kind === 'doc') text = open.liveText;
       else {
         try {
@@ -1729,13 +1898,13 @@ async function scanUnused(dir, only = null) {
         for (const p of r.hits) linked.add(p);
         rest = r.rest;
       }
-      const mention = (c) => {
+      const mention = (c: FileEntry) => {
         if (c.path === f.path) return;
         if (!seen.has(c.path)) seen.set(c.path, new Set());
-        seen.get(c.path).add(f.rel);
+        seen.get(c.path)!.add(f.rel);
       };
       for (const m of rest.matchAll(NAME_RE)) {
-        const name = lc(decodeTarget(m[0]).split('/').pop());
+        const name = lc(decodeTarget(m[0]).split('/').pop()!);
         for (const c of byName.get(name) || []) mention(c);
       }
       if (odd.length) {
@@ -1752,7 +1921,7 @@ async function scanUnused(dir, only = null) {
     try { size = (await tjs.stat(f.path)).size; } catch { continue; }   // gone meanwhile
     const where = [...(seen.get(f.path) || [])].sort();
     if (SERVED_BY_NAME.test(f.rel)) where.unshift('served by name (public/ or a favicon)');
-    const row = { path: f.path, rel: f.rel, name: f.name, size, kind: IMAGES.has(ext(f.name)) ? 'image' : 'other' };
+    const row: UnusedRow = { path: f.path, rel: f.rel, name: f.name, size, kind: IMAGES.has(ext(f.name)) ? 'image' : 'other' };
     if (where.length) result.named.push({ ...row, where: where.slice(0, 4), more: Math.max(0, where.length - 4) });
     else result.unused.push(row);
   }
@@ -1763,7 +1932,7 @@ async function scanUnused(dir, only = null) {
 
 // The assets one document links, as lowercased absolute paths — read just
 // before Remove sends it to the Trash, the last moment its text exists.
-function assetRefsOf(text, path, roots) {
+function assetRefsOf(text: string, path: string, roots: Roots | null) {
   const dir = path.slice(0, path.lastIndexOf('/'));
   const { hits } = linksIn(text, dir, ext(path).startsWith('a'), roots);
   return [...new Set(hits.filter((p) => ASSETS.has(ext(p))))];
@@ -1780,11 +1949,11 @@ function assetRefsOf(text, path, roots) {
 // panel asks on focus, on save and on tab switch, often all together.
 
 const MENU_WALK_MAX = 60000;
-let menuMemo = null;             // { root, at, res }
+let menuMemo: { root: string; at: number; res: SiteMenusResult } | null = null;             // { root, at, res }
 
-async function menuRels(root) {
-  const out = [];
-  async function dir(path, rel, depth) {
+async function menuRels(root: string) {
+  const out: string[] = [];
+  async function dir(path: string, rel: string, depth: number) {
     if (out.length >= MENU_WALK_MAX || depth > 12) return;
     let ents;
     try { ents = await tjs.readDir(path); } catch { return; }
@@ -1799,12 +1968,12 @@ async function menuRels(root) {
   return out;
 }
 
-async function siteMenus({ fresh = false } = {}) {
+async function siteMenus({ fresh = false } = {}): Promise<SiteMenusResult> {
   if (!project) return { sites: [] };
   const root = project.root;
   if (!fresh && menuMemo && menuMemo.root === root && Date.now() - menuMemo.at < 1500) return menuMemo.res;
   const files = await menuRels(root);
-  const read = async (rel) => {
+  const read = async (rel: string) => {
     const p = root + '/' + rel;
     const open = findSheetByPath(p);
     if (open && open.kind === 'doc') return open.liveText;
@@ -1816,10 +1985,10 @@ async function siteMenus({ fresh = false } = {}) {
       return await readText(p);
     } catch { return null; }
   };
-  let sites;
+  let sites: MenuSite[];
   try { sites = await readSites({ files, read }); } catch (e) {
     sites = [];
-    console.log('site menus:', e && e.stack || e);
+    console.log('site menus:', e && (e as Error).stack || e);
   }
   const res = { root, sites: slimSites(sites) };
   if (project && project.root === root) menuMemo = { root, at: Date.now(), res };
@@ -1829,14 +1998,16 @@ async function siteMenus({ fresh = false } = {}) {
 // The page only asks WHETHER an entry has a place in its file (to offer
 // dragging); the spans, JSON paths and id maps are for the backend's own
 // edit, which reads the menu fresh anyway. Flags instead keep the push small.
-function slimSites(sites) {
-  const items = (list) => {
+// Trimmed in place: what comes back is the same objects, in the page's looser
+// shape (spans replaced by flags).
+function slimSites(sites: MenuSite[]): Site[] {
+  const items = (list: SiteMenuItem[] | undefined) => {
     for (const it of list || []) {
       for (const k of ['span', 'itemsSpan', 'textSpan', 'jpath', 'listPath']) if (it[k]) it[k] = 1;
       items(it.items);
     }
   };
-  for (const s of sites) {
+  for (const s of sites as unknown as Site[]) {
     delete s.rewrites;
     for (const m of s.menus) {
       delete m.ids;
@@ -1847,7 +2018,7 @@ function slimSites(sites) {
       items(m.items);
     }
   }
-  return sites;
+  return sites as unknown as Site[];
 }
 
 // An edit made in the ☰ face — move, rename, remove, add — written into the
@@ -1857,12 +2028,12 @@ function slimSites(sites) {
 // so nothing typed there is ever written behind its back. Each write keeps
 // what it replaced, for Undo — only while the file still says what the edit
 // left, so an undo never clobbers a change made since.
-const menuUndo = [];                   // { path, before, after, label }
-const menuRedo = [];
+const menuUndo: MenuStep[] = [];                   // { path, before, after, label }
+const menuRedo: MenuStep[] = [];
 
 // text null: the file didn't exist before the edit made it (a new
 // _category_.json, a folder's first meta.json) — undo takes it away again
-async function writeMenuFile(app, path, text) {
+async function writeMenuFile(app: TinyApp, path: string, text: string | null) {
   if (text === null) {
     try { await tjs.remove(path); } catch { /* already gone */ }
     menuMemo = null;
@@ -1885,11 +2056,11 @@ const siteMenuUndoLabels = () => [
 ];
 
 // One step is every file one edit wrote (a renumbered folder is several)
-async function stepMenuHistory(app, from, to, expect, write, word) {
+async function stepMenuHistory(app: TinyApp, from: MenuStep[], to: MenuStep[], expect: 'before' | 'after', write: 'before' | 'after', word: string) {
   const u = from.pop();
   if (!u) return { error: 'Nothing to ' + word + ' in the menu.' };
   for (const f of u.files) {
-    let now;
+    let now: string | null | undefined;
     try { now = await currentText(f.path); } catch { now = undefined; }   // can't read = changed
     if (now !== f[expect]) {
       menuUndo.length = menuRedo.length = 0;
@@ -1910,7 +2081,7 @@ async function stepMenuHistory(app, from, to, expect, write, word) {
 // whole), or not a plain file (a symlink could aim a menu write at anything
 // on the disk; one to /dev/zero stats as size 0) — THROWS, and the edit is
 // refused rather than overwriting it, or its undo deleting it.
-async function currentText(path) {
+async function currentText(path: string): Promise<string | null> {
   const open = findSheetByPath(path);
   if (open && open.kind === 'doc') return open.liveText;
   let st;
@@ -1926,18 +2097,21 @@ async function currentText(path) {
 // folder: Go ▸ Find Broken Links. A link is broken when none of its readings
 // exists — the tree answers first, the disk second, because the tree leaves
 // out folders, dot-files, node_modules and anything outside the project.
-async function brokenLinks(gone = null) {
+async function brokenLinks(gone: string[] | null = null) {
   const goneLc = gone && new Set(gone.map(lc));
-  const here = new Set(project.files.map((f) => lc(f.path)));
-  const known = new Map();              // path -> exists, asked of the disk once
-  const onDisk = async (p) => {
+  const here = new Set(project!.files.map((f) => lc(f.path)));
+  const known = new Map<string, Promise<boolean>>();              // path -> exists, asked of the disk once
+  const onDisk = async (p: string) => {
     if (!known.has(p)) known.set(p, exists(p));
     return known.get(p);
   };
   const roots = rootsOf();
-  const docs = project.files.filter((f) => LINKS.has(ext(f.name)));
+  const docs = project!.files.filter((f) => LINKS.has(ext(f.name)));
   const MAX = gone ? 200 : 500;
-  const out = [];
+  const out: {
+    path: string; rel: string; name: string; line: number; col: number; len: number;
+    text: string; at: number; to: string;
+  }[] = [];
   let next = 0;
   async function worker() {
     while (next < docs.length && out.length < MAX) {
@@ -1957,7 +2131,7 @@ async function brokenLinks(gone = null) {
       for (let i = 0; i < lines.length; i++) {
         if (/^\s*(```|~~~)/.test(lines[i])) { fence = !fence; continue; }
         if (fence) continue;
-        const found = [];
+        const found: [string, number][] = [];
         for (const m of lines[i].matchAll(INLINE_RE)) found.push([m[2], m.index + m[1].length]);
         const d = lines[i].match(DEFN_RE);
         if (d) found.push([d[2], d[1].length]);
@@ -1971,10 +2145,10 @@ async function brokenLinks(gone = null) {
           if (alive) continue;
           // the line around the link, so a long paragraph still shows it
           const line = lines[i];
-          const start = Math.max(line.match(/^\s*/)[0].length, col - 50);
+          const start = Math.max(line.match(/^\s*/)![0].length, col - 50);
           out.push({ path: f.path, rel: f.rel, name: f.name, line: i, col, len: t.length,
             text: line.slice(start, start + 220), at: col - start,
-            to: to.startsWith(project.root + '/') ? relOf(project.root, to) : to });
+            to: to.startsWith(project!.root + '/') ? relOf(project!.root, to) : to });
         }
       }
     }
@@ -2005,7 +2179,7 @@ const HITS_MAX = 2000;                 // across the whole search
 const HITS_PER_FILE = 200;
 const LINE_MAX = 400;                  // of context per hit, so a minified line can't flood the panel
 
-function buildRe(pattern, flags) {
+function buildRe(pattern: string, flags: string) {
   if (!pattern) return null;
   try { return new RegExp(pattern, flags.includes('g') ? flags : flags + 'g'); }
   catch { return null; }
@@ -2014,10 +2188,10 @@ function buildRe(pattern, flags) {
 // Every match in one string, with the line it fell on and that line's text.
 // The line number is carried forward rather than recomputed, so a file with a
 // thousand hits still costs one pass.
-function scanText(text, re) {
-  const hits = [];
+function scanText(text: string, re: RegExp) {
+  const hits: SearchHit[] = [];
   re.lastIndex = 0;
-  let line = 0, counted = 0, m;
+  let line = 0, counted = 0, m: RegExpExecArray | null;
   while ((m = re.exec(text))) {
     const i = m.index;
     for (let k = counted; k < i; k++) if (text.charCodeAt(k) === 10) line++;
@@ -2037,16 +2211,16 @@ function scanText(text, re) {
 
 // One walk of the project's text files. `replace` turns it into the write —
 // same scan, same pattern, so what you replace is exactly what you were shown.
-async function searchProject(app, re, replace, within) {
-  const files = project.files.filter((f) => TEXTY.has(ext(f.name)) && inScope(within, f.path));
-  const found = [];
-  const skipped = [];
+async function searchProject(app: TinyApp, re: RegExp, replace: string | null, within: string[] | null) {
+  const files = project!.files.filter((f) => TEXTY.has(ext(f.name)) && inScope(within, f.path));
+  const found: { path: string; rel: string; name: string; hits: SearchHit[] }[] = [];
+  const skipped: string[] = [];
   let total = 0, changed = 0, truncated = false, next = 0;
 
   async function worker() {
     while (next < files.length && !truncated) {
       const f = files[next++];
-      let text;
+      let text: string;
       try {
         if ((await tjs.stat(f.path)).size > SEARCH_MAX_BYTES) continue;
         text = await readText(f.path);
@@ -2092,16 +2266,16 @@ async function searchProject(app, re, replace, within) {
 // itself, or Actions ▸ Reload. Availability is worked out per REQUEST rather
 // than cached, because it depends on what the asking window is showing: the
 // same action is live in one window and greyed in the next.
-let actions = { list: [], problems: [] };
+let actions: ActionSet = { list: [], problems: [] };
 
-async function reloadActions(app) {
+async function reloadActions(app: TinyApp) {
   actions = await loadActions(app, project && project.root, projectOwns());
   warmActionIcons(app);
   await refreshMenu(app);
   app.push('actions', { count: actions.list.length, problems: actions.problems });
 }
 
-const findAction = (scope, id) =>
+const findAction = (scope: string, id: string) =>
   actions.list.find((a) => a.scope === scope && a.id === id);
 
 // ------------------------------------------------------------- ai approvals
@@ -2111,38 +2285,38 @@ const findAction = (scope, id) =>
 // push and the promise waits here for `aiApprove` to come back. The decision
 // is never made in the page's favour by default: a window that goes away, or
 // a person who walks off, both end in "no" rather than in a hung run.
-const aiAsks = new Map();
+const aiAsks = new Map<string, (v: unknown) => void>();
 let askSeq = 0;
 const ASK_PATIENCE = 5 * 60 * 1000;
 
-function aiHostFor(app, win) {
+function aiHostFor(app: TinyApp, win: string | null | undefined): ActionHost {
   const target = () => (win && wins.has(win) ? app.window(win) : app);
   // One shape for every mid-run question: push the sheet, park on the
   // registry, and resolve `fallback` if nobody answers inside the patience
   // window — a sheet that outlives its reader must not hang the run.
-  const askPage = (name, req, fallback) => new Promise((resolve) => {
+  const askPage = (name: string, req: object, fallback: unknown) => new Promise((resolve) => {
     const askId = 'k' + (++askSeq);
     let done = false;
-    const answer = (v) => { if (!done) { done = true; aiAsks.delete(askId); resolve(v); } };
+    const answer = (v: unknown) => { if (!done) { done = true; aiAsks.delete(askId); resolve(v); } };
     aiAsks.set(askId, answer);
     setTimeout(() => answer(fallback), ASK_PATIENCE);
     target().push(name, { askId, ...req });
   });
   return {
-    ask: (req) => askPage('ai-approve', req, false),
+    ask: (req: object) => askPage('ai-approve', req, false),
 
     // ctx.prompt / ctx.confirm / ctx.alert — a js action talking to the
     // person mid-run (actions.ts jsApi). An unanswered prompt is a cancel,
     // an unanswered confirm is a no, an unread alert just lets the run go on.
-    promptUser: (req) => askPage('action-prompt', req, null),
-    confirmUser: (req) => askPage('action-confirm', req, false),
-    alertUser: (req) => askPage('action-alert', req, true),
-    pickUser: (req) => askPage('action-pick', req, null),
+    promptUser: (req: object) => askPage('action-prompt', req, null),
+    confirmUser: (req: object) => askPage('action-confirm', req, false),
+    alertUser: (req: object) => askPage('action-alert', req, true),
+    pickUser: (req: object) => askPage('action-pick', req, null),
 
     // Through the page, deliberately: applyText() is what output:"replace"
     // already uses, so the change is one ⌘Z away like everything else. A
     // model rewriting your document must not be the one edit undo can't see.
-    applyDoc: async (text) => {
+    applyDoc: async (text: string) => {
       if (!win || !wins.has(win)) throw new Error('no document window to write into');
       app.window(win).push('ai-apply', { text });
       const d = activeSheet(win);
@@ -2151,9 +2325,9 @@ function aiHostFor(app, win) {
     },
 
     // create_action writes into YOUR file, as text, so its comments live.
-    addAction: async (action) => {
+    addAction: async (action: TidyAction) => {
       const path = await globalActionsPath(app);
-      let text = null;
+      let text: string | null = null;
       try { text = await readText(path); } catch { /* first one */ }
       const next = appendActionText(text, action);
       if (next === null) {
@@ -2177,7 +2351,7 @@ function aiHostFor(app, win) {
 // open" — so for that window there is no folder here either. Anything else and
 // the menu would offer a folder's actions to a window that is deliberately not
 // in it.
-function actionCtx(given = {}, bare) {
+function actionCtx(given: ActionCtx = {}, bare: boolean): ActionCtx {
   const file = given.file ? tidyPath(given.file) : null;
   const root = project && !bare ? project.root : null;
   const scope = file && !bare ? pinScope('docs', file) : null;
@@ -2188,10 +2362,10 @@ function actionCtx(given = {}, bare) {
 }
 
 // Which window is asking, and has it opted out of the folder?
-const isBare = (meta) => !!(meta && meta.window && bareWins.has(meta.window));
+const isBare = (meta: Meta | undefined) => !!(meta && meta.window && bareWins.has(meta.window));
 
 // The actions a given window may see: a bare window sees only your own.
-const visibleActions = (bare) =>
+const visibleActions = (bare: boolean) =>
   actions.list.filter((a) => !(bare && a.scope === 'project'));
 
 // ------------------------------------------------------------ action icons
@@ -2210,28 +2384,28 @@ const visibleActions = (bare) =>
 // holds search previews — so browsing sixty rockets doesn't write sixty
 // bodies into the store for the one you picked.
 const ICONIFY_API = 'https://api.iconify.design';
-const isIconName = (s) => typeof s === 'string' && /^[a-z0-9-]+:[a-z0-9-]+$/.test(s);
-let iconStore = null;                  // store-backed, mirrors 'iconcache'
-const iconMem = {};                    // this run only — search previews
-const iconMisses = new Set();          // failed once this run: don't re-ask
-async function iconCacheLoad(app) {
+const isIconName = (s: unknown): s is string => typeof s === 'string' && /^[a-z0-9-]+:[a-z0-9-]+$/.test(s);
+let iconStore: Record<string, IconRec> | null = null;                  // store-backed, mirrors 'iconcache'
+const iconMem: Record<string, IconRec> = {};                    // this run only — search previews
+const iconMisses = new Set<string>();          // failed once this run: don't re-ask
+async function iconCacheLoad(app: TinyApp): Promise<Record<string, IconRec>> {
   if (!iconStore) iconStore = (await app.store.get('iconcache')) || {};
-  return iconStore;
+  return iconStore!;
 }
-const iconSync = (n) => (iconStore && iconStore[n]) || iconMem[n] || null;
+const iconSync = (n: string) => (iconStore && iconStore[n]) || iconMem[n] || null;
 // A body is trusted as far as a picture. Iconify serves plain path markup;
 // anything that could script, load, or link out is refused whole rather
 // than cleaned — these strings end up innerHTML'd into pages.
-const iconSafe = (body) => typeof body === 'string' && body.length < 20000
+const iconSafe = (body: unknown) => typeof body === 'string' && body.length < 20000
   && !/<\s*(script|foreignObject|image|use|animate)\b|\bhref\s*=|\bon[a-z]+\s*=|javascript:/i
     .test(body);
 
 // Resolve names to {body,width,height}, fetching what neither cache has.
 // `persist` says these names are in USE (an actions file references them) —
 // they land in the store; previews stay in memory.
-async function iconResolve(app, names, persist) {
+async function iconResolve(app: TinyApp, names: unknown, persist: boolean) {
   const st = await iconCacheLoad(app);
-  const uniq = [...new Set([].concat(names || []).filter(isIconName))];
+  const uniq = [...new Set(([] as unknown[]).concat(names || []).filter(isIconName))];
   let dirty = false;
   if (persist) {
     for (const n of uniq) {
@@ -2239,7 +2413,7 @@ async function iconResolve(app, names, persist) {
     }
   }
   const need = uniq.filter((n) => !st[n] && !iconMem[n] && !iconMisses.has(n));
-  const byPrefix = new Map();
+  const byPrefix = new Map<string, string[]>();
   for (const n of need) {
     const [prefix, name] = n.split(':');
     byPrefix.set(prefix, [...(byPrefix.get(prefix) || []), name]);
@@ -2248,12 +2422,12 @@ async function iconResolve(app, names, persist) {
   for (const [prefix, wants] of byPrefix) {
     try {
       const r = await fetch(ICONIFY_API + '/' + prefix + '.json?icons=' + wants.join(','));
-      const j = await r.json();
+      const j: IconifyIcons = await r.json();
       for (const name of wants) {
         const full = prefix + ':' + name;
         const ic = j && j.icons && j.icons[name];
         if (ic && iconSafe(ic.body)) {
-          const rec = { body: ic.body,
+          const rec: IconRec = { body: ic.body,
             width: ic.width || j.width || 16, height: ic.height || j.height || 16 };
           if (persist) { st[full] = rec; dirty = true; } else iconMem[full] = rec;
           fetched = true;
@@ -2262,7 +2436,7 @@ async function iconResolve(app, names, persist) {
     } catch { for (const name of wants) iconMisses.add(prefix + ':' + name); }
   }
   if (dirty) await app.store.set('iconcache', st);
-  const icons = {};
+  const icons: Record<string, IconRec> = {};
   for (const n of uniq) { const rec = iconSync(n); if (rec) icons[n] = rec; }
   return { icons, fetched };
 }
@@ -2271,7 +2445,7 @@ async function iconResolve(app, names, persist) {
 // and tell the pages if anything new arrived — they re-ask actionsList and
 // the icons appear. Never awaited from a listing, so a dead network can't
 // hold a menu open.
-function warmActionIcons(app) {
+function warmActionIcons(app: TinyApp) {
   const names = actions.list.map((a) => a.icon).filter(isIconName);
   if (!names.length) return;
   iconResolve(app, names, true)
@@ -2279,12 +2453,12 @@ function warmActionIcons(app) {
     .catch(() => {});
 }
 
-async function actionRow(app, a, ctx, aiWhy) {
+async function actionRow(app: TinyApp, a: Action, ctx: ActionCtx, aiWhy: string | null) {
   const why = availability(a, ctx);
   const trust = await trustState(app, a);
   // Only worth a stat storm when the button would otherwise work
   let missing = false;
-  if (!why && a.type === 'cli' && !a.shell) missing = !(await whichBin(a.run[0], a.path || [], a.scope !== 'project'));
+  if (!why && a.type === 'cli' && !a.shell) missing = !(await whichBin(a.run![0], a.path || [], a.scope !== 'project'));
   return {
     scope: a.scope, id: a.id, label: a.label, type: a.type, needs: a.needs,
     output: a.output, stdin: a.stdin, save: a.save, confirm: a.confirm, trust,
@@ -2294,7 +2468,7 @@ async function actionRow(app, a, ctx, aiWhy) {
     key: keyOf('act:' + a.scope + ':' + a.id) || null,
     // is this action ABOUT a file? — what the file tree's right-click offers
     fileScoped: a.needs === 'file' || !!a.match,
-    why: why || (missing ? a.run[0] + ' — not found' : null)
+    why: why || (missing ? a.run![0] + ' — not found' : null)
       || (a.type === 'ai' ? aiWhy : null),
     missing,
   };
@@ -2304,7 +2478,7 @@ async function actionRow(app, a, ctx, aiWhy) {
 // — not found". Asked ONCE per menu, not once per action: for the Apple
 // provider it is a round trip to the launcher, and a folder with six prompts
 // in it shouldn't make six of them.
-async function aiUnavailable(app) {
+async function aiUnavailable(app: TinyApp) {
   const c = await aiConfig(app);
   if (!c.enabled) return 'AI is off — Actions ▸ AI Settings…';
   const st = await providerState(app, c.provider);
@@ -2314,7 +2488,7 @@ async function aiUnavailable(app) {
 export const api = {
   ...(smokeOn ? smokeApi : {}),     // pnpm smoke only (smoke.ts)
   // Every window boots here; meta.window says which one is asking.
-  boot: async (_p, app, meta) => {
+  boot: async (_p: unknown, app: TinyApp, meta: TinyApiMeta) => {
     const appearance = (await app.store.get('appearance')) || 'system';
     const outline = (await app.store.get('outline')) || false;
     const editable = (await app.store.get('editable')) || false;
@@ -2360,7 +2534,7 @@ export const api = {
 
   // The page owns the folder picker (dialogs are page-side), so it either
   // hands us a path or asks us to remember the last one on launch.
-  openFolder: async ({ path: given, quiet }, app, meta) => {
+  openFolder: async ({ path: given, quiet }: { path?: string | null; quiet?: boolean }, app: TinyApp, meta?: Meta) => {
     const path = tidyPath(given);
     if (!path) return null;
     try { if (!(await tjs.stat(path)).isDirectory) return null; } catch { return null; }
@@ -2375,12 +2549,12 @@ export const api = {
     // README (or the first Markdown file at the root) so the tree has a home.
     if (!quiet && !wins.size) {
       let restored = false;
-      const st = await app.store.get(fstateKey(path));
+      const st: FolderState | null = await app.store.get(fstateKey(path));
       if (st && Array.isArray(st.windows)) {
         restoringFolder = true;
         try {
           for (const wst of st.windows) {
-            let win = null;
+            let win: string | null = null;
             for (const f of wst.files || []) {
               if (!(await exists(f))) continue;      // moved or gone: skipped
               win = await openDoc(app, f, win
@@ -2389,18 +2563,18 @@ export const api = {
             }
             const act = win && wst.active && findSheetByPath(wst.active);
             if (act && act.win === win) {
-              wins.get(win).active = act.id;
-              app.window(win).push('show-sheet', sheetPayload(act));
-              pushTabs(app, win);
+              wins.get(win!)!.active = act.id;
+              app.window(win!).push('show-sheet', sheetPayload(act));
+              pushTabs(app, win!);
             }
           }
         } finally { restoringFolder = false; }
       }
       if (!restored) {
-        const top = project.files.filter((f) => f.kind === 'doc' && !f.rel.includes('/'));
+        const top = project!.files.filter((f) => f.kind === 'doc' && !f.rel.includes('/'));
         const pick = top.find((f) => /^readme\.(md|markdown|mdown|mkdn)$/i.test(f.name)) || top[0];
         if (pick) await openDoc(app, pick.path, { withFolder: true });
-        else app.push('toast', { text: p.name + ' — no Markdown files at the top level' });
+        else app.push('toast', { text: p!.name + ' — no Markdown files at the top level' });
       }
     }
     // The scope may have just changed hands — a bare window that opened a
@@ -2415,7 +2589,7 @@ export const api = {
   // What this window may run right now, in menu order: yours first, then the
   // folder's. Everything unavailable comes back too, with the reason — the ⚡
   // menu greys those rather than hiding them.
-  actionsList: async ({ ctx } = {}, app, meta) => {
+  actionsList: async ({ ctx }: { ctx?: ActionCtx } = {}, app: TinyApp, meta: TinyApiMeta) => {
     const bare = isBare(meta);
     const c = actionCtx(ctx, bare);
     const seen = visibleActions(bare);
@@ -2431,14 +2605,14 @@ export const api = {
   },
 
   // ::: embed — the page asking for a URL's oEmbed answer (oembed.ts).
-  oembedGet: async ({ url }) => {
+  oembedGet: async ({ url }: { url?: unknown }) => {
     if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return { error: 'not a URL' };
     return oembedGet(url);
   },
 
   // Manage Actions vetting a js action's script before it saves: does it
   // parse? Nothing is executed — see checkJsSyntax.
-  actionCheckJs: async ({ script }) => {
+  actionCheckJs: async ({ script }: { script?: unknown }) => {
     const bad = checkJsSyntax(String(script ?? ''));
     return bad ? { error: bad.message, line: bad.line } : {};
   },
@@ -2446,13 +2620,13 @@ export const api = {
   // Manage Actions ▸ the icon search. Iconify's search wants a word, gives
   // back names; the bodies come along resolved so the grid can draw them.
   // Previews stay in the in-memory cache — see iconResolve.
-  iconSearch: async ({ query }, app) => {
+  iconSearch: async ({ query }: { query?: string }, app: TinyApp) => {
     const q = String(query || '').trim();
     if (!q) return { icons: [] };
     try {
       const r = await fetch(ICONIFY_API + '/search?query=' + encodeURIComponent(q)
         + '&limit=64');
-      const j = await r.json();
+      const j: { icons?: unknown[] } | null = await r.json();
       const names = ((j && j.icons) || []).filter(isIconName).slice(0, 60);
       const got = await iconResolve(app, names, false);
       return { icons: names.filter((n) => got.icons[n])
@@ -2464,8 +2638,8 @@ export const api = {
 
   // Names to bodies, for the editor sheet's previews (the row list, the
   // field's swatch). Preview-grade: nothing is persisted here.
-  iconGet: async ({ names }, app) => {
-    const r = await iconResolve(app, [].concat(names || []).slice(0, 100), false);
+  iconGet: async ({ names }: { names?: string | string[] }, app: TinyApp) => {
+    const r = await iconResolve(app, ([] as string[]).concat(names || []).slice(0, 100), false);
     return { icons: r.icons };
   },
 
@@ -2475,7 +2649,10 @@ export const api = {
   // Trust is answered HERE rather than in the page, because a page that could
   // decide it was trusted would be the whole hole this is meant to close. An
   // unapproved action comes back with what it would do, and the page asks.
-  actionRun: async ({ scope, id, ctx, trust, confirmed, inputs }, app, meta) => {
+  actionRun: async ({ scope, id, ctx, trust, confirmed, inputs }: {
+    scope: string; id: string; ctx?: ActionCtx; trust?: 'once' | 'always'; confirmed?: boolean;
+    inputs?: Record<string, unknown>;
+  }, app: TinyApp, meta?: Meta) => {
     const bare = isBare(meta);
     const a = findAction(scope, id);
     if (!a || (bare && a.scope === 'project')) {
@@ -2507,7 +2684,7 @@ export const api = {
     }
 
     const win = meta && meta.window;
-    const send = (name, payload) => {
+    const send = (name: string, payload: unknown) => {
       if (win && wins.has(win)) app.window(win).push(name, payload);
       else app.push(name, payload);
     };
@@ -2519,7 +2696,7 @@ export const api = {
     return { ...started, label: a.label, mode: a.output };
   },
 
-  actionCancel: async ({ runId }) => cancelRun(runId),
+  actionCancel: async ({ runId }: { runId: string }) => cancelRun(runId),
 
   // ---------------------------------------------------------------- the ai
   //
@@ -2528,14 +2705,14 @@ export const api = {
   // actions travel with a git clone, so an endpoint a folder could set would
   // be an endpoint a stranger could set.
 
-  aiStatus: async (_p, app) => aiStatus(app),
+  aiStatus: async (_p: unknown, app: TinyApp) => aiStatus(app),
 
   // Only a page knows whether its engine has a speech recogniser, and the
   // Settings window is a different page from the one that can answer. So the
   // document window reports it and the backend remembers.
-  speechPossible: async ({ yes }) => { speechOk = !!yes; return true; },
+  speechPossible: async ({ yes }: { yes?: boolean }) => { speechOk = !!yes; return true; },
 
-  aiSet: async (patch, app) => {
+  aiSet: async (patch: Record<string, unknown> | null, app: TinyApp) => {
     const c = await setAiConfig(app, patch || {});
     await refreshMenu(app);
     app.push('ai-config', { enabled: c.enabled, speech: c.speech });
@@ -2544,21 +2721,21 @@ export const api = {
 
   // The key never comes back out. It goes to the Keychain (or the store, when
   // the Keychain won't have it — the panel is told which, and says so).
-  aiSetKey: async ({ provider, key }, app) => {
+  aiSetKey: async ({ provider, key }: { provider: string; key: string }, app: TinyApp) => {
     const r = await setKey(app, provider, key);
     return { ...r, status: await aiStatus(app) };
   },
-  aiForgetKey: async ({ provider }, app) => {
+  aiForgetKey: async ({ provider }: { provider: string }, app: TinyApp) => {
     await deleteKey(app, provider);
     return { ok: true, status: await aiStatus(app) };
   },
 
-  aiModels: async ({ provider }, app) => listModels(app, provider),
+  aiModels: async ({ provider }: { provider: string }, app: TinyApp) => listModels(app, provider),
 
   // "Does this actually work?" — the question every settings panel with a key
   // field in it should be able to answer without you writing a document to
   // find out.
-  aiTest: async ({ provider }, app) => {
+  aiTest: async ({ provider }: { provider: string }, app: TinyApp) => {
     try {
       const { generate } = await import('./ai.ts');
       const r = await generate(app, {
@@ -2566,14 +2743,14 @@ export const api = {
       });
       return { ok: true, text: (r.text || '').trim().slice(0, 200), model: r.model };
     } catch (e) {
-      return { ok: false, error: e.message || String(e) };
+      return { ok: false, error: (e as Error).message || String(e) };
     }
   },
 
   // The page answering an approval sheet. The request was made by a tool
   // mid-run, so the answer arrives here and unblocks the promise it is waiting
   // on — the decision is the person's, and it is made where dialogs live.
-  aiApprove: async ({ askId, ok }) => {
+  aiApprove: async ({ askId, ok }: { askId: string; ok?: boolean }) => {
     const resolve = aiAsks.get(askId);
     if (!resolve) return false;
     aiAsks.delete(askId);
@@ -2583,7 +2760,7 @@ export const api = {
 
   // …and answering a ctx.prompt / ctx.confirm / ctx.alert, where the answer
   // is a value rather than a yes. Absent means cancelled.
-  actionAnswer: async ({ askId, value }) => {
+  actionAnswer: async ({ askId, value }: { askId: string; value?: unknown }) => {
     const resolve = aiAsks.get(askId);
     if (!resolve) return false;
     aiAsks.delete(askId);
@@ -2592,7 +2769,7 @@ export const api = {
   },
 
   // ⌘+ / ⌘− / ⌥⌘0 from any window, and View ▸ Zoom. dir 0 is "back to normal".
-  zoomStep: async ({ dir }, app) => {
+  zoomStep: async ({ dir }: { dir: number }, app: TinyApp) => {
     const near = ZOOM_STEPS.reduce((best, z) =>
       (Math.abs(z - uiZoom) < Math.abs(best - uiZoom) ? z : best), ZOOM_STEPS[0]);
     const i = ZOOM_STEPS.indexOf(near);
@@ -2607,7 +2784,7 @@ export const api = {
 
   // The Settings window names a zoom rather than stepping to it; ⌘+ and ⌘−
   // still go through zoomStep, and both end in the same push.
-  setZoom: async ({ zoom }, app) => {
+  setZoom: async ({ zoom }: { zoom: number | string }, app: TinyApp) => {
     const next = Math.max(0.5, Math.min(3, +zoom || 1));
     if (next === uiZoom) return uiZoom;
     uiZoom = next;
@@ -2617,13 +2794,13 @@ export const api = {
   },
 
   // File ▸ Edit Folder Settings…, reachable from the Settings window too.
-  editFolderSettings: async (_p, app) => (openSettingsFile(app), true),
+  editFolderSettings: async (_p: unknown, app: TinyApp) => (openSettingsFile(app), true),
 
   // output: "doc" — what the command printed, as a new untitled document.
   // Written as a fresh tab plus a text push rather than through makeSheet's
   // draft path, which would fly the "restored draft" banner over output that
   // was never a draft.
-  newDocWith: async ({ text }, app, meta) => {
+  newDocWith: async ({ text }: { text?: string }, app: TinyApp, meta?: Meta) => {
     const win = await openDoc(app, null, { from: meta && meta.window });
     const d = activeSheet(win);
     if (!d) return false;
@@ -2633,16 +2810,16 @@ export const api = {
     return true;
   },
 
-  actionsReload: async (_p, app) => {
+  actionsReload: async (_p: unknown, app: TinyApp) => {
     await reloadActions(app);
     return { count: actions.list.length, problems: actions.problems };
   },
 
   // Editing actions is opening a file — this IS a text editor. The starter is
   // written the first time so the format is in front of you, not in a README.
-  actionsEdit: async ({ scope }, app, meta) => {
+  actionsEdit: async ({ scope }: { scope?: string }, app: TinyApp, meta?: Meta): Promise<{ error: string } | { path: string }> => {
     const p = scope === 'project'
-      ? (projectOwns() && !isBare(meta) ? projectActionsPath(project.root) : null)
+      ? (projectOwns() && !isBare(meta) ? projectActionsPath(project!.root) : null)
       : await globalActionsPath(app);
     if (!p) return { error: 'no folder is open, or it isn’t keeping settings' };
     if (!(await exists(p))) {
@@ -2659,9 +2836,9 @@ export const api = {
   // (json.ts keeps the comments through that round trip). So these two are
   // deliberately dumb — read bytes, write bytes — and everything clever about
   // the format stays in one place.
-  actionsFile: async ({ scope }, app, meta) => {
+  actionsFile: async ({ scope }: { scope?: string }, app: TinyApp, meta?: Meta) => {
     const path = scope === 'project'
-      ? (projectOwns() && !isBare(meta) ? projectActionsPath(project.root) : null)
+      ? (projectOwns() && !isBare(meta) ? projectActionsPath(project!.root) : null)
       : await globalActionsPath(app);
     if (!path) return { error: 'no folder is open, or it isn’t keeping settings' };
     let text = null;
@@ -2673,9 +2850,10 @@ export const api = {
     };
   },
 
-  actionsWrite: async ({ scope, text }, app, meta) => {
+  actionsWrite: async ({ scope, text }: { scope?: string; text?: unknown }, app: TinyApp, meta?: Meta): Promise<
+    { error: string } | { ok: true; path: string; problems: ActionSet['problems'] }> => {
     const path = scope === 'project'
-      ? (projectOwns() && !isBare(meta) ? projectActionsPath(project.root) : null)
+      ? (projectOwns() && !isBare(meta) ? projectActionsPath(project!.root) : null)
       : await globalActionsPath(app);
     if (!path || typeof text !== 'string') return { error: 'nowhere to write that' };
     const fresh = !(await exists(path));
@@ -2696,14 +2874,14 @@ export const api = {
   },
 
   // What has been approved, and taking it back.
-  actionsTrusted: async (_p, app) => listTrust(app, project ? project.root : null),
-  actionRevoke: async ({ key }, app) => {
+  actionsTrusted: async (_p: unknown, app: TinyApp) => listTrust(app, project ? project.root : null),
+  actionRevoke: async ({ key }: { key: string }, app: TinyApp) => {
     await revokeTrust(app, key);
     await reloadActions(app);
     return true;
   },
 
-  closeFolder: async (_p, app) => {
+  closeFolder: async (_p: unknown, app: TinyApp) => {
     unwatchFolder();
     project = null;
     localSettings = {};
@@ -2722,7 +2900,7 @@ export const api = {
   // Per FOLDER now: ticking it for one repo no longer opts in every other one
   // you open. The old app-wide flag stays as the answer for a folder that has
   // never been asked, so nobody's existing setting changes meaning.
-  setProjectSettings: async ({ on }, app) => {
+  setProjectSettings: async ({ on }: { on?: boolean }, app: TinyApp) => {
     if (!project) {
       useProjectSettings = !!on;
       await app.store.set('useProjectSettings', useProjectSettings);
@@ -2747,7 +2925,7 @@ export const api = {
 
   // Pin a folder for search, change what the pin covers, or take it off
   // (state null). The tree's badge and the context menu both land here.
-  setPin: async ({ path, state }, app) => {
+  setPin: async ({ path, state }: { path?: string; state?: PinKind | null }, app: TinyApp) => {
     if (!project || !path || (state && !PIN_KINDS.has(state))) return false;
     if (state) project.pins[path] = state;
     else delete project.pins[path];
@@ -2757,13 +2935,13 @@ export const api = {
     // Save Settings in Folder goes off
     try {
       const k = fstateKey(project.root);
-      const cur = (await app.store.get(k)) || {};
+      const cur: FolderState = (await app.store.get(k)) || {};
       await app.store.set(k, { ...cur, pins: project.pins, pinsOn: project.pinsOn });
     } catch { /* the pin still holds for this run */ }
     // …and when the project owns its settings, the pins go with the folder
     if (projectOwns()) {
       project.settings.pins = Object.fromEntries(
-        Object.entries(project.pins).map(([d, s]) => [relOf(project.root, d), s]));
+        Object.entries(project.pins).map(([d, s]) => [relOf(project!.root, d), s]));
       await writeProjectSettings(app);
     }
     pushProject(app);
@@ -2771,7 +2949,7 @@ export const api = {
   },
 
   // The master switch above the tree: pins keep their places, scope nothing.
-  setPinsOn: async ({ on }, app) => {
+  setPinsOn: async ({ on }: { on?: boolean }, app: TinyApp) => {
     if (!project) return false;
     project.pinsOn = !!on;
     try {
@@ -2786,7 +2964,7 @@ export const api = {
   // Find in Folder. The page sends a compiled pattern (source + flags) so the
   // bar and the folder agree on what the query means; we answer with the hits,
   // grouped by file, and how much we had to leave out.
-  findInFolder: async ({ pattern, flags }, app, meta) => {
+  findInFolder: async ({ pattern, flags }: { pattern: string; flags?: string }, app: TinyApp, meta?: Meta) => {
     if (!project) return { error: 'No folder is open.' };
     const re = buildRe(pattern, flags || 'g');
     if (!re) return { error: 'That isn’t a valid pattern.' };
@@ -2795,12 +2973,12 @@ export const api = {
     const scope = pinScope('docs', (activeSheet(meta && meta.window) || {}).path);
     const r = await searchProject(app, re, null, scope);
     return { ...r, root: project.root, ms: Date.now() - t,
-      pinned: scope ? scope.map((d) => d.slice(project.root.length + 1) + '/') : null };
+      pinned: scope ? scope.map((d) => d.slice(project!.root.length + 1) + '/') : null };
   },
 
   // The same search, writing. Files with unsaved changes are left alone and
   // named back — replacing under a buffer you're editing would lose the edit.
-  replaceInFolder: async ({ pattern, flags, replace }, app, meta) => {
+  replaceInFolder: async ({ pattern, flags, replace }: { pattern: string; flags?: string; replace?: string }, app: TinyApp, meta?: Meta) => {
     if (!project) return { error: 'No folder is open.' };
     const re = buildRe(pattern, flags || 'g');
     if (!re) return { error: 'That isn’t a valid pattern.' };
@@ -2813,7 +2991,9 @@ export const api = {
 
   // Open a file AT a place — a search hit. The window it lands in gets a
   // 'goto' once the sheet is showing, which is what selects the match.
-  openAt: async ({ path, line, col, len, preview }, app, meta) => {
+  openAt: async ({ path, line, col, len, preview }: {
+    path?: string; line?: number; col?: number; len?: number; preview?: boolean;
+  }, app: TinyApp, meta?: Meta) => {
     if (!path) return false;
     const win = await openDoc(app, path, { from: meta && meta.window, preview });
     if (win) app.window(win).push('goto', { path, line, col, len });
@@ -2823,13 +3003,13 @@ export const api = {
   // A tree that's gone stale — same walk, no reopen. The watcher catches
   // most of this by itself now; the menu item stays for what it can't (a
   // folder deeper than WATCH_MAX handles, a network share that sends nothing).
-  refreshFolder: async (_p, app) => rescanFolder(app, { force: true }),
+  refreshFolder: async (_p: unknown, app: TinyApp) => rescanFolder(app, { force: true }),
 
   // Clean Up Unused Files… — the scan, then the paths the person ticked. The
   // trash step re-checks each path against the project and the asset list,
   // so a page can never send it something it didn't scan for.
-  scanUnused: async ({ dir } = {}) => scanUnused(dir),
-  trashFiles: async ({ paths }, app) => {
+  scanUnused: async ({ dir }: { dir?: string | null } = {}) => scanUnused(dir),
+  trashFiles: async ({ paths }: { paths?: unknown }, app: TinyApp) => {
     if (!project || !Array.isArray(paths)) return null;
     const root = project.root;
     let done = 0;
@@ -2846,26 +3026,27 @@ export const api = {
   // The Broken Links panel: everything (Go ▸ Find Broken Links), or only what
   // points into paths a Remove took — asked again as you fix them.
   // The ☰ Menu face: every docs-site menu in the folder, in one shape.
-  siteMenus: async ({ fresh } = {}) => siteMenus({ fresh: !!fresh }),
+  siteMenus: async ({ fresh }: { fresh?: boolean } = {}) => siteMenus({ fresh: !!fresh }),
 
   // One edit to one menu. Answers with the menus as they now read, so the
   // panel redraws from the file's own word rather than guessing.
-  editSiteMenu: async ({ key, op, label }, app) => {
+  editSiteMenu: async ({ key, op, label }: { key?: string; op?: { file?: unknown; [k: string]: unknown }; label?: unknown }, app: TinyApp) => {
     if (!project || !key || !op || typeof op !== 'object') return { error: 'No folder is open.' };
     const root = project.root;
     if (op.file !== undefined && (typeof op.file !== 'string' || op.file.includes('..'))) return { error: 'Not a page in this folder.' };
     const files = await menuRels(root);
-    const read = (rel) => currentText(root + '/' + rel);
-    let r;
-    try { r = await editMenu({ files, read, key, op }); } catch (e) { r = { error: 'Couldn’t edit the menu: ' + (e && e.message) }; }
+    const read = (rel: string) => currentText(root + '/' + rel);
+    let r: EditResult;
+    // `op` is the page's word: menus.ts checks every field it uses
+    try { r = await editMenu({ files, read, key, op: op as unknown as MenuOp }); } catch (e) { r = { error: 'Couldn’t edit the menu: ' + (e && (e as Error).message) }; }
     if (r.error) return r;
     if (!r.writes || !r.writes.length) return { error: 'Nothing changed.' };
-    const step = [];
+    const step: MenuWrite[] = [];
     for (const wr of r.writes) {
       if (wr.file.includes('..')) return { error: 'Not a file in this folder.' };
       const path = root + '/' + wr.file;
-      let before;
-      try { before = await currentText(path); } catch (e) { return { error: 'Couldn’t edit the menu: ' + (e && e.message) }; }
+      let before: string | null;
+      try { before = await currentText(path); } catch (e) { return { error: 'Couldn’t edit the menu: ' + (e && (e as Error).message) }; }
       step.push({ path, file: wr.file, before, after: wr.text });
     }
     for (const f of step) await writeMenuFile(app, f.path, f.after);
@@ -2879,20 +3060,20 @@ export const api = {
   // ⌘Z / ⇧⌘Z in the ☰ panel. Each step only goes through while the file
   // still says what that step left — a change made in the file since (by
   // hand, in a tab, by git) ends the history rather than being clobbered.
-  undoSiteMenu: async (_p, app) => stepMenuHistory(app, menuUndo, menuRedo, 'after', 'before', 'undo'),
+  undoSiteMenu: async (_p: unknown, app: TinyApp) => stepMenuHistory(app, menuUndo, menuRedo, 'after', 'before', 'undo'),
   // the panel gained or lost the keyboard: Edit ▸ Undo changes hands
-  setSiteMenuFocus: async ({ on }, app) => {
+  setSiteMenuFocus: async ({ on }: { on?: boolean }, app: TinyApp) => {
     menuState.siteMenuFocus = !!on;
     await refreshMenu(app);
     return true;
   },
-  redoSiteMenu: async (_p, app) => stepMenuHistory(app, menuRedo, menuUndo, 'before', 'after', 'redo'),
+  redoSiteMenu: async (_p: unknown, app: TinyApp) => stepMenuHistory(app, menuRedo, menuUndo, 'before', 'after', 'redo'),
 
   // …and its "from sidebarConfig.ts" link, for a menu kept in a file Nib
   // doesn't edit (TS, YAML, TOML, Python). openLink would only reveal those —
   // Nib never runs files — but `open -t` is the one door that can't run one:
   // it hands the file to the default TEXT EDITOR. Inside the open folder only.
-  openMenuSource: async ({ path }, app) => {
+  openMenuSource: async ({ path }: { path?: unknown }, app: TinyApp) => {
     if (!project || typeof path !== 'string' || !path.startsWith(project.root + '/')
         || path.includes('/../')) return { error: 'Not in the open folder.' };
     try { if (!(await tjs.stat(path)).isFile) return { error: 'Not a file.' }; } catch { return { error: 'It isn’t there.' }; }
@@ -2904,7 +3085,7 @@ export const api = {
     return { opened: 'shown', note: 'Shown in ' + FILE_MANAGER + ' — open it in your editor' };
   },
 
-  brokenLinks: async ({ gone } = {}) => {
+  brokenLinks: async ({ gone }: { gone?: unknown } = {}) => {
     if (!project) return null;
     const g = Array.isArray(gone) ? gone.filter((p) => typeof p === 'string') : null;
     return brokenLinks(g);
@@ -2917,21 +3098,21 @@ export const api = {
   // and now land on nothing. The page shows both; nothing else is touched.
   // A tab with unsaved changes in the way stops it before anything happens;
   // clean tabs of what went are closed.
-  removeEntry: async ({ path }, app) => {
+  removeEntry: async ({ path }: { path?: unknown }, app: TinyApp) => {
     if (!project) return { error: 'No folder is open.' };
     const root = project.root;
     if (typeof path !== 'string' || normPath(path) !== path || !path.startsWith(root + '/')) {
       return { error: 'That isn’t in this folder.' };
     }
     if (!(await exists(path))) return { error: 'That’s already gone.' };
-    const under = (p) => p === path || p.startsWith(path + '/');
+    const under = (p: string) => p === path || p.startsWith(path + '/');
     const open = [...sheets.values()].filter((d) => d.path && under(d.path));
     const dirty = open.find((d) => d.kind === 'doc' && d.liveText !== d.savedText);
     if (dirty) return { error: '“' + dirty.name + '” has unsaved changes — save or close it first.' };
 
     const gone = project.files.filter((f) => under(f.path));
     const roots = rootsOf();
-    const cands = new Set();
+    const cands = new Set<string>();
     for (const f of gone) {
       if (!LINKS.has(ext(f.name))) continue;
       try { for (const p of assetRefsOf(await readText(f.path), f.path, roots)) cands.add(p); }
@@ -2946,7 +3127,7 @@ export const api = {
 
     const goneList = [path, ...gone.map((f) => f.path)];
     const here = new Map(project.files.map((f) => [lc(f.path), f.path]));
-    const left = [...cands].filter((p) => here.has(p)).map((p) => here.get(p));
+    const left = [...cands].filter((p) => here.has(p)).map((p) => here.get(p)!);
     const scan = left.length ? await scanUnused(root, left) : null;
     return {
       ok: true,
@@ -2967,7 +3148,7 @@ export const api = {
   gitChanges: async () => {
     const top = await gitTop();
     if (!top) return { repo: false };
-    const r = await runGit(project.root,
+    const r = await runGit(project!.root,
       ['status', '--porcelain', '-z', '-uall', '--no-renames', '--ignore-submodules=all', '--', '.']);
     if (!r || r.code !== 0) return { repo: false };
     const files = [];
@@ -2975,14 +3156,14 @@ export const api = {
       if (entry.length < 4) continue;               // "XY <path>"
       const x = entry[0], y = entry[1];
       const path = top + '/' + entry.slice(3);
-      if (path !== project.root && !path.startsWith(project.root + '/')) continue;
+      if (path !== project!.root && !path.startsWith(project!.root + '/')) continue;
       // one letter, the working tree's view: untracked reads U, otherwise
       // the unstaged half of the pair wins (that's what you'd see on disk)
       const status = x === '?' ? 'U' : y !== ' ' ? y : x;
-      files.push({ path, rel: relOf(project.root, path), status });
+      files.push({ path, rel: relOf(project!.root, path), status });
     }
     files.sort((a, b) => (a.rel < b.rel ? -1 : 1));
-    const b = await runGit(project.root, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    const b = await runGit(project!.root, ['rev-parse', '--abbrev-ref', 'HEAD']);
     return { repo: true, branch: (b && b.code === 0 && b.out.trim()) || '', files };
   },
 
@@ -2990,9 +3171,9 @@ export const api = {
   // the one hunk, so the window rebuilds both sides from a single pass and
   // needs no diff algorithm of its own. An untracked file has no HEAD side —
   // the whole file comes back as added.
-  gitDiff: async ({ path }) => {
+  gitDiff: async ({ path }: { path?: string }) => {
     const top = await gitTop();
-    if (!top || !path || !path.startsWith(project.root + '/')) {
+    if (!top || !path || !path.startsWith(project!.root + '/')) {
       return { error: 'That file isn’t in the folder.' };
     }
     try {
@@ -3000,8 +3181,8 @@ export const api = {
         return { error: 'The file is too large to diff.' };
       }
     } catch { /* deleted: git still answers from HEAD */ }
-    const rel = relOf(project.root, path);
-    const r = await runGit(project.root,
+    const rel = relOf(project!.root, path);
+    const r = await runGit(project!.root,
       ['diff', '--no-color', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all',
         '-U999999', 'HEAD', '--', path]);
     if (!r || (r.code !== 0 && r.code !== 1)) return { rel, error: 'git didn’t answer.' };
@@ -3009,7 +3190,7 @@ export const api = {
     if (r.out.trim()) return { rel, diff: r.out };
     // nothing vs HEAD: either untracked (the whole file is the change) or
     // the list was stale and the file is simply clean again
-    const known = await runGit(project.root, ['ls-files', '--error-unmatch', '--', path]);
+    const known = await runGit(project!.root, ['ls-files', '--error-unmatch', '--', path]);
     if (known && known.code === 0) return { rel, same: true };
     const text = await readText(path).catch(() => null);
     if (text == null) return { rel, error: 'Couldn’t read the file.' };
@@ -3021,7 +3202,7 @@ export const api = {
   // file; a second click focuses the one already up. The tab and the file's
   // own document tab coexist (findSheetByPath skips diff sheets), which is
   // how you read the change and edit the file at once.
-  openDiff: async ({ path }, app, meta) => {
+  openDiff: async ({ path }: { path?: string }, app: TinyApp, meta?: Meta) => {
     if (!project || !path) return false;
     const open = [...sheets.values()].find((s) => s.kind === 'diff' && s.path === path);
     if (open) {
@@ -3035,10 +3216,10 @@ export const api = {
       || (lastDocWin && wins.has(lastDocWin) && lastDocWin);
     if (!winId) return false;
     const id = 'sh' + sheetSeq++;
-    const s = { id, win: winId, path, name: base(path), kind: 'diff',
+    const s: Sheet = { id, win: winId, path, name: base(path), kind: 'diff',
       preview: false, savedText: '', liveText: '', restored: false };
     sheets.set(id, s);
-    const w = wins.get(winId);
+    const w = wins.get(winId)!;
     w.order.push(s.id);
     w.active = s.id;
     app.window(winId).push('show-sheet', sheetPayload(s));
@@ -3051,7 +3232,8 @@ export const api = {
   // whole subtree of them if you renamed a folder), their drafts, the recent
   // lists, the tree. Links inside documents are the page's next move: it takes
   // the { from, to } below to scanRefs, asks, and calls updateRefs.
-  renameEntry: async ({ path, name }, app) => {
+  renameEntry: async ({ path, name }: { path?: string; name?: string }, app: TinyApp): Promise<
+    { error: string } | { ok: true; path: string; name: string; from?: string }> => {
     if (!project) return { error: 'No folder is open.' };
     if (!path || !path.startsWith(project.root + '/')) return { error: 'That isn’t in this folder.' };
     const clean = String(name || '').trim();
@@ -3064,9 +3246,9 @@ export const api = {
     if (await exists(next)) return { error: '“' + clean + '” already exists here.' };
     try { await tjs.rename(path, next); } catch { return { error: 'Couldn’t rename that.' }; }
 
-    const moved = (p) => (p === path || p.startsWith(path + '/') ? next + p.slice(path.length) : p);
+    const moved = (p: string) => (p === path || p.startsWith(path + '/') ? next + p.slice(path.length) : p);
 
-    const touched = new Set();
+    const touched = new Set<string>();
     for (const s of sheets.values()) {
       if (!s.path || moved(s.path) === s.path) continue;
       s.path = moved(s.path);
@@ -3086,8 +3268,8 @@ export const api = {
       await app.store.delete(k);
     }
 
-    const fix = async (key) => {
-      const list = (await app.store.get(key)) || [];
+    const fix = async (key: string) => {
+      const list: Recent[] = (await app.store.get(key)) || [];
       await app.store.set(key, list.map((r) => ({ ...r, path: moved(r.path) })));
     };
     await fix('recents');
@@ -3101,20 +3283,20 @@ export const api = {
   // What that rename left dangling, and the offer to fix it. Two calls rather
   // than one so the page can ask first — the whole point is that a rename
   // doesn't quietly rewrite six other documents.
-  scanRefs: async ({ from, to }, app) => {
+  scanRefs: async ({ from, to }: { from?: string; to?: string }, app: TinyApp) => {
     if (!project || !from || !to || from === to) return { total: 0, files: [] };
     const r = await refsWalk(app, from, to, false);
     return { total: r.total, files: r.files };
   },
 
-  updateRefs: async ({ from, to }, app) => {
+  updateRefs: async ({ from, to }: { from?: string; to?: string }, app: TinyApp) => {
     if (!project || !from || !to || from === to) return { total: 0, changed: 0 };
     const r = await refsWalk(app, from, to, true);
     return { total: r.total, changed: r.changed, files: r.files };
   },
 
   // Debounced buffer sync — this is what makes red-✗ closes lossless.
-  sync: ({ id, text }, app, meta) => {
+  sync: ({ id, text }: { id?: string; text?: unknown }, app: TinyApp, meta: TinyApiMeta) => {
     const d = sheetFor(meta, id);
     if (!d || d.kind !== 'doc' || typeof text !== 'string') return true;
     const was = d.liveText !== d.savedText;
@@ -3125,7 +3307,7 @@ export const api = {
 
   // Save. The page owns the native Save panel (dialogs are page-side), so an
   // untitled doc gets { needsPath: true } back and calls again with the pick.
-  saveDoc: async ({ id, text, path }, app, meta) => {
+  saveDoc: async ({ id, text, path }: { id?: string; text: string; path?: string }, app: TinyApp, meta: TinyApiMeta) => {
     const d = sheetFor(meta, id);
     if (!d) throw new Error('not a document window');
     if (d.kind !== 'doc') return { ok: true, id: d.id, path: d.path, name: d.name };
@@ -3153,8 +3335,8 @@ export const api = {
     }
     // saving THE SETTINGS FILE is changing the settings — the folder takes
     // the edit the moment it lands, same as any change made from a menu
-    if (projectOwns() && d.path === settingsPath(project.root)) {
-      project.settings = await readProjectSettings(project.root);
+    if (projectOwns() && d.path === settingsPath(project!.root)) {
+      project!.settings = await readProjectSettings(project!.root);
       await reloadPins(app);
       await pushEffective(app);
       pushProject(app);
@@ -3173,7 +3355,7 @@ export const api = {
   },
 
   // Throw away the draft and go back to what's on disk.
-  revert: async ({ id } = {}, app, meta) => {
+  revert: async ({ id }: { id?: string } = {}, app: TinyApp, meta: TinyApiMeta) => {
     const d = sheetFor(meta, id);
     if (!d || !d.path) throw new Error('nothing to revert to');
     const text = await readText(d.path);
@@ -3189,7 +3371,7 @@ export const api = {
 
   // Show another of this window's documents. The page has already flushed the
   // one it was showing, so liveText here is current.
-  showSheet: ({ id }, app, meta) => {
+  showSheet: ({ id }: { id: string }, app: TinyApp, meta: TinyApiMeta) => {
     const w = wins.get(meta.window);
     const d = sheets.get(id);
     if (!w || !d || d.win !== meta.window) return null;
@@ -3201,9 +3383,9 @@ export const api = {
 
   // Close one tab. The page has done the dirty dance already (saved, or chose
   // Don't Save); closing the last tab closes the window with it.
-  closeSheet: async ({ id, discard }, app, meta) => {
+  closeSheet: async ({ id, discard }: { id?: string; discard?: boolean }, app: TinyApp, meta: TinyApiMeta) => {
     const w = wins.get(meta.window);
-    const d = sheets.get(id) || activeSheet(meta.window);
+    const d = sheets.get(id!) || activeSheet(meta.window);
     if (!w || !d) return { closed: false };
     if (discard) await app.store.delete(draftKey(d));
     rememberClosed(d, meta.window);
@@ -3242,13 +3424,13 @@ export const api = {
   // Close the whole window. Dirty tabs are not argued over: they become drafts
   // exactly as they would if you'd used the red ✗, and the Welcome screen
   // offers them back. That promise is the reason this app can be casual here.
-  closeWindow: (_p, app, meta) => {
+  closeWindow: (_p: unknown, app: TinyApp, meta: TinyApiMeta) => {
     app.window(meta.window).close();
     return true;
   },
 
   // Drag-reorder in the tab strip.
-  reorderSheets: ({ order }, app, meta) => {
+  reorderSheets: ({ order }: { order?: string[] }, app: TinyApp, meta: TinyApiMeta) => {
     const w = wins.get(meta.window);
     if (!w || !Array.isArray(order)) return false;
     const keep = order.filter((id) => w.order.includes(id));
@@ -3265,7 +3447,7 @@ export const api = {
   // own numbers and had them restored as content units came back smaller by
   // the zoom factor every launch. getState and setSize speak the same
   // content units, so this round-trips exactly.
-  rememberSize: async (_p, app, meta) => {
+  rememberSize: async (_p: unknown, app: TinyApp, meta?: Meta) => {
     const st = await app.window((meta && meta.window) || 'main').getState();
     if (!st || st.fullscreen || st.minimized || !(st.width > 300) || !(st.height > 200)) return false;
     await app.store.set('winSize', { width: Math.round(st.width), height: Math.round(st.height) });
@@ -3274,7 +3456,7 @@ export const api = {
 
   // The Welcome screen keeps its own size — it's a different kind of window,
   // and inheriting a document window's 1180×900 would be absurd for it.
-  rememberWelcomeSize: async (_p, app) => {
+  rememberWelcomeSize: async (_p: unknown, app: TinyApp) => {
     const st = await app.win.getState();
     if (!st || st.fullscreen || st.minimized || !(st.width > 300) || !(st.height > 200)) return false;
     await app.store.set('welcomeSize', { width: Math.round(st.width), height: Math.round(st.height) });
@@ -3283,13 +3465,13 @@ export const api = {
 
   // ⌘N: a new document joins the window you're in, like an opened file does.
   // File ▸ New Window is the way to get a window of its own.
-  newDoc: async (_p, app, meta) => (await openDoc(app, null, { from: meta && meta.window }), true),
+  newDoc: async (_p: unknown, app: TinyApp, meta?: Meta) => (await openDoc(app, null, { from: meta && meta.window }), true),
   // New Window is a clean slate — no folder, whatever is open elsewhere.
   // The (Same Folder) variant inherits the open one; the menu only offers it
   // while there is one.
-  newWindow: async (_p, app) => (await openDoc(app, null, { forceWindow: true, bare: true }), true),
+  newWindow: async (_p: unknown, app: TinyApp) => (await openDoc(app, null, { forceWindow: true, bare: true }), true),
   // The one new window that DOES bring the folder — that is the whole item
-  newWindowSame: async (_p, app) =>
+  newWindowSame: async (_p: unknown, app: TinyApp) =>
     (await openDoc(app, null, { forceWindow: true, withFolder: true }), true),
 
   // Files from anywhere — Open panel, window drops, recents clicks.
@@ -3303,7 +3485,8 @@ export const api = {
   // A FOLDER is a different verb. `nib .` and dropping a directory both mean
   // "make this the project", not "open a document", so a directory in the list
   // opens the folder and the last one wins; files still open as documents.
-  openPaths: async ({ paths, preview }, app, meta) => {
+  openPaths: async ({ paths, preview }: { paths?: string[]; preview?: boolean }, app: TinyApp, meta?: Meta): Promise<
+    { opened: number; skipped: number; folder: string | null }> => {
     let ok = 0, skipped = 0, folder = null;
     for (const raw of paths || []) {
       const p = tidyPath(raw);
@@ -3324,7 +3507,7 @@ export const api = {
 
   // "I mean it" — the preview tab becomes a real one. Typing in the document
   // does this, and so do a double-click and ⌘⏎ in the tree.
-  promoteSheet: ({ id }, app, meta) => {
+  promoteSheet: ({ id }: { id?: string }, app: TinyApp, meta: TinyApiMeta) => {
     const d = sheetFor(meta, id);
     if (!d || !d.preview) return false;
     d.preview = false;
@@ -3332,22 +3515,22 @@ export const api = {
     return true;
   },
 
-  removeRecentFolder: async ({ path }, app) => {
-    const list = (await app.store.get('folders')) || [];
+  removeRecentFolder: async ({ path }: { path: string }, app: TinyApp) => {
+    const list: Recent[] = (await app.store.get('folders')) || [];
     await app.store.set('folders', list.filter((r) => r.path !== path));
     paintWelcome(app);
     return true;
   },
 
-  removeRecent: async ({ path }, app) => {
-    const list = (await app.store.get('recents')) || [];
+  removeRecent: async ({ path }: { path: string }, app: TinyApp) => {
+    const list: Recent[] = (await app.store.get('recents')) || [];
     await app.store.set('recents', list.filter((r) => r.path !== path));
     paintWelcome(app);
     return true;
   },
 
   // The welcome card for a draft that died with no file behind it.
-  restoreUntitled: async (_p, app) => {
+  restoreUntitled: async (_p: unknown, app: TinyApp) => {
     const draft = await app.store.get('draft:untitled');
     if (!draft) return false;
     await app.store.delete('draft:untitled');
@@ -3360,7 +3543,7 @@ export const api = {
   // `mine` whatever is open). The reading options below split: the flavour
   // and link-writing keys are the project's and follow PROJECT_PREFS; the
   // rest are yours like the theme.
-  setTheme: async ({ theme, layer }, app) => {
+  setTheme: async ({ theme, layer }: { theme: string; layer?: string }, app: TinyApp) => {
     if (!THEMES.some(([t]) => t === theme)) return false;
     await writeSetting(app, layer, 'theme', theme);
     await pushEffective(app);
@@ -3369,7 +3552,7 @@ export const api = {
 
   // Appearance is the app's own chrome (Light / Dark / Match System) — the
   // preview theme is a separate axis. Pages resolve 'system' themselves.
-  setAppearance: async ({ appearance }, app) => {
+  setAppearance: async ({ appearance }: { appearance: string }, app: TinyApp) => {
     if (!APPEARANCES.some(([a]) => a === appearance)) return false;
     await app.store.set('appearance', appearance);
     syncAppearanceMenu(app, appearance);
@@ -3379,12 +3562,12 @@ export const api = {
 
   // Reading preferences (page width, captions, centring, zoom, linked tabs) —
   // one set, same shape as the theme: persist, retick, tell the windows.
-  setPref: async ({ key, value, layer }, app) => {
+  setPref: async ({ key, value, layer }: { key: string; value: unknown; layer?: string }, app: TinyApp) => {
     if (!(key in PREF_DEFAULTS)) return false;
     if (key === 'width' && !WIDTHS.some(([w]) => w === value)) return false;
     if (key === 'findColor' && !FIND_HI.some(([v]) => v === value)) return false;
     if (key === 'linkSep' && !LINK_SEPS.some(([v]) => v === value)) return false;
-    if (key === 'linkFrom' && !LINK_FROM.has(value)) return false;
+    if (key === 'linkFrom' && !LINK_FROM.has(value as string)) return false;
     const stringy = key === 'width' || key === 'findColor' || key === 'linkSep'
       || key === 'linkFrom';
     await writeSetting(app, layer, 'prefs.' + key, stringy ? value : !!value);
@@ -3396,7 +3579,7 @@ export const api = {
 
   // A flavor preset is just several setPrefs at once, saved the same way
   // (project-owned when the folder keeps its settings, app-wide otherwise).
-  setFlavor: async ({ flavor, layer }, app) => {
+  setFlavor: async ({ flavor, layer }: { flavor: string; layer?: string }, app: TinyApp) => {
     const set = FLAVORS[flavor];
     if (!set) return false;
     // A preset is several setPrefs at once, and they must all land in the SAME
@@ -3411,9 +3594,9 @@ export const api = {
   // View mode is per-window; the menu's ticks follow the focused window
   // (pages re-assert on focus so the radio never drifts — which is also how
   // the backend learns which window has the keyboard).
-  setView: async ({ view, persist, layer }, app, meta) => {
+  setView: async ({ view, persist, layer }: { view: string; persist?: boolean; layer?: string }, app: TinyApp, meta?: Meta) => {
     if (!VIEWS.some(([v]) => v === view)) return false;
-    if (meta && wins.has(meta.window)) lastDocWin = meta.window;
+    if (meta && wins.has(meta.window!)) lastDocWin = meta.window!;
     await syncFocusScope(app);
     if (persist) await writeSetting(app, layer, 'view', view);
     syncViewMenu(app, view);
@@ -3426,7 +3609,7 @@ export const api = {
   // source again, inside a code block), so the focused window says so and the
   // View menu's other two modes grey out with the buttons. Same channel
   // carries whether Format ▸ Format JSON is live.
-  setViewLock: ({ on, json }, app) => {
+  setViewLock: ({ on, json }: { on?: boolean; json?: boolean }, app: TinyApp) => {
     menuState.viewLock = !!on;
     menuState.jsonSheet = !!json;
     for (const [v] of VIEWS) {
@@ -3439,7 +3622,7 @@ export const api = {
   // Insert ▸ lists what the "/" menu would, and that depends on the window
   // (its Markdown Flavor, whether it has a folder) — so the focused window
   // sends its catalogue, and the bar is rebuilt only when it differs.
-  setInsertItems: async ({ items }, app) => {
+  setInsertItems: async ({ items }: { items?: { id: unknown; label: unknown; group?: unknown }[] }, app: TinyApp) => {
     menuState.insert = (Array.isArray(items) ? items : []).slice(0, 80).map((it) => ({
       id: String(it.id), label: String(it.label), group: String(it.group || ''),
     }));
@@ -3449,7 +3632,7 @@ export const api = {
 
   // The file tree is per-window too; its menu tick follows the focused one.
   // Never disabled: with no folder open the panel is how you choose one.
-  setFilesPanel: ({ on }, app) => {
+  setFilesPanel: ({ on }: { on?: boolean }, app: TinyApp) => {
     menuState.files = !!on;
     app.menu.update('files', { checked: !!on, enabled: true });
     return true;
@@ -3458,7 +3641,7 @@ export const api = {
   // Sidebar widths are app-wide — drag one window's file tree and the next
   // window opens at that width — and remembered per folder on top, so each
   // project keeps its own. Existing windows keep theirs until reopened.
-  setPaneWidth: async ({ pane, w }, app) => {
+  setPaneWidth: async ({ pane, w }: { pane: string; w: number | string }, app: TinyApp) => {
     if (pane !== 'files' && pane !== 'outline') return false;
     const n = Math.round(+w);
     if (!(n >= 120 && n <= 600)) return false;
@@ -3475,7 +3658,7 @@ export const api = {
   },
 
   // Same deal for the outline sidebar: per-window, with a remembered default.
-  setOutline: async ({ on, persist }, app) => {
+  setOutline: async ({ on, persist }: { on?: boolean; persist?: boolean }, app: TinyApp) => {
     if (persist) await app.store.set('outline', !!on);
     menuState.outline = !!on;
     app.menu.update('outline', { checked: !!on });
@@ -3484,7 +3667,7 @@ export const api = {
 
   // "Editable" — type into the rendered preview. Only means anything when
   // the preview is on screen, so the menu item grays out in Editor Only.
-  setEditable: async ({ on, enabled, persist }, app) => {
+  setEditable: async ({ on, enabled, persist }: { on?: boolean; enabled?: boolean; persist?: boolean }, app: TinyApp) => {
     if (persist) await app.store.set('editable', !!on);
     menuState.editable = !!on;
     menuState.editableOk = enabled !== false;
@@ -3503,7 +3686,7 @@ export const api = {
   // window calls the same api the menu item does, and the menu redraws because
   // the backend pushed. So the two can never disagree, and neither is the
   // "real" one.
-  settingsAll: async ({ staged } = {}, app, meta) => {
+  settingsAll: async ({ staged }: { staged?: unknown } = {}, app: TinyApp, meta?: Meta) => {
     const d = activeSheet(meta && meta.window);
     // A BARE window (File ▸ New Window, a file from Finder, the example
     // document) has opted out of the app-wide folder — its tree says "No
@@ -3527,7 +3710,7 @@ export const api = {
     const paths = ['theme', 'view',
       ...Object.keys(PREF_DEFAULTS).map((k) => 'prefs.' + k),
       ...Object.keys(IMAGE_DEFAULTS).map((k) => 'images.' + k)];
-    const from = {};
+    const from: Record<string, { from: string | null; set: string[] }> = {};
     for (const path of paths) {
       const e = effective(stack, path);
       if (e.from || e.set.length) from[path] = { from: e.from, set: e.set };
@@ -3538,7 +3721,7 @@ export const api = {
     // layer under it, so every key it has ever been given is "set" there —
     // which made all twenty rows claim an override and meant nothing. On that
     // tab the honest question is whether the value differs from the default.
-    const defaults = { theme: 'paper', view: 'split' };
+    const defaults: Record<string, unknown> = { theme: 'paper', view: 'split' };
     for (const [k, v] of Object.entries(PREF_DEFAULTS)) defaults['prefs.' + k] = v;
     for (const [k, v] of Object.entries(IMAGE_DEFAULTS)) defaults['images.' + k] = v;
 
@@ -3586,7 +3769,8 @@ export const api = {
   // what the Settings window's tabs and its ↺ reset control call. Everything
   // validating a value lives in the setters above, so this routes through
   // them rather than writing whatever the page sent.
-  settingsSet: async ({ layer, path, value }, app) => {
+  settingsSet: async ({ layer, path, value }: { layer: string; path: string; value: unknown }, app: TinyApp): Promise<
+    boolean | { error: string }> => {
     if (!LAYER_NAMES.includes(layer)) return { error: 'unknown layer' };
     // …and only a layer that exists right now: the folder tabs are gone from
     // the window when the scope is bare, so a write naming them is a stray.
@@ -3596,8 +3780,8 @@ export const api = {
     if (layer !== 'mine' && !isProjectPath(path)) {
       return { error: 'personal setting — it lives in Mine' };
     }
-    if (path === 'theme') return api.setTheme({ theme: value, layer }, app);
-    if (path === 'view') return api.setView({ view: value, persist: true, layer }, app);
+    if (path === 'theme') return api.setTheme({ theme: value as string, layer }, app);
+    if (path === 'view') return api.setView({ view: value as string, persist: true, layer }, app);
     if (path.startsWith('prefs.')) {
       return api.setPref({ key: path.slice(6), value, layer }, app);
     }
@@ -3607,7 +3791,7 @@ export const api = {
       // quietly copied the folder's other image answers into Mine.
       const k = path.slice(7);
       if (!(k in IMAGE_DEFAULTS)) return { error: 'unknown setting' };
-      const v = cleanPartialImages({ [k]: value })[k];
+      const v = cleanPartialImages({ [k]: value })[k as keyof ImageSettings];
       if (v === undefined) return { error: 'bad value' };
       await writeSetting(app, layer, path, v);
       pushProject(app);              // the payload carries the / roots
@@ -3622,7 +3806,7 @@ export const api = {
   // with the defaults on load and saved back — so a folder that only ever
   // chose a theme now honestly reports that it overrides everything. This is
   // how you say "actually, just the theme" without hand-editing JSON.
-  settingsClearLayer: async ({ layer }, app) => {
+  settingsClearLayer: async ({ layer }: { layer: string }, app: TinyApp) => {
     if (!LAYER_NAMES.includes(layer)) return { error: 'unknown layer' };
     if (!layerStack(appScopeBare()).some((l) => l.name === layer)) {
       return { error: 'no folder is open' };
@@ -3636,7 +3820,7 @@ export const api = {
     return true;
   },
 
-  settingsClear: async ({ layer, path }, app) => {
+  settingsClear: async ({ layer, path }: { layer: string; path: string }, app: TinyApp) => {
     if (!LAYER_NAMES.includes(layer)) return { error: 'unknown layer' };
     if (!layerStack(appScopeBare()).some((l) => l.name === layer)) {
       return { error: 'no folder is open' };
@@ -3647,17 +3831,17 @@ export const api = {
     return true;
   },
 
-  imageOptions: async (_p, app, meta) => {
+  imageOptions: async (_p: unknown, app: TinyApp, meta?: Meta) => {
     const d = activeSheet(meta && meta.window);
     // A bare window is not in the folder, however close their paths are: its
     // images follow Mine's answers and its scope is its own directory.
     const inProject = !!project && !isBare(meta);
-    const scope = inProject ? project.root
+    const scope = inProject ? project!.root
       : (d && d.path ? d.path.slice(0, d.path.lastIndexOf('/')) : null);
     const asked = (await app.store.get('imgAsked')) || [];
     return {
       settings: effImages(isBare(meta)), scope, project: inProject,
-      root: inProject ? project.root : null,
+      root: inProject ? project!.root : null,
       inFolder: inProject && projectOwns(),   // File ▸ Save Settings in Folder
       ask: !!scope && !asked.includes(scope),
     };
@@ -3667,7 +3851,9 @@ export const api = {
   // keeps the answer for everywhere else. `scope` only marks the folder as
   // asked — cancelling the dialog sends it without settings, so a folder never
   // asks twice whatever you did with the question.
-  setImageOptions: async ({ settings, scope, layer }, app, meta) => {
+  setImageOptions: async ({ settings, scope, layer }: {
+    settings?: Partial<ImageSettings>; scope?: string; layer?: string;
+  }, app: TinyApp, meta?: Meta) => {
     const bare = isBare(meta);
     if (settings) {
       // The sheet hands back a whole settings object, so only the keys that
@@ -3679,7 +3865,7 @@ export const api = {
       const base = resolveAll(layerStack(bare).filter((l) =>
         LAYER_NAMES.indexOf(l.name) < LAYER_NAMES.indexOf(target)),
       { prefDefaults: PREF_DEFAULTS, imageDefaults: IMAGE_DEFAULTS }).images;
-      for (const k of Object.keys(IMAGE_DEFAULTS)) {
+      for (const k of Object.keys(IMAGE_DEFAULTS) as (keyof ImageSettings)[]) {
         if (s[k] === base[k]) await clearSetting(app, target, 'images.' + k);
         else await writeSetting(app, target, 'images.' + k, s[k]);
       }
@@ -3700,7 +3886,9 @@ export const api = {
   // The destination is computed HERE from the settings, never taken from the
   // page: `dest` is one of three shapes and `folder` is one cleaned segment,
   // so a document can't be talked into writing outside its own project.
-  saveImage: async ({ id, src, data, format, stem, number }, app, meta) => {
+  saveImage: async ({ id, src, data, format, stem, number }: {
+    id?: string; src?: string; data?: string; format?: string; stem?: string; number?: boolean;
+  }, app: TinyApp, meta?: Meta): Promise<{ needsPath: true } | { name: string; path: string; rel: string }> => {
     const d = sheetFor(meta, id);
     if (!d) throw new Error('not a document window');
     if (!d.path) return { needsPath: true };
@@ -3715,7 +3903,7 @@ export const api = {
       && d.path.startsWith(project.root + '/')) {
       // under the IMAGE root when the project has one, so a picture lands
       // where that project's own `/images/…` links already point
-      dir = normPath(rootBase(rootsOf(), 'image') + '/' + s.folder);
+      dir = normPath(rootBase(rootsOf()!, 'image') + '/' + s.folder);
     }
     if (dir !== docDir) {
       try { await tjs.makeDir(dir, { recursive: true }); } catch { /* already there */ }
@@ -3733,7 +3921,7 @@ export const api = {
       if (!(await exists(dir + '/' + name))) break;
       n = n ? n + 1 : 2;
     }
-    await tjs.writeFile(dir + '/' + name, data ? fromB64(data) : await tjs.readFile(src));
+    await tjs.writeFile(dir + '/' + name, data ? fromB64(data) : await tjs.readFile(src!));
     if (project && dir.startsWith(project.root)) await api.refreshFolder(null, app);
     return { name, path: dir + '/' + name, rel: relFrom(docDir, dir + '/' + name) };
   },
@@ -3746,7 +3934,8 @@ export const api = {
   // drags along — open sheets, links in other documents — follows the same
   // paths a tree rename does: sheets are patched here, links are the page's
   // scanRefs/updateRefs question with the { from } handed back.
-  optimizeWrite: async ({ path, data, format }, app) => {
+  optimizeWrite: async ({ path, data, format }: { path?: string; data?: string; format?: string }, app: TinyApp): Promise<
+    { error: string } | { ok: true; path: string; from: string | null }> => {
     if (!project || !path || !path.startsWith(project.root + '/')) {
       return { error: 'That isn’t in this folder.' };
     }
@@ -3763,7 +3952,7 @@ export const api = {
     await tjs.writeFile(next, fromB64(data));
     if (next !== path) {
       await tjs.remove(path).catch(() => {});
-      const touched = new Set();
+      const touched = new Set<string>();
       for (const s of sheets.values()) {
         if (s.path !== path) continue;
         s.path = next;
@@ -3780,7 +3969,7 @@ export const api = {
   // The guided tour. It's written into the app's own data folder (with the
   // one image it references) so it opens as an ordinary, editable document —
   // and rewritten fresh each time, unless a window already has it open.
-  openExample: async (_p, app) => {
+  openExample: async (_p: unknown, app: TinyApp) => {
     const dir = (await app.paths()).data;
     try { await tjs.makeDir(dir, { recursive: true }); } catch { /* already there */ }
     const path = dir + '/' + EXAMPLE_NAME;
@@ -3797,7 +3986,7 @@ export const api = {
   },
 
   // The Welcome banner's ✕ (and its Read It — either way it has been seen).
-  dismissIntro: async (_p, app) => {
+  dismissIntro: async (_p: unknown, app: TinyApp) => {
     await app.store.set('introSeen', true);
     return true;
   },
@@ -3811,7 +4000,7 @@ export const api = {
   // A palette pick, run EXACTLY like the menu click it stands for: the page
   // handles its half itself (same switch as tiny.menu.on) and this is the
   // backend's half — onMenu, verbatim.
-  runCommand: async ({ id }, app) => {
+  runCommand: async ({ id }: { id?: unknown }, app: TinyApp) => {
     if (typeof id !== 'string') return false;
     onMenu(id, app);
     return true;
@@ -3845,7 +4034,7 @@ export const api = {
       }),
   }),
 
-  keymapSet: async ({ id, key }, app) => {
+  keymapSet: async ({ id, key }: { id: string; key?: string | null }, app: TinyApp) => {
     if (!Object.prototype.hasOwnProperty.call(DEFAULT_KEYS, id) && !isActionCommand(id)) {
       return { error: 'unknown command' };
     }
@@ -3867,7 +4056,7 @@ export const api = {
     return true;
   },
 
-  keymapPreset: async ({ preset }, app) => {
+  keymapPreset: async ({ preset }: { preset: string }, app: TinyApp) => {
     if (!Object.prototype.hasOwnProperty.call(KEY_PRESETS, preset)) {
       return { error: 'unknown preset' };
     }
@@ -3885,7 +4074,7 @@ export const api = {
   // Settings — one shared window, focused if it is already up. Deliberately
   // not a sheet: it opens from a document, from the Welcome screen, or from
   // nothing at all, and all three have to work.
-  openSettings: (p, app) => {
+  openSettings: (p: { section?: string } | null, app: TinyApp) => {
     const section = (p && p.section) || 'general';
     if (settingsOpen) {
       const w = app.window(SET_WIN);
@@ -3909,7 +4098,7 @@ export const api = {
   // Manage Actions is a sheet in a DOCUMENT window (it edits the file the way
   // the editor does), so the Settings window asks for it rather than trying
   // to draw it itself.
-  openActionEditor: async (_p, app) => {
+  openActionEditor: async (_p: unknown, app: TinyApp) => {
     if (lastDocWin && wins.has(lastDocWin)) {
       app.window(lastDocWin).restore();
       app.window(lastDocWin).show();
@@ -3922,7 +4111,7 @@ export const api = {
   },
 
   // Markdown reference — one shared window, focused if it's already up.
-  openHelp: (p, app) => {
+  openHelp: (p: { at?: string } | null, app: TinyApp) => {
     const at = p && p.at;
     if (helpOpen) {
       const w = app.window(HELP_WIN);
@@ -3959,7 +4148,7 @@ export const api = {
   //
   // The page owns the dialog (installCliUI in updates.ts); this only computes
   // and writes, answering { status: 'ok' | 'dev' | 'cancelled', path?, note? }.
-  installCli: async (_p, app) => {
+  installCli: async (_p: unknown, app: TinyApp) => {
     const exe = tjs.exePath;
     const win = tjs.env.OS === 'Windows_NT';
     const linux = !win && /linux/i.test(globalThis.navigator?.platform ?? '');
@@ -4053,7 +4242,7 @@ export const api = {
 
   // The page wrote a file itself (tiny.win.printToPDF) — announce it the same
   // way exports are announced, so the banner reveals it in Finder.
-  announce: ({ path, title }, app) => {
+  announce: ({ path, title }: { path?: string; title?: string }, app: TinyApp) => {
     if (!path) return false;
     app.notify(title || 'Nib', base(path), { id: 'reveal:' + path, sound: false });
     return true;
@@ -4061,7 +4250,7 @@ export const api = {
 
   // The page hands us a finished standalone HTML document (theme inlined,
   // images already data:-URIs); we just put it where the Save panel said.
-  exportHtml: async ({ path, html }, app) => {
+  exportHtml: async ({ path, html }: { path?: string; html?: unknown }, app: TinyApp) => {
     if (!path || typeof html !== 'string') throw new Error('bad export');
     if (!/\.html?$/i.test(path)) path += '.html';
     await writeText(path, html);
@@ -4072,7 +4261,7 @@ export const api = {
   // Backend as asset server: the preview asks for images referenced by the
   // markdown (relative paths resolved against the doc's folder) and gets a
   // data: URI back — WebKit never has to be allowed near file:// itself.
-  imageData: async ({ src, dir }) => {
+  imageData: async ({ src, dir }: { src?: string; dir?: string }) => {
     if (!src) return null;
     let raw = src;
     try { raw = decodeURI(src); } catch { /* as written */ }
@@ -4095,7 +4284,7 @@ export const api = {
 
   // What the image viewer puts under the picture (its own size is measured
   // from the loaded image; the file's isn't knowable in the page).
-  fileInfo: async ({ path }) => {
+  fileInfo: async ({ path }: { path: string }) => {
     try {
       const st = await tjs.stat(path);
       return { bytes: Number(st.size) || 0 };
@@ -4103,9 +4292,9 @@ export const api = {
   },
 
   // Preview links open in the default browser, never inside the app window.
-  openExternal: ({ url }, app) => {
+  openExternal: ({ url }: { url?: string }, app: TinyApp) => {
     if (!/^(https?:|mailto:)/i.test(String(url))) return false;
-    app.shell.open(url);                   // not `open`: that's macOS only
+    app.shell.open(url!);                   // not `open`: that's macOS only
     return true;
   },
 
@@ -4132,7 +4321,7 @@ export const api = {
   // resolution happens here: only the backend knows the project and what its
   // settings say a leading `/` means. The tree's clicks on files Nib can't
   // open arrive here too, and get the same rule.
-  openLink: async ({ href, dir, frag }, app, meta) => {
+  openLink: async ({ href, dir, frag }: { href?: string; dir?: string; frag?: string }, app: TinyApp, meta?: Meta) => {
     const raw = String(href || '').trim();
     if (!raw) return { error: 'That link isn’t a file.' };
     if (!raw.startsWith('/') && !dir) return { error: 'Save the document first.' };
@@ -4150,7 +4339,7 @@ export const api = {
     // folder's index, above.
     const bareName = /(^|\/)[^/.]+$/.test(target);   // last segment has no dot
     const tries = [...new Set(found.flatMap((p) => (bareName ? [p + '.md', p] : [p])))];
-    const show = (path) => {
+    const show = (path: string) => {
       app.shell.reveal(path);
       return { opened: 'shown', path,
         note: 'Shown in ' + FILE_MANAGER + ' — Nib doesn’t run files' };
@@ -4196,7 +4385,7 @@ export const api = {
 };
 
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-function toB64(bytes) {
+function toB64(bytes: Uint8Array) {
   let out = '';
   for (let i = 0; i < bytes.length; i += 3) {
     const a = bytes[i], b = bytes[i + 1], c = bytes[i + 2];
@@ -4209,7 +4398,7 @@ function toB64(bytes) {
 }
 
 // …and back, for an image the page re-encoded and handed us as base64.
-function fromB64(s) {
+function fromB64(s: string) {
   const clean = String(s).replace(/^data:[^,]*,/, '').replace(/[^A-Za-z0-9+/]/g, '');
   const out = new Uint8Array(Math.floor((clean.length * 3) / 4));
   let o = 0, acc = 0, bits = 0;
@@ -4225,7 +4414,7 @@ function fromB64(s) {
 
 // A window is gone (red ✗ or programmatic). No veto exists — so this is
 // where dying dirty becomes a draft instead of a loss.
-export function onWindowClosed(id, app) {
+export function onWindowClosed(id: string, app: TinyApp) {
   if (id === HELP_WIN) { helpOpen = false; return; }
   if (id === SET_WIN) { settingsOpen = false; return; }
   const w = wins.get(id);
@@ -4252,13 +4441,13 @@ export function onWindowClosed(id, app) {
 }
 
 // Finder: double-click, "Open With", Dock drop. Works cold-start too.
-export function onOpenFiles(paths, app) {
+export function onOpenFiles(paths: string[], app: TinyApp) {
   api.openPaths({ paths }, app);
 }
 
 // 'Welcome' needs no page state, so it's handled backend-side; everything
 // else lands in whichever page has focus (they gate on document.hasFocus()).
-export function onMenu(id, app) {
+export function onMenu(id: string, app: TinyApp) {
   if (id === 'welcome') app.show();
   if (id === 'help:markdown') api.openHelp(null, app);
   if (id === 'help:about') api.openHelp({ at: 'about' }, app);
@@ -4283,7 +4472,7 @@ export function onMenu(id, app) {
   if (id.startsWith('ls:')) api.setPref({ key: 'linkSep', value: id.slice(3) }, app);
   if (id.startsWith('lf:')) api.setPref({ key: 'linkFrom', value: id.slice(3) }, app);
   for (const k of ['math', 'mermaid', 'alerts', 'emojiCodes', 'footnotes',
-    'carousel', 'download', 'embed', 'pagelink', 'toc', 'html']) {
+    'carousel', 'download', 'embed', 'pagelink', 'toc', 'html'] as const) {
     if (id === 'opt:' + k) api.setPref({ key: k, value: !effPrefs(appScopeBare())[k] }, app);
   }
   // New Window is answered here and ONLY here: a blank document in a window of
@@ -4302,7 +4491,7 @@ export function onMenu(id, app) {
   // Open Recent. A file joins the window that had the keyboard, as a tab —
   // the same thing clicking it in the file tree does.
   if (id.startsWith('rf:')) {
-    bareWins.delete(lastDocWin);        // the window receiving it changed its mind
+    bareWins.delete(lastDocWin!);        // the window receiving it changed its mind
     api.openFolder({ path: id.slice(3) }, app);
   }
   if (id.startsWith('rd:')) openDoc(app, id.slice(3), { from: lastDocWin }).catch(() => {
@@ -4328,7 +4517,7 @@ export function onMenu(id, app) {
   // Settings is its OWN window: it has to open from the Welcome screen and
   // from no window at all, and hanging it off a document meant conjuring an
   // empty one to hold it — which is what it used to do, and which was wrong.
-  const openSettings = (section) => api.openSettings({ section }, app);
+  const openSettings = (section: string) => api.openSettings({ section }, app);
   if (id === 'settings') openSettings('general');
   if (id === 'act:ai') openSettings('ai');
   if (id.startsWith('act:')
@@ -4341,7 +4530,7 @@ export function onMenu(id, app) {
     } else {
       api.actionRun({ scope, id: key, ctx: {} }, app, {}).then((r) => {
         if (r && r.needsTrust) {
-          app.push('toast', { text: 'Open a document to approve “' + r.label + '”' });
+          app.push('toast', { text: 'Open a document to approve “' + (r as { label?: string }).label + '”' });
         } else if (r && r.error) app.push('toast', { text: r.error });
       });
     }
@@ -4354,16 +4543,16 @@ export function onMenu(id, app) {
 // created from the current settings if the folder hasn't one yet. Saving it
 // applies it (see saveDoc), and changes made from menus flow back into a
 // clean open tab (refreshSettingsSheet) — the file and the app can't drift.
-async function openSettingsFile(app) {
+async function openSettingsFile(app: TinyApp) {
   if (!projectOwns()) return;
-  const p = settingsPath(project.root);
+  const p = settingsPath(project!.root);
   if (!(await exists(p))) await writeProjectSettings(app);
   openDoc(app, p, { from: lastDocWin }).catch(() => {
     app.push('toast', { text: 'Couldn’t open ' + base(p) });
   });
 }
 
-async function clearRecents(app) {
+async function clearRecents(app: TinyApp) {
   await app.store.set('recents', []);
   await app.store.set('folders', []);
   paintWelcome(app);
@@ -4375,12 +4564,12 @@ async function clearRecents(app) {
 // (updates.ts) — the backend only handles the unsolicited daily check, which
 // gets a notification precisely because nobody asked for it.
 
-export function onUpdateAvailable(info, app) {
+export function onUpdateAvailable(info: { latest: string }, app: TinyApp) {
   app.notify('Update available', 'v' + info.latest + ' is ready — use "Check for Updates…" to install.');
 }
 
 // A notification banner was clicked — reveal the file it announced.
-export function onNotificationClick(id, app) {
+export function onNotificationClick(id: string, app: TinyApp) {
   if (id.startsWith('reveal:')) {
     tjs.spawn(['open', '-R', id.slice(7)], { stdout: 'ignore', stderr: 'ignore' });
   }
@@ -4405,7 +4594,7 @@ export function onNotificationClick(id, app) {
 
 // A name is enough for one file, but two READMEs from different folders are
 // the normal case, so those get their parent folder's name after them.
-function recentLabel(list, r) {
+function recentLabel(list: Recent[], r: Recent) {
   const name = base(r.path);
   if (list.filter((x) => base(x.path) === name).length < 2) return name;
   const parent = base(r.path.slice(0, r.path.lastIndexOf('/'))) || '/';
@@ -4414,8 +4603,8 @@ function recentLabel(list, r) {
 
 // File ▸ Open Recent — the Welcome screen's two lists, for when it isn't on
 // screen (which is whenever you have a document open).
-function recentMenu() {
-  const items = [];
+function recentMenu(): TinyMenuItem[] {
+  const items: TinyMenuItem[] = [];
   for (const r of menuState.folders) {
     items.push({ id: 'rf:' + r.path, label: recentLabel(menuState.folders, r) });
   }
@@ -4447,7 +4636,7 @@ function recentMenu() {
 // unbound — which is also Print's factory state: ⌘P belongs to Open Quickly
 // and ⌘⇧P to the Command Palette; printing a Markdown file is the rarer act
 // and lives in the File menu without a key.
-const DEFAULT_KEYS = {
+const DEFAULT_KEYS: Record<string, string | null> = {
   settings: ',', new: 'n', newwindow: 'N', open: 'o', openfolder: 'alt+o',
   save: 's', saveas: 'S', export: 'E', print: null,
   closetab: 'w', closewin: 'W', reopentab: 'T',
@@ -4478,7 +4667,7 @@ const DEFAULT_KEYS = {
 //  - eclipse: ⇧⌘R Open Resource (Refresh gives its key up for it).
 //  - vim: navigation lives on ⌃ chords and modes AppKit accelerators can't
 //    spell, so it keeps the defaults — the preset exists to say so.
-const KEY_PRESETS = {
+const KEY_PRESETS: Record<string, Record<string, string | null>> = {
   nib: {},
   vscode: { 'view:preview': 'V', files: 'E', export: null },
   sublime: { outline: 'r' },
@@ -4491,13 +4680,13 @@ const KEY_PRESETS = {
 const KEYMAP_PRESETS = [['nib', 'Nib'], ['vscode', 'VS Code'],
   ['sublime', 'Sublime Text'], ['atom', 'Atom'], ['notepad++', 'Notepad++'],
   ['textmate', 'TextMate'], ['vim', 'Vim'], ['eclipse', 'Eclipse']];
-let keymapConf = { preset: 'nib', custom: {} };
+let keymapConf: { preset: string; custom: Record<string, string | null> } = { preset: 'nib', custom: {} };
 // An action's command id — the one kind of row the keymap accepts beyond
 // DEFAULT_KEYS. Yours or a folder's: either way the BINDING is yours alone,
 // stored in your keymap. An actions file never carries a key — a repo has no
 // more business rebinding your keyboard than a preset has unbinding it.
-const isActionCommand = (id) => /^act:(global|project):./.test(id);
-function keyOf(id) {
+const isActionCommand = (id: string) => /^act:(global|project):./.test(id);
+function keyOf(id: string) {
   const c = keymapConf.custom || {};
   if (Object.prototype.hasOwnProperty.call(c, id)) return c[id] || undefined;
   const p = KEY_PRESETS[keymapConf.preset] || {};
@@ -4505,7 +4694,7 @@ function keyOf(id) {
   return DEFAULT_KEYS[id] || undefined;
 }
 
-function menuSpec() {
+function menuSpec(): TinyMenu[] {
   const p = effPrefs(appScopeBare());
   const m = menuState;
   const mine = visibleActions(m.bare);
@@ -4516,7 +4705,7 @@ function menuSpec() {
     // that setMenu could not reach until tinyjs grew `role: 'app'`. Off-macOS
     // the role is unknown and its items are dropped, so those platforms get
     // the same item in File instead — see below.
-    ...(IS_MAC ? [{ role: 'app', items: [
+    ...(IS_MAC ? [{ role: 'app' as const, items: [
       { id: 'settings', label: 'Settings…', key: keyOf('settings') },
     ] }] : []),
     { title: 'File', items: [
@@ -4743,9 +4932,9 @@ function menuSpec() {
 // command wearing its own icon, and whatever the keymap says is the key the
 // row shows. Dynamic rows (recents) and placeholders are skipped.
 const SKIP_COMMANDS = new Set(['recent:none', 'recent:clear', 'act:none']);
-function commandList(includeDisabled) {
-  const icons = new Map();
-  const svgs = new Map();
+function commandList(includeDisabled: boolean) {
+  const icons = new Map<string, string>();
+  const svgs = new Map<string, IconRec | null>();
   for (const a of visibleActions(menuState.bare)) {
     if (!a.icon) continue;
     const id = 'act:' + a.scope + ':' + a.id;
@@ -4754,9 +4943,9 @@ function commandList(includeDisabled) {
     // (warmActionIcons fills it the first time the actions are listed.)
     if (isIconName(a.icon)) svgs.set(id, iconSync(a.icon));
   }
-  const out = [];
-  const seen = new Set();
-  const walk = (items, path) => {
+  const out: Command[] = [];
+  const seen = new Set<string>();
+  const walk = (items: TinyMenuItem[] | undefined, path: string | undefined) => {
     for (const it of items || []) {
       if (!it || it.separator) continue;
       if (it.submenu) { walk(it.submenu, path + ' ▸ ' + it.label); continue; }
@@ -4786,8 +4975,8 @@ function commandList(includeDisabled) {
 // Rebuilt only when the lists actually differ — saving a file bumps its
 // recent entry on every ⌘S, and redeclaring the whole bar for a list that
 // hasn't moved would be a lot of wire traffic for no visible change.
-let menuSig = null;
-async function refreshMenu(app) {
+let menuSig: string | null = null;
+async function refreshMenu(app: TinyApp) {
   menuState.recents = (await app.store.get('recents')) || [];
   menuState.folders = (await app.store.get('folders')) || [];
   const sig = JSON.stringify([[...menuState.folders, ...menuState.recents].map((r) => r.path),
@@ -4804,18 +4993,18 @@ async function refreshMenu(app) {
   app.menu.set(menuSpec());
 }
 
-export async function init(app) {
+export async function init(app: TinyApp) {
   app.setHideOnClose(true);                  // red ✗ on Welcome hides, not quits
   // The Welcome screen is a real window: a long recents list is worth being
   // able to make room for, and the size it's left at is the size it reopens
   // at. The floor is the point below which the four buttons would wrap.
   app.setResizable(true);
   app.window('main').setMinSize(460, 380);
-  const wel = await app.store.get('welcomeSize');
+  const wel: SizeRec | null = await app.store.get('welcomeSize');
   if (wel && wel.width > 300 && wel.height > 200) app.setSize(wel.width, wel.height);
 
   const st = await app.win.getState();
-  screen = st.screen;
+  screen = st!.screen;
 
   const appearance = (await app.store.get('appearance')) || 'system';
   const outline = (await app.store.get('outline')) || false;

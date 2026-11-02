@@ -31,24 +31,75 @@
 
 const HL_SUPPORTED = typeof CSS !== 'undefined' && CSS.highlights && typeof Highlight === 'function';
 
-function createPeerSync(opts) {
+export interface PeerSyncOptions {
+  /** the source textarea */
+  ed: HTMLTextAreaElement;
+  /** the coloured backdrop under it: one <div> per source line */
+  edBack: HTMLElement;
+  /** the rendered document (md.ts output, data-line stamped) */
+  preview: HTMLElement;
+  /** the preview's scroller */
+  previewPane: HTMLElement;
+  /** the 2px overlay drawn as the peer caret in the preview */
+  caretPeer: HTMLElement;
+  /** …and in the source pane */
+  caretSource: HTMLElement;
+}
+
+/** A rendered block and the source lines it came from. */
+interface Block {
+  el: HTMLElement;
+  line: number;
+  end: number;
+  /** the line the next block starts at */
+  after?: number;
+}
+
+/** A block's rendered→source character map. */
+interface CharMap {
+  src: string;
+  text: string;
+  map: Int32Array;
+  /** absolute source offset of the block's first line */
+  base: number;
+}
+
+interface Model {
+  lines: string[];
+  starts: Int32Array;
+  blocks: Block[];
+  maps: WeakMap<Element, CharMap>;
+}
+
+/** A DOM position. */
+export interface DomPos { node: Node; offset: number }
+/** A DOM position in the preview, with the block it's in. */
+export interface PreviewPos extends DomPos { block: Block; atElement?: boolean }
+/** A DOM position in the source backdrop, with its row. */
+interface RowPos extends DomPos { row: Element }
+/** A scroll position, as a source line and how far through it. */
+export interface ScrollAnchor { line: number; frac: number }
+
+export type PeerSync = ReturnType<typeof createPeerSync>;
+
+function createPeerSync(opts: PeerSyncOptions) {
   const { ed, edBack, preview, previewPane, caretPeer, caretSource } = opts;
 
-  let cache = null;
+  let cache: Model | null = null;
   const invalidate = () => { cache = null; };
 
   // ------------------------------------------------------------- the index
 
-  function model() {
+  function model(): Model {
     if (cache) return cache;
     const lines = ed.value.split('\n');
     const starts = new Int32Array(lines.length + 1);
     for (let i = 0; i < lines.length; i++) starts[i + 1] = starts[i] + lines[i].length + 1;
 
-    const blocks = [];
-    for (const el of preview.querySelectorAll('[data-line]')) {
+    const blocks: Block[] = [];
+    for (const el of preview.querySelectorAll<HTMLElement>('[data-line]')) {
       if (el.tagName === 'INPUT') continue;            // task boxes aren't blocks
-      const line = +el.dataset.line;
+      const line = +el.dataset.line!;
       if (!isNaN(line)) blocks.push({ el, line, end: lines.length - 1 });
     }
     // A block runs until the next one that starts further down. Document
@@ -57,7 +108,7 @@ function createPeerSync(opts) {
     // obvious nested loop is not an option on a long document.
     for (let i = blocks.length - 1; i >= 0; i--) {
       const next = i + 1 < blocks.length
-        ? (blocks[i + 1].line > blocks[i].line ? blocks[i + 1].line : blocks[i + 1].after)
+        ? (blocks[i + 1].line > blocks[i].line ? blocks[i + 1].line : blocks[i + 1].after!)
         : lines.length;
       blocks[i].after = next;
       blocks[i].end = Math.max(blocks[i].line, next - 1);
@@ -66,7 +117,7 @@ function createPeerSync(opts) {
     return cache;
   }
 
-  const lineOf = (off) => {
+  const lineOf = (off: number) => {
     const { starts } = model();
     let lo = 0, hi = starts.length - 2, best = 0;
     while (lo <= hi) {
@@ -77,9 +128,9 @@ function createPeerSync(opts) {
   };
 
   // parents come first in document order, so the last container wins
-  function blockForLine(line) {
+  function blockForLine(line: number) {
     const { blocks } = model();
-    let best = null;
+    let best: Block | null = null;
     for (const b of blocks) if (b.line <= line && line <= b.end) best = b;
     return best;
   }
@@ -90,10 +141,10 @@ function createPeerSync(opts) {
   // nodes behind your back (focusing the preview is enough), and a stale
   // list silently collapses every lookup to the start of the block. The
   // index arithmetic is cached, guarded by the block's own text.
-  function nodesOf(el) {
-    const out = [];
+  function nodesOf(el: Node) {
+    const out: Text[] = [];
     const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-    for (let n = walk.nextNode(); n; n = walk.nextNode()) out.push(n);
+    for (let n = walk.nextNode(); n; n = walk.nextNode()) out.push(n as Text);
     return out;
   }
 
@@ -106,11 +157,11 @@ function createPeerSync(opts) {
   const INVISIBLE = /!\[[^\]\n]*\]\([^)\n]*\)|\]\([^)\n]*\)/g;
   // NUL rather than spaces: spaces would go on matching the spaces in the
   // rendered text, which is the whole problem over again.
-  const blank = (s) => s.replace(INVISIBLE, (m) => '\u0000'.repeat(m.length));
+  const blank = (s: string) => s.replace(INVISIBLE, (m) => '\u0000'.repeat(m.length));
 
-  function mapFor(b) {
+  function mapFor(b: Block): CharMap {
     const m = model();
-    const text = b.el.textContent;
+    const text = b.el.textContent!;
     let mp = m.maps.get(b.el);
     if (mp && mp.text === text) return mp;
 
@@ -135,24 +186,24 @@ function createPeerSync(opts) {
   }
 
   // rendered index -> a DOM position inside the block
-  function domAt(el, mp, i) {
+  function domAt(el: Node, mp: CharMap, i: number): DomPos | null {
     const nodes = nodesOf(el);
     let left = Math.max(0, Math.min(i, mp.text.length));
     for (const node of nodes) {
-      const len = node.nodeValue.length;
+      const len = node.nodeValue!.length;
       if (left <= len) return { node, offset: left };
       left -= len;
     }
     const last = nodes[nodes.length - 1];
-    return last ? { node: last, offset: last.nodeValue.length } : null;
+    return last ? { node: last, offset: last.nodeValue!.length } : null;
   }
 
   // a DOM position -> rendered index
-  function indexAt(el, node, offset) {
+  function indexAt(el: Node, node: Node, offset: number) {
     let n = 0;
     for (const t of nodesOf(el)) {
-      if (t === node) return n + Math.min(offset, t.nodeValue.length);
-      n += t.nodeValue.length;
+      if (t === node) return n + Math.min(offset, t.nodeValue!.length);
+      n += t.nodeValue!.length;
     }
     return -1;
   }
@@ -167,7 +218,7 @@ function createPeerSync(opts) {
   // offset: an offset sitting on a marker means the text next to it, at
   // either end. A collapsed caret snaps back instead, so it stays put rather
   // than jumping over the markers you are typing.
-  function srcToDom(off, forward) {
+  function srcToDom(off: number, forward?: boolean): PreviewPos | null {
     const b = blockForLine(lineOf(off));
     if (!b) return null;
     const mp = mapFor(b);
@@ -188,8 +239,8 @@ function createPeerSync(opts) {
   // actually selected rather than to the start of whatever comes next, so
   // selecting the word inside `*word*` doesn't come back with the closing
   // star attached.
-  function domToSrc(node, offset, atEnd) {
-    let el = node.nodeType === 3 ? node.parentElement : node;
+  function domToSrc(node: Node, offset: number, atEnd?: boolean): number | null {
+    let el = (node.nodeType === 3 ? node.parentElement : node) as Element | null;
     while (el && el !== preview && !el.hasAttribute('data-line')) el = el.parentElement;
     if (!el || el === preview) return null;
     const b = model().blocks.find((x) => x.el === el);
@@ -207,11 +258,11 @@ function createPeerSync(opts) {
   // one: it has no Markdown to point at). Until then the caret parks at
   // the end of the nearest stamped block above rather than vanishing from
   // the source pane altogether.
-  function srcBehind(node) {
-    const el = node.nodeType === 3 ? node.parentElement : node;
+  function srcBehind(node: Node): number | null {
+    const el = (node.nodeType === 3 ? node.parentElement : node) as Element | null;
     if (!el || el === preview) return null;
     const m = model();
-    let best = null;
+    let best: Block | null = null;
     for (const blk of m.blocks) {
       if (blk.el !== el
           && blk.el.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) best = blk;
@@ -223,23 +274,23 @@ function createPeerSync(opts) {
 
   // absolute source offset -> a DOM position inside the coloured backdrop,
   // which is one <div> per line whose text matches that line exactly
-  function srcToRow(off) {
+  function srcToRow(off: number): RowPos | null {
     const m = model();
     const line = lineOf(off);
     const row = edBack.children[line];
     if (!row) return null;
     let col = off - m.starts[line];
     const walk = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
-    let node = null;
+    let node: Node | null = null;
     for (let n = walk.nextNode(); n; n = walk.nextNode()) {
       node = n;
-      if (col <= n.nodeValue.length) return { row, node: n, offset: col };
-      col -= n.nodeValue.length;
+      if (col <= n.nodeValue!.length) return { row, node: n, offset: col };
+      col -= n.nodeValue!.length;
     }
-    return node ? { row, node, offset: node.nodeValue.length } : { row, node: row, offset: 0 };
+    return node ? { row, node, offset: node.nodeValue!.length } : { row, node: row, offset: 0 };
   }
 
-  const rangeIn = (a, b) => {
+  const rangeIn = (a: DomPos | null, b: DomPos | null) => {
     if (!a || !b) return null;
     const r = document.createRange();
     try {
@@ -261,7 +312,7 @@ function createPeerSync(opts) {
   const findOnHi = HL_SUPPORTED ? new Highlight() : null;
   if (findHi) {
     CSS.highlights.set('nib-find', findHi);
-    CSS.highlights.set('nib-find-on', findOnHi);
+    CSS.highlights.set('nib-find-on', findOnHi!);
   }
 
   function clearPaint() {
@@ -274,7 +325,7 @@ function createPeerSync(opts) {
 
   // a caret has no width, so it can't be a highlight — measure the collapsed
   // range and float a 2px overlay at it, clipped to the pane it belongs to
-  function drawCaret(bar, pos, pane) {
+  function drawCaret(bar: HTMLElement, pos: DomPos | null, pane: Element) {
     if (!pos) { bar.hidden = true; return; }
     const r = document.createRange();
     try {
@@ -283,7 +334,7 @@ function createPeerSync(opts) {
     } catch { bar.hidden = true; return; }
     let rect = r.getBoundingClientRect();
     if (!rect.height) {                                  // empty line: use the box
-      const host = pos.node.nodeType === 3 ? pos.node.parentElement : pos.node;
+      const host = (pos.node.nodeType === 3 ? pos.node.parentElement : pos.node) as Element;
       rect = host.getBoundingClientRect();
     }
     const box = pane.getBoundingClientRect();
@@ -296,9 +347,9 @@ function createPeerSync(opts) {
 
   // block tint, for context under a collapsed caret (and the whole show when
   // the Custom Highlight API isn't available)
-  function tintPreview(fromLine, toLine) {
-    const deepest = new Map();
-    let lead = null;
+  function tintPreview(fromLine: number, toLine: number) {
+    const deepest = new Map<number, HTMLElement>();
+    let lead: HTMLElement | null = null;
     for (const b of model().blocks) {
       if (b.line >= fromLine && b.line <= toLine) deepest.set(b.line, b.el);
       if (b.line <= fromLine) lead = b.el;
@@ -308,7 +359,7 @@ function createPeerSync(opts) {
     return lead;
   }
 
-  function tintSource(fromLine, toLine) {
+  function tintSource(fromLine: number, toLine: number) {
     const rows = edBack.children;
     if (fromLine < 0 || fromLine >= rows.length) return null;
     for (let i = fromLine; i <= toLine && i < rows.length; i++) rows[i].classList.add('hit');
@@ -322,14 +373,14 @@ function createPeerSync(opts) {
   // without opening it. Cursor moves do open it — that's the point — but
   // scrolling must not, so `layoutHost` is the read-only alternative:
   // the nearest ancestor that actually has a box.
-  function reveal(el) {
+  function reveal(el: Element | null): boolean {
     let changed = false;
     for (let p = el && el.parentElement; p && p !== preview; p = p.parentElement) {
-      if (p.tagName === 'DETAILS' && !p.open) { p.open = true; changed = true; }
+      if (p.tagName === 'DETAILS' && !(p as HTMLDetailsElement).open) { (p as HTMLDetailsElement).open = true; changed = true; }
       if (!p.classList.contains('tp')) continue;
-      const group = p.parentElement;
+      const group = p.parentElement!;
       const k = [...group.querySelectorAll(':scope > .tp')].indexOf(p);
-      const radio = group.querySelectorAll(':scope > input[type=radio]')[k];
+      const radio = group.querySelectorAll<HTMLInputElement>(':scope > input[type=radio]')[k];
       if (radio && !radio.checked) {
         radio.checked = true;
         changed = true;
@@ -342,17 +393,17 @@ function createPeerSync(opts) {
     return changed;
   }
 
-  const hasBox = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+  const hasBox = (el: HTMLElement | null) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
 
-  function layoutHost(el) {
-    let p = el;
+  function layoutHost(el: HTMLElement): HTMLElement {
+    let p: HTMLElement | null = el;
     while (p && p !== preview && !hasBox(p)) p = p.parentElement;
     return p && p !== preview ? p : el;
   }
 
   // ----------------------------------------------------- editor -> preview
 
-  function fromEditor({ scrollIntoView } = {}) {
+  function fromEditor({ scrollIntoView }: { scrollIntoView?: boolean } = {}): void {
     clearPaint();
     const a = ed.selectionStart, b = ed.selectionEnd;
     const from = srcToDom(a, a !== b);
@@ -374,7 +425,7 @@ function createPeerSync(opts) {
     if (scrollIntoView) showBlock(from.block);
   }
 
-  function showBlock(b) {
+  function showBlock(b: Block) {
     const el = layoutHost(b.el);
     const box = previewPane.getBoundingClientRect();
     const r = el.getBoundingClientRect();
@@ -385,7 +436,7 @@ function createPeerSync(opts) {
 
   // ----------------------------------------------------- preview -> editor
 
-  function fromPreview({ moveCaret } = {}) {
+  function fromPreview({ moveCaret }: { moveCaret?: boolean } = {}): { from: number; to: number | null } | undefined {
     const sel = window.getSelection();
     if (!sel || !sel.rangeCount || !preview.contains(sel.anchorNode)) return;
     clearPaint();
@@ -417,8 +468,8 @@ function createPeerSync(opts) {
     return { from: a, to: b };
   }
 
-  function showLine(line) {
-    const row = edBack.children[line];
+  function showLine(line: number) {
+    const row = edBack.children[line] as HTMLElement | undefined;
     if (!row) return;
     const y = row.offsetTop - ed.scrollTop;
     if (y >= 30 && y <= ed.clientHeight - 60) return;
@@ -432,8 +483,8 @@ function createPeerSync(opts) {
 
   // which source line sits at the top of the source pane, and how far into
   // it — the rows start one padding-height down, so that comes off the top
-  function editorAnchor() {
-    const rows = edBack.children;
+  function editorAnchor(): ScrollAnchor | null {
+    const rows = edBack.children as HTMLCollectionOf<HTMLElement>;
     if (!rows.length) return null;
     const y = ed.scrollTop + padTop();
     let lo = 0, hi = rows.length - 1, k = 0;
@@ -446,7 +497,7 @@ function createPeerSync(opts) {
     return { line: k, frac: Math.max(0, Math.min(1, (y - row.offsetTop) / h)) };
   }
 
-  function scrollPreviewTo(anchor) {
+  function scrollPreviewTo(anchor: ScrollAnchor | null) {
     if (!anchor) return;
     const b = blockForLine(anchor.line);
     if (!b) return;
@@ -463,10 +514,10 @@ function createPeerSync(opts) {
   }
 
   // the topmost laid-out block in the preview, and how far into it we are
-  function previewAnchor() {
+  function previewAnchor(): ScrollAnchor | null {
     const box = previewPane.getBoundingClientRect();
     const top = box.top + 1;
-    let found = null;
+    let found: { b: Block; r: DOMRect } | null = null;
     for (const b of model().blocks) {
       if (!hasBox(b.el)) continue;                     // inside a closed tab
       const r = b.el.getBoundingClientRect();
@@ -481,9 +532,9 @@ function createPeerSync(opts) {
     return { line: Math.min(b.end, b.line + Math.floor(pos)), frac: pos % 1 };
   }
 
-  function scrollEditorTo(anchor) {
+  function scrollEditorTo(anchor: ScrollAnchor | null) {
     if (!anchor) return;
-    const row = edBack.children[anchor.line];
+    const row = edBack.children[anchor.line] as HTMLElement | undefined;
     if (!row) return;
     ed.scrollTop = Math.max(0, row.offsetTop + anchor.frac * (row.offsetHeight || 0) - padTop());
     edBack.scrollTop = ed.scrollTop;
@@ -507,10 +558,10 @@ function createPeerSync(opts) {
     // Paint source ranges — [from, to] offsets — as find matches, with
     // `at` marked as the current one. The ranges live in the backdrop's DOM,
     // so every repaint of it invalidates them: call this again after one.
-    paintFind(spans, at) {
+    paintFind(spans: [number, number][], at: number): boolean {
       if (!findHi) return false;
       findHi.clear();
-      findOnHi.clear();
+      findOnHi!.clear();
       // One common letter in a long document matches thousands of times, and
       // every range costs a walk of its line. Paint a window around the one
       // you're on — the rest are counted, which is what the count is for.
@@ -523,7 +574,7 @@ function createPeerSync(opts) {
       for (let i = from; i < to; i++) {
         const reg = i === at ? findOnHi : findHi;
         const r = rangeIn(srcToRow(spans[i][0]), srcToRow(spans[i][1]));
-        if (r) reg.add(r);
+        if (r) reg!.add(r);
         // …and the same match where the PREVIEW shows it. The character
         // map is exact for prose — inside **bold** it lights just the
         // word — but a match that lives in the SYNTAX ("note" inside
@@ -531,23 +582,23 @@ function createPeerSync(opts) {
         // counts when it covers the very text that matched.
         const pr = rangeIn(srcToDom(spans[i][0], true), srcToDom(spans[i][1], true));
         if (pr && !pr.collapsed
-            && pr.toString() === ed.value.slice(spans[i][0], spans[i][1])) reg.add(pr);
+            && pr.toString() === ed.value.slice(spans[i][0], spans[i][1])) reg!.add(pr);
       }
       return true;
     },
     clearFind() {
       if (!findHi) return;
       findHi.clear();
-      findOnHi.clear();
+      findOnHi!.clear();
     },
     // which line an offset is on, and where a line starts — Find scrolls the
     // source by row, the same way showLine does
     lineOf,
-    rowTop(line) {
-      const row = edBack.children[line];
+    rowTop(line: number): number | null {
+      const row = edBack.children[line] as HTMLElement | undefined;
       return row ? row.offsetTop : null;
     },
-    caretRect(off) {
+    caretRect(off: number): DOMRect | null {
       const at = srcToRow(off);
       if (!at) return null;
       const r = document.createRange();

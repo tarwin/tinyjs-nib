@@ -13,42 +13,172 @@
 // entries — with ⓘ for the rest: where the menu is written, what's built by
 // code, where this page sits.
 
+// --------------------------------------------------------------- the data
+// What siteMenus answers (menus.ts, after annotate) — page-side copies of
+// menuparse.ts's shapes, cut to the fields this panel reads.
+
+export type SiteItemKind = 'page' | 'group' | 'link' | 'sep' | 'dyn' | 'auto';
+
+/** A menu entry. The position fields only matter as present-or-not here. */
+export interface SiteMenuItem {
+  text: string;
+  kind: SiteItemKind;
+  link?: string | null;
+  file?: string | null;
+  href?: string;
+  items?: SiteMenuItem[];
+  collapsed?: boolean;
+  note?: string;
+  line?: number;
+  span?: unknown;
+  itemsSpan?: unknown;
+  jpath?: unknown;
+  listPath?: unknown;
+  noEdit?: boolean;
+  ychild?: string;
+  /** placed by front matter: the flavor ('jtd' can nest) */
+  fm?: string;
+  /** listed in a per-folder meta file */
+  meta?: unknown;
+  missing?: boolean;
+  generated?: boolean;
+}
+
+export interface SiteMenuSource { file: string; kind?: string; line?: number }
+
+export interface SiteMenu {
+  /** `system:root:id` */
+  key: string;
+  label: string;
+  source: SiteMenuSource;
+  editable: boolean;
+  complete: boolean;
+  items: SiteMenuItem[];
+  auto?: boolean;
+  top?: boolean;
+  note?: string;
+  eject?: { config: string; locale: string | null } | null;
+}
+
+/** A menu entry whose link lands on nothing. */
+export interface SiteDeadLink {
+  menu?: string;
+  text: string;
+  link: string;
+  trail: string[];
+  generated?: boolean;
+}
+
+export interface SiteMenuSite {
+  system: string;
+  label: string;
+  root: string;
+  content: string;
+  menus: SiteMenu[];
+  notes: string[];
+  dead: SiteDeadLink[];
+  /** pages no menu of this site links to */
+  orphans: string[];
+}
+
+/** One edit to one menu (editMenu in menus.ts). */
+export interface SiteMenuOp {
+  kind: 'move' | 'rename' | 'remove' | 'add' | 'eject';
+  at?: string | null;
+  to?: string | null;
+  where?: 'before' | 'after' | 'inside';
+  text?: string;
+  file?: string;
+}
+
+/** siteMenus / editSiteMenu / undo / redo: the menus re-read, or why not. */
+export interface SiteMenusAnswer {
+  sites?: SiteMenuSite[];
+  error?: string;
+  /** undo / redo: what was taken back */
+  label?: string;
+}
+
+/** A context-menu row (doc.ts's drawCtx). */
+export interface SiteMenuAction { label?: string; fn?: () => unknown; sep?: boolean }
+
+export interface SiteMenuOptions {
+  /** the panel (#menuInner) */
+  box: HTMLElement;
+  /** siteMenus */
+  fetch: () => Promise<SiteMenusAnswer | null>;
+  /** the open folder */
+  root: () => string | null;
+  onOpen: (path: string, preview: boolean) => unknown;
+  /** open a menu's source file at a line */
+  onOpenAt: (path: string, line: number) => unknown;
+  onExternal: (url: string) => unknown;
+  /** whether there are menus at all changed */
+  onChange?: () => unknown;
+  onEdit: (key: string, op: SiteMenuOp, label: string) => Promise<SiteMenusAnswer | null>;
+  onUndo: () => Promise<SiteMenusAnswer | null>;
+  onRedo: () => Promise<SiteMenusAnswer | null>;
+  showMenu: (title: string, items: SiteMenuAction[], x: number, y: number) => unknown;
+  toast: (msg: string) => unknown;
+  onEscape?: () => unknown;
+  /** the panel took or lost the keyboard (Edit ▸ Undo follows it) */
+  onFocus?: (on: boolean) => unknown;
+}
+
+export interface SiteMenuPanel {
+  refresh(): Promise<void>;
+  has(): boolean;
+  showing(p: string | null): void;
+  paint(): void;
+  focus(): void;
+  history(redo?: boolean): Promise<void>;
+  clear(): void;
+}
+
+/** A menu and the site it belongs to. */
+interface Picked { site: SiteMenuSite; menu: SiteMenu }
+/** A visible row. */
+interface Row { id: string; it: SiteMenuItem; kids: boolean; isShut: boolean | undefined; auto: boolean }
+type Where = 'before' | 'after' | 'inside';
+/** What's being dragged: a menu entry (at), or an orphan page (file). */
+interface Drag { at?: string; text?: string; tree?: boolean; file?: string }
+
 function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChange, onEdit, onUndo, onRedo,
-  showMenu, toast, onEscape, onFocus }) {
-  const $ = (id) => box.querySelector('#' + id);
-  let sites = [];
-  let current = null;              // project-relative path of the shown doc
-  let chosen = null;               // menu key the person picked
-  let shown = null;                // menu key on screen now
+  showMenu, toast, onEscape, onFocus }: SiteMenuOptions): SiteMenuPanel {
+  const $ = <T extends HTMLElement = HTMLElement>(id: string) => box.querySelector('#' + id) as T;
+  let sites: SiteMenuSite[] = [];
+  let current: string | null = null;              // project-relative path of the shown doc
+  let chosen: string | null = null;               // menu key the person picked
+  let shown: string | null = null;                // menu key on screen now
   let ask = 0;
-  const shut = new Map();          // menu key -> Set of item ids folded by hand
-  const opened = new Map();        // ... and ones opened by hand (beats collapsed: true)
+  const shut = new Map<string, Set<string>>();          // menu key -> Set of item ids folded by hand
+  const opened = new Map<string, Set<string>>();        // ... and ones opened by hand (beats collapsed: true)
   let orphansOpen = false;
-  let drag = null;                 // { at } a menu entry, or { file } an orphan
-  let cursor = null;               // keyboard cursor: an item id in the shown menu
-  let renaming = null;             // item id being renamed in place
-  let typed = null;                // what's typed there, kept across repaints
-  let rows = [];                   // the visible rows, top to bottom: { id, it, kids, isShut }
+  let drag: Drag | null = null;                 // { at } a menu entry, or { file } an orphan
+  let cursor: string | null = null;               // keyboard cursor: an item id in the shown menu
+  let renaming: string | null = null;             // item id being renamed in place
+  let typed: string | null = null;                // what's typed there, kept across repaints
+  let rows: Row[] = [];                   // the visible rows, top to bottom: { id, it, kids, isShut }
   let infoOpen = false;
-  let previewTimer = null;
+  let previewTimer: number | null = null;
 
   const KEY = 'nib.sitemenu.chosen', INFO = 'nib.sitemenu.info';
   try { chosen = localStorage.getItem(KEY); infoOpen = localStorage.getItem(INFO) === '1'; } catch { /* fine */ }
   box.tabIndex = 0;                // focusable, like the tree, for the keys
 
-  const menus = () => sites.flatMap((s) => s.menus.map((m) => ({ site: s, menu: m })));
-  const abs = (rel) => (root() ? root() + '/' + rel : rel);
-  const itemAt = (menu, id) => {
-    let list = menu.items, it = null;
+  const menus = () => sites.flatMap((s) => s.menus.map((m): Picked => ({ site: s, menu: m })));
+  const abs = (rel: string) => (root() ? root() + '/' + rel : rel);
+  const itemAt = (menu: SiteMenu, id: string): SiteMenuItem | null => {
+    let list: SiteMenuItem[] | undefined = menu.items, it: SiteMenuItem | null | undefined = null;
     for (const k of String(id).split('.')) { it = list && list[+k]; if (!it) return null; list = it.items; }
     return it;
   };
-  const parentId = (id) => (id.includes('.') ? id.slice(0, id.lastIndexOf('.')) : null);
+  const parentId = (id: string) => (id.includes('.') ? id.slice(0, id.lastIndexOf('.')) : null);
 
   // the trail to `rel` in one menu's items, as item ids — or null
-  function trailTo(items, rel, pre = '') {
+  function trailTo(items: SiteMenuItem[] | undefined, rel: string, pre = ''): string[] | null {
     for (let i = 0; i < (items || []).length; i++) {
-      const it = items[i];
+      const it = items![i];
       const id = pre + i;
       if (it.file === rel) return [id];
       const sub = trailTo(it.items, rel, id + '.');
@@ -56,11 +186,11 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
     }
     return null;
   }
-  const textAt = (items, ids) => {
-    const out = [];
+  const textAt = (items: SiteMenuItem[], ids: string[]) => {
+    const out: string[] = [];
     let list = items;
     for (const id of ids) {
-      const it = list[+id.split('.').pop()];
+      const it = list[+id.split('.').pop()!];
       out.push(it.text || '(untitled)');
       list = it.items || [];
     }
@@ -72,13 +202,13 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
   // page, else the first that does.
   function follow() {
     const all = menus();
-    const has = (k) => { const x = all.find((y) => y.menu.key === k); return x && current && trailTo(x.menu.items, current); };
+    const has = (k: string | null) => { const x = all.find((y) => y.menu.key === k); return x && current && trailTo(x.menu.items, current); };
     if (shown && has(shown)) return;
     if (chosen && has(chosen)) { shown = chosen; return; }
-    const holds = current && all.find((x) => !x.menu.top && trailTo(x.menu.items, current));
+    const holds = current && all.find((x) => !x.menu.top && trailTo(x.menu.items, current!));
     if (holds) shown = holds.menu.key;
   }
-  function pick() {
+  function pick(): Picked | null {
     const all = menus();
     if (!all.length) return null;
     return all.find((x) => x.menu.key === shown) || all.find((x) => x.menu.key === chosen)
@@ -89,14 +219,14 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
   // is in its file (an autogenerated branch isn't), and it isn't code.
   //   it.fm — placed by front matter (an autogenerated folder's page)
   //   it.meta — listed in a per-folder meta file (Fumadocs, Nextra, Rspress)
-  function movable(menu, it, auto) {
+  function movable(menu: SiteMenu, it: SiteMenuItem, auto: boolean | undefined) {
     if (it.fm) return true;
     if (it.meta) return !!menu.editable;
     return !!menu.editable && !auto && it.kind !== 'dyn' && it.kind !== 'auto' && !it.noEdit
       && (it.line != null || !!it.span || !!it.jpath);
   }
   // Whether something can land `where` relative to `it`
-  function fits(menu, it, where) {
+  function fits(menu: SiteMenu, it: SiteMenuItem, where: Where) {
     if (it.kind === 'dyn' || it.kind === 'auto' || it.noEdit) return false;
     // folder-built entries move among their own folder's (Just the Docs:
     // any page can become a parent)
@@ -112,15 +242,15 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
   }
   // what's being dragged may land here at all: folder-built entries only
   // beside their siblings, and nothing else among them
-  function accepts(it, id) {
+  function accepts(it: SiteMenuItem, id: string) {
     if (!drag) return false;
     const tree = !!(it.fm || it.meta);
     if (drag.file) return !tree;
     if (drag.tree !== tree) return false;
-    if (tree && it.fm !== 'jtd' && parentId(drag.at) !== parentId(id)) return false;
+    if (tree && it.fm !== 'jtd' && parentId(drag.at!) !== parentId(id)) return false;
     return true;
   }
-  function zone(e, row, menu, it) {
+  function zone(e: MouseEvent, row: HTMLElement, menu: SiteMenu, it: SiteMenuItem): Where | null {
     const r = row.getBoundingClientRect();
     const y = (e.clientY - r.top) / r.height;
     const into = fits(menu, it, 'inside');
@@ -135,7 +265,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
     }
     $('smTree').classList.remove('drop-end');
   }
-  const setOpen = (key, id, on) => {
+  const setOpen = (key: string, id: string, on: boolean | undefined) => {
     const s = shut.get(key) || new Set(), o = opened.get(key) || new Set();
     if (on) { s.delete(id); o.add(id); } else { s.add(id); o.delete(id); }
     shut.set(key, s);
@@ -144,8 +274,8 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
 
   // ------------------------------------------------------------- drawing
 
-  function paintHead(all, cur) {
-    const sys = $('smSys'), sel = $('smPick'), dead = $('smDead'), info = $('smInfo'), btn = $('smInfoBtn');
+  function paintHead(all: Picked[], cur: Picked | null) {
+    const sys = $('smSys'), sel = $<HTMLSelectElement>('smPick'), dead = $('smDead'), info = $('smInfo'), btn = $('smInfoBtn');
     info.textContent = '';
     if (!cur) {
       sys.textContent = 'No docs-site menu here';
@@ -162,7 +292,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
     const multiSite = sites.length > 1;
     for (const s of sites) {
       const parent = multiSite ? document.createElement('optgroup') : sel;
-      if (multiSite) { parent.label = s.label + (s.root ? ' — ' + s.root : ''); sel.appendChild(parent); }
+      if (multiSite) { (parent as HTMLOptGroupElement).label = s.label + (s.root ? ' — ' + s.root : ''); sel.appendChild(parent); }
       for (const m of s.menus) {
         const o = document.createElement('option');
         o.value = m.key;
@@ -183,7 +313,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
     if (!infoOpen) return;
 
     // the details
-    const line = (text, cls) => {
+    const line = (text: string, cls?: string) => {
       const d = document.createElement('div');
       d.className = 'smLine' + (cls ? ' ' + cls : '');
       if (text) d.textContent = text;
@@ -222,14 +352,14 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
       const trail = trailTo(menu.items, current);
       if (trail) line('This page: ' + textAt(menu.items, trail).join(' › '), 'here');
       else if (current.startsWith(site.content ? site.content + '/' : '')) {
-        const elsewhere = all.filter((x) => x.menu.key !== menu.key && trailTo(x.menu.items, current));
+        const elsewhere = all.filter((x) => x.menu.key !== menu.key && trailTo(x.menu.items, current!));
         line(elsewhere.length ? 'This page is in ' + elsewhere.map((x) => x.menu.label).join(', ') + ', not here.'
           : 'This page isn’t in any menu.', 'here off');
       }
     }
   }
 
-  function paint({ scroll = false } = {}) {
+  function paint({ scroll = false }: { scroll?: boolean } = {}) {
     const list = $('smTree'), orph = $('smOrphans');
     list.textContent = '';
     orph.textContent = '';
@@ -246,7 +376,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
     const hand = shut.get(menu.key) || new Set();
     const handOpen = opened.get(menu.key) || new Set();
 
-    const draw = (items, depth, pre, auto) => {
+    const draw = (items: SiteMenuItem[], depth: number, pre: string, auto: boolean) => {
       items.forEach((it, i) => {
         const id = pre + i;
         const row = document.createElement('div');
@@ -275,7 +405,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
           });
           input.oninput = () => { typed = input.value; };
           let done = false;
-          const finish = (commit) => {
+          const finish = (commit: boolean) => {
             if (done) return;
             done = true;
             const value = input.value.trim();
@@ -303,7 +433,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
           : it.missing ? 'Points at ' + it.link + ' — there’s no such page'
             : it.kind === 'dyn' ? 'Built by code: ' + (it.note || '')
               : it.kind === 'auto' ? 'Generated from the folder, not listed by hand'
-                : it.kind === 'link' ? it.href
+                : it.kind === 'link' ? it.href!
                   : it.file || '';
         const toggle = () => { setOpen(menu.key, id, isShut); paint(); };
         tw.onclick = (e) => { e.stopPropagation(); if (kids) toggle(); };
@@ -312,7 +442,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
           cursor = id;
           box.focus({ preventScroll: true });
           if (it.file) onOpen(abs(it.file), true);
-          else if (it.kind === 'link') onExternal(it.href);
+          else if (it.kind === 'link') onExternal(it.href!);
           else if (kids) { toggle(); return; }
           paint();
         };
@@ -328,18 +458,18 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
           e.stopPropagation();
           cursor = id;
           paint();
-          const acts = [];
-          if (it.file) acts.push({ label: 'Open', fn: () => onOpen(abs(it.file), false) });
-          if (it.kind === 'link') acts.push({ label: 'Open in Browser', fn: () => onExternal(it.href) });
-          if (isFile) acts.push({ label: 'Show in ' + from.split('/').pop(), fn: () => onOpenAt(abs(from), it.line != null ? it.line : (menu.source.line || 0)) });
+          const acts: SiteMenuAction[] = [];
+          if (it.file) acts.push({ label: 'Open', fn: () => onOpen(abs(it.file!), false) });
+          if (it.kind === 'link') acts.push({ label: 'Open in Browser', fn: () => onExternal(it.href!) });
+          if (isFile) acts.push({ label: 'Show in ' + from!.split('/').pop(), fn: () => onOpenAt(abs(from!), it.line != null ? it.line : (menu.source.line || 0)) });
           if (can) {
             acts.push({ sep: true });
             acts.push({ label: 'Rename', fn: () => startRename(id) });
             if (current && !trail && !it.fm && !it.meta && fits(menu, it, 'after')) {
-              acts.push({ label: 'Add This Page After', fn: () => edit(menu, { kind: 'add', file: current, to: id, where: 'after' }, 'Add this page') });
+              acts.push({ label: 'Add This Page After', fn: () => edit(menu, { kind: 'add', file: current!, to: id, where: 'after' }, 'Add this page') });
             }
             if (current && !trail && !it.fm && !it.meta && fits(menu, it, 'inside')) {
-              acts.push({ label: 'Add This Page Inside', fn: () => edit(menu, { kind: 'add', file: current, to: id, where: 'inside' }, 'Add this page') });
+              acts.push({ label: 'Add This Page Inside', fn: () => edit(menu, { kind: 'add', file: current!, to: id, where: 'inside' }, 'Add this page') });
             }
             // a folder-built entry can't be taken out, only hidden
             acts.push({ label: it.fm || it.meta ? 'Hide from Menu' : 'Remove from Menu', fn: () => remove(menu, id, it) });
@@ -352,8 +482,8 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
           row.draggable = true;
           row.ondragstart = (e) => {
             drag = { at: id, text: it.text, tree: !!(it.fm || it.meta) };
-            e.dataTransfer.effectAllowed = 'move';
-            try { e.dataTransfer.setData('text/plain', it.text || ''); } catch { /* fine */ }
+            e.dataTransfer!.effectAllowed = 'move';
+            try { e.dataTransfer!.setData('text/plain', it.text || ''); } catch { /* fine */ }
             row.classList.add('dragging');
           };
           row.ondragend = () => { drag = null; row.classList.remove('dragging'); clearDrop(); };
@@ -364,7 +494,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
             const where = zone(e, row, menu, it);
             if (!where) return;
             e.preventDefault();
-            e.dataTransfer.dropEffect = drag.at ? 'move' : 'copy';
+            e.dataTransfer!.dropEffect = drag.at ? 'move' : 'copy';
             clearDrop();
             row.classList.add('drop-' + where);
           };
@@ -379,11 +509,11 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
             drag = null;
             cursor = null;
             if (d.at) edit(menu, { kind: 'move', at: d.at, to: id, where }, 'Move “' + (d.text || 'entry') + '”');
-            else edit(menu, { kind: 'add', file: d.file, to: id, where }, 'Add “' + d.file.split('/').pop() + '”');
+            else edit(menu, { kind: 'add', file: d.file, to: id, where }, 'Add “' + d.file!.split('/').pop() + '”');
           };
         }
         list.appendChild(row);
-        if (kids && !isShut) draw(it.items, depth + 1, id + '.', auto || it.kind === 'auto');
+        if (kids && !isShut) draw(it.items!, depth + 1, id + '.', auto || it.kind === 'auto');
       });
     };
     draw(menu.items, 0, '', false);
@@ -403,7 +533,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
       const d = drag;
       drag = null;
       if (d.at) edit(menu, { kind: 'move', at: d.at, to: null }, 'Move “' + (d.text || 'entry') + '”');
-      else edit(menu, { kind: 'add', file: d.file, to: null }, 'Add “' + d.file.split('/').pop() + '”');
+      else edit(menu, { kind: 'add', file: d.file, to: null }, 'Add “' + d.file!.split('/').pop() + '”');
     };
     if (scroll) {
       const el = list.querySelector('.smRow.kc') || list.querySelector('.smRow.cur');
@@ -417,9 +547,9 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
       const head = document.createElement('div');
       head.className = 'sfFile';
       head.innerHTML = '<span class="sfTwist">▾</span><span class="sfName"></span><span class="sfDir"></span><span class="sfN"></span>';
-      head.querySelector('.sfTwist').textContent = orphansOpen ? '▾' : '▴';
-      head.querySelector('.sfName').textContent = 'Not in any menu';
-      head.querySelector('.sfN').textContent = site.orphans.length;
+      head.querySelector('.sfTwist')!.textContent = orphansOpen ? '▾' : '▴';
+      head.querySelector('.sfName')!.textContent = 'Not in any menu';
+      head.querySelector('.sfN')!.textContent = site.orphans.length as unknown as string;   // textContent stringifies
       head.title = 'Pages under ' + (site.content || 'the folder') + '/ that no menu of this site links to'
         + (menu.editable && !menu.auto && menu.source.kind !== 'meta-tree' ? ' — drag one into the menu to add it' : '');
       head.onclick = () => { orphansOpen = !orphansOpen; paint(); if (orphansOpen) orph.scrollTop = 0; };
@@ -429,7 +559,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
           const row = document.createElement('div');
           row.className = 'smRow k-page orphan' + (rel === current ? ' cur' : '');
           row.style.paddingLeft = '16px';
-          const name = rel.split('/').pop();
+          const name = rel.split('/').pop()!;
           const tx = document.createElement('span');
           tx.className = 'smTx';
           tx.textContent = name;
@@ -447,14 +577,14 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
             row.draggable = true;
             row.ondragstart = (e) => {
               drag = { file: rel };
-              e.dataTransfer.effectAllowed = 'copy';
-              try { e.dataTransfer.setData('text/plain', rel); } catch { /* fine */ }
+              e.dataTransfer!.effectAllowed = 'copy';
+              try { e.dataTransfer!.setData('text/plain', rel); } catch { /* fine */ }
             };
             row.ondragend = () => { drag = null; clearDrop(); };
           }
           row.oncontextmenu = (e) => {
             e.preventDefault();
-            const acts = [{ label: 'Open', fn: () => onOpen(abs(rel), false) }];
+            const acts: SiteMenuAction[] = [{ label: 'Open', fn: () => onOpen(abs(rel), false) }];
             if (addable) acts.push({ label: 'Add to the End of the Menu', fn: () => edit(menu, { kind: 'add', file: rel, to: null }, 'Add “' + name + '”') });
             showMenu(name, acts, e.clientX, e.clientY);
           };
@@ -465,9 +595,9 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
   }
 
   // open the groups holding dead entries and put the cursor on the first
-  function revealDead(menu) {
-    let first = null;
-    const walk = (items, pre) => items.forEach((it, i) => {
+  function revealDead(menu: SiteMenu) {
+    let first: string | null = null;
+    const walk = (items: SiteMenuItem[], pre: string): void => items.forEach((it, i) => {
       const id = pre + i;
       if (it.missing && !it.generated) {
         if (!first) first = id;
@@ -484,9 +614,9 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
 
   // --------------------------------------------------------------- edits
 
-  async function edit(menu, op, what) {
-    let r;
-    try { r = await onEdit(menu.key, op, what); } catch (e) { r = { error: String(e && e.message || e) }; }
+  async function edit(menu: SiteMenu, op: SiteMenuOp, what: string): Promise<boolean> {
+    let r: SiteMenusAnswer | null;
+    try { r = await onEdit(menu.key, op, what); } catch (e) { r = { error: String(e && (e as Error).message || e) }; }
     if (!r || r.error) { toast((r && r.error) || 'Couldn’t change the menu.'); return false; }
     sites = r.sites || sites;
     shown = menu.key;
@@ -494,8 +624,8 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
     paint({ scroll: true });
     return true;
   }
-  async function history(redo) {
-    let r;
+  async function history(redo?: boolean): Promise<void> {
+    let r: SiteMenusAnswer | null;
     try { r = await (redo ? onRedo() : onUndo()); } catch { r = null; }
     if (!r || r.error) { toast((r && r.error) || (redo ? 'Nothing to redo.' : 'Nothing to undo.')); return; }
     if (r.label) toast((redo ? 'Redo: ' : 'Undo: ') + r.label);
@@ -503,7 +633,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
     follow();
     paint({ scroll: true });       // the cursor stays where it was
   }
-  async function ejectMenu(menu) {
+  async function ejectMenu(menu: SiteMenu) {
     const ok = await tiny.dialog.confirm('Move this sidebar to a JSON file?', {
       detail: 'Nib writes the sidebar, as the site builds it now, to a .json file next to the config, '
         + 'and the config imports it in place of the pieces. From then on it can be edited here. '
@@ -512,7 +642,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
     });
     if (ok) edit(menu, { kind: 'eject' }, 'Move Sidebar to JSON');
   }
-  function startRename(id) {
+  function startRename(id: string) {
     const cur = pick();
     if (!cur) return;
     const it = itemAt(cur.menu, id);
@@ -523,7 +653,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
     typed = null;
     paint();
   }
-  async function remove(menu, id, it) {
+  async function remove(menu: SiteMenu, id: string, it: SiteMenuItem) {
     const n = (it.items || []).length;
     if (n) {
       const ok = await tiny.dialog.confirm('Remove “' + (it.text || '') + '” and the ' + (n === 1 ? 'entry' : n + ' entries') + ' under it from the menu?', {
@@ -538,10 +668,10 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
     }
   }
   // ⌘↑ / ⌘↓: swap with the sibling above or below
-  async function nudge(menu, id, dir) {
+  async function nudge(menu: SiteMenu, id: string, dir: number) {
     const p = parentId(id);
-    const i = +id.split('.').pop();
-    const sibs = p ? (itemAt(menu, p) || {}).items : menu.items;
+    const i = +id.split('.').pop()!;
+    const sibs = p ? (itemAt(menu, p) || ({} as Partial<SiteMenuItem>)).items : menu.items;
     const j = i + dir;
     if (!sibs || j < 0 || j >= sibs.length) return;
     const pre = p ? p + '.' : '';
@@ -569,12 +699,12 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
     if (!rows.length) return;
     const i = rows.findIndex((r) => r.id === cursor);
     const r = rows[i] || null;
-    const go = (row, { preview = true } = {}) => {
+    const go = (row: Row | undefined, { preview = true }: { preview?: boolean } = {}) => {
       if (!row) return;
       cursor = row.id;
       paint({ scroll: true });
-      clearTimeout(previewTimer);
-      if (preview && row.it.file) previewTimer = setTimeout(() => onOpen(abs(row.it.file), true), 180);
+      clearTimeout(previewTimer as number | undefined);
+      if (preview && row.it.file) previewTimer = setTimeout(() => onOpen(abs(row.it.file!), true), 180);
     };
     if (mod && (k === 'ArrowUp' || k === 'ArrowDown')) {
       e.preventDefault();
@@ -593,7 +723,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
       else if (r && parentId(r.id)) go(rows.find((x) => x.id === parentId(r.id)), { preview: false });
     } else if (k === 'Enter' && mod) {
       e.preventDefault();
-      clearTimeout(previewTimer);
+      clearTimeout(previewTimer as number | undefined);
       if (r && r.it.file) onOpen(abs(r.it.file), false);
     } else if (k === 'Enter') {
       e.preventDefault();
@@ -601,7 +731,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
     } else if (k === ' ') {
       e.preventDefault();
       if (r && r.it.file) onOpen(abs(r.it.file), true);
-      else if (r && r.it.kind === 'link') onExternal(r.it.href);
+      else if (r && r.it.kind === 'link') onExternal(r.it.href!);
     } else if ((k === 'Backspace' && mod) || k === 'Delete') {
       e.preventDefault();
       if (r && movable(menu, r.it, r.auto)) remove(menu, r.id, r.it);
@@ -611,7 +741,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
       paint();
     } else if (k === 'Escape') {
       e.preventDefault();
-      clearTimeout(previewTimer);
+      clearTimeout(previewTimer as number | undefined);
       if (onEscape) onEscape();
     }
   });
@@ -631,7 +761,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
   window.addEventListener('focus', () => setTimeout(focusNow, 0));
 
   $('smPick').onchange = (e) => {
-    chosen = shown = e.target.value;
+    chosen = shown = (e.target as HTMLSelectElement).value;
     cursor = null;
     try { localStorage.setItem(KEY, chosen); } catch { /* fine */ }
     paint();
@@ -642,9 +772,9 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
     paint();
   };
 
-  async function refresh() {
+  async function refresh(): Promise<void> {
     const n = ++ask;
-    let r;
+    let r: SiteMenusAnswer | null;
     try { r = await fetch(); } catch { r = null; }
     if (n !== ask) return;
     const was = sites.length > 0;
@@ -658,7 +788,7 @@ function setupSiteMenu({ box, fetch, root, onOpen, onOpenAt, onExternal, onChang
   return {
     refresh,
     has: () => sites.length > 0,
-    showing(p) {
+    showing(p: string | null) {
       const r = root();
       const rel = p && r && p.startsWith(r + '/') ? p.slice(r.length + 1) : null;
       if (rel === current) return;

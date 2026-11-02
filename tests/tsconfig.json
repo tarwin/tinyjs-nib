@@ -1,0 +1,11 @@
+{
+  // The tests import modules from both halves of the app, so they get their
+  // own program (not one of tsc -b's composite projects, which may only see
+  // their own files). `pnpm typecheck` runs it after tsc -b.
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["node"]
+  },
+  "include": ["./**/*.ts", "../types/tiny.d.ts", "../types/tjs.d.ts"]
+}

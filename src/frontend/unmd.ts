@@ -21,43 +21,45 @@ import { MD_CONTAINERS } from './md.ts';
 const INLINE_ESC = /([\\*`[\]])/g;
 // …and a < that would open a tag, so text typed as "<kbd>" stays text
 // when the HTML flavor option is on
-const esc = (s) => s.replace(INLINE_ESC, '\\$1').replace(/<(?=[a-zA-Z/!])/g, '\\<');
+const esc = (s: string) => s.replace(INLINE_ESC, '\\$1').replace(/<(?=[a-zA-Z/!])/g, '\\<');
 
-const isEl = (n, ...tags) => n.nodeType === 1 && tags.includes(n.tagName);
+const isEl = (n: Node, ...tags: string[]) => n.nodeType === 1 && tags.includes((n as Element).tagName);
 
 // --------------------------------------------------------------- inline
 
-function inline(node) {
+// Any node comes in; past the text-node and non-element returns it is an
+// element, which is what the casts below say.
+function inline(node: Node): string {
   // U+200B is live.ts's caret perch after an input rule fires — it is
   // scaffolding, never content.
-  if (node.nodeType === 3) return esc(node.nodeValue.replace(/​/g, '').replace(/\s+/g, ' '));
+  if (node.nodeType === 3) return esc(node.nodeValue!.replace(/​/g, '').replace(/\s+/g, ' '));
   if (node.nodeType !== 1) return '';
   // inline islands answer from data-text before anything walks into them:
   // an emoji goes home as its :shortcode:, inline math as its $TeX$
-  if (node.classList.contains('emo')) return node.dataset.text || node.textContent;
-  if (node.classList.contains('math')) return '$' + (node.dataset.text || '') + '$';
+  if ((node as HTMLElement).classList.contains('emo')) return (node as HTMLElement).dataset.text || node.textContent!;
+  if ((node as HTMLElement).classList.contains('math')) return '$' + ((node as HTMLElement).dataset.text || '') + '$';
   // inline HTML (md.ts "raw HTML"): a hidden comment is its own text, and a
   // tag goes back as it was spelled, around whatever it holds now
-  if (node.classList.contains('hcom')) return node.dataset.text || '';
-  if (node.dataset.h != null) {
-    const t = node.tagName.toLowerCase();
-    return /^(?:br|img|wbr)$/.test(t) ? node.dataset.h
-      : node.dataset.h + [...node.childNodes].map(inline).join('') + '</' + t + '>';
+  if ((node as HTMLElement).classList.contains('hcom')) return (node as HTMLElement).dataset.text || '';
+  if ((node as HTMLElement).dataset.h != null) {
+    const t = (node as Element).tagName.toLowerCase();
+    return /^(?:br|img|wbr)$/.test(t) ? (node as HTMLElement).dataset.h!
+      : (node as HTMLElement).dataset.h + [...node.childNodes].map(inline).join('') + '</' + t + '>';
   }
   const kids = () => [...node.childNodes].map(inline).join('');
   // a path with a space or a bracket in it has to go back inside <angle
   // brackets> — written bare it would not parse as a link at all
-  const target = (p) => (/[\s()<>]/.test(p) ? '<' + p + '>' : p);
+  const target = (p: string) => (/[\s()<>]/.test(p) ? '<' + p + '>' : p);
 
-  switch (node.tagName) {
+  switch ((node as Element).tagName) {
     case 'BR': return '  \n';
     case 'INPUT': return '';                        // task boxes: handled by the li
     case 'IMG': {
-      const src = node.dataset.src || node.getAttribute('src') || '';
-      return `![${(node.getAttribute('alt') || '').replace(/[[\]]/g, '')}](${target(src)})`;
+      const src = (node as HTMLElement).dataset.src || (node as Element).getAttribute('src') || '';
+      return `![${((node as Element).getAttribute('alt') || '').replace(/[[\]]/g, '')}](${target(src)})`;
     }
     case 'CODE': {
-      const raw = node.textContent;
+      const raw = node.textContent!;
       const tick = '`'.repeat((raw.match(/`+/g) || []).reduce((m, r) => Math.max(m, r.length), 0) + 1);
       return tick + (/^`|`$/.test(raw) ? ' ' + raw + ' ' : raw) + tick;
     }
@@ -80,11 +82,11 @@ function inline(node) {
     case 'LABEL': return '';                        // tab titles: the div emits them
     case 'SUP': {
       // a footnote reference — the number is presentation, the id is truth
-      if (node.classList.contains('fnref')) return '[^' + node.dataset.fn + ']';
+      if ((node as HTMLElement).classList.contains('fnref')) return '[^' + (node as HTMLElement).dataset.fn + ']';
       return kids();
     }
     case 'A': {
-      const href = node.getAttribute('href') || '';
+      const href = (node as Element).getAttribute('href') || '';
       const label = kids().trim() || href;
       if (!href) return label;
       return href === label ? label : `[${label}](${target(href)})`;
@@ -96,7 +98,7 @@ function inline(node) {
 // Newlines in inline content only ever come from <br>, which Markdown
 // spells as two trailing spaces — so normalize around them and drop the
 // indentation the renderer left on the following line.
-const inlineOf = (nodes) =>
+const inlineOf = (nodes: Node[]) =>
   nodes.map(inline).join('')
     .replace(/[ \t]+\n/g, '  \n')
     .replace(/\n[ \t]+/g, '\n')
@@ -104,40 +106,40 @@ const inlineOf = (nodes) =>
 
 // ---------------------------------------------------------------- blocks
 
-function listOf(el, indent) {
+function listOf(el: Element, indent: string): string {
   const ordered = el.tagName === 'OL';
   let n = parseInt(el.getAttribute('start') || '1', 10) || 1;
-  const out = [];
+  const out: string[] = [];
   for (const li of el.children) {
     if (li.tagName !== 'LI') continue;
-    const nested = [], own = [];
+    const nested: Node[] = [], own: Node[] = [];
     for (const c of li.childNodes) {
       (isEl(c, 'UL', 'OL') ? nested : own).push(c);
     }
-    const box = li.querySelector(':scope > input[type=checkbox]');
+    const box = li.querySelector<HTMLInputElement>(':scope > input[type=checkbox]');
     const mark = ordered ? n++ + '. ' : '- ';
     const body = inlineOf(own).replace(/\n/g, '\n' + indent + '  ') || '';
     out.push(indent + mark + (box ? (box.checked ? '[x] ' : '[ ] ') : '') + body);
-    for (const sub of nested) out.push(listOf(sub, indent + '  '));
+    for (const sub of nested) out.push(listOf(sub as Element, indent + '  '));
   }
   return out.join('\n');
 }
 
-function tableOf(el) {
+function tableOf(el: Element) {
   const rows = [...el.querySelectorAll('tr')];
   if (!rows.length) return '';
-  const cells = (tr) => [...tr.children].map((td) => inlineOf([...td.childNodes]).replace(/\|/g, '\\|').trim());
+  const cells = (tr: Element) => [...tr.children].map((td) => inlineOf([...td.childNodes]).replace(/\|/g, '\\|').trim());
   const align = [...(rows[0].children || [])].map((td) => {
-    const a = td.style.textAlign || '';
+    const a = (td as HTMLElement).style.textAlign || '';
     return a === 'center' ? ':---:' : a === 'right' ? '---:' : '---';
   });
-  const line = (cs) => '| ' + cs.join(' | ') + ' |';
+  const line = (cs: string[]) => '| ' + cs.join(' | ') + ' |';
   const out = [line(cells(rows[0])), line(align)];
   for (const tr of rows.slice(1)) out.push(line(cells(tr)));
   return out.join('\n');
 }
 
-function blockOf(el) {
+function blockOf(el: HTMLElement): string {
   const kids = () => blocks(el);
 
   if (/^H[1-6]$/.test(el.tagName)) {
@@ -150,10 +152,10 @@ function blockOf(el) {
     case 'UL': case 'OL': return listOf(el, '');
     case 'TABLE': return tableOf(el);
     case 'PRE': {
-      if (el.classList.contains('fm')) return '---\n' + el.textContent.replace(/\n$/, '') + '\n---';
+      if (el.classList.contains('fm')) return '---\n' + el.textContent!.replace(/\n$/, '') + '\n---';
       const code = el.querySelector('code');
       const lang = (code && (code.className.match(/lang-([\w+-]+)/) || [])[1]) || '';
-      const body = (code || el).textContent.replace(/\n$/, '');
+      const body = (code || el).textContent!.replace(/\n$/, '');
       const fence = '`'.repeat(Math.max(3, ((body.match(/`{3,}/g) || []).reduce((m, r) => Math.max(m, r.length), 0)) + 1));
       return fence + lang + '\n' + body + '\n' + fence;
     }
@@ -168,10 +170,10 @@ function blockOf(el) {
     // the footnote list at the document's end: back into [^id]: lines
     case 'SECTION': {
       if (el.classList.contains('footnotes')) {
-        return [...el.querySelectorAll('li[data-fn]')]
+        return [...el.querySelectorAll<HTMLElement>('li[data-fn]')]
           .map((li) => {
             const kids = [...li.childNodes].filter((n) =>
-              !(n.nodeType === 1 && n.classList.contains('fn-back')));
+              !(n.nodeType === 1 && (n as Element).classList.contains('fn-back')));
             return '[^' + li.dataset.fn + ']: ' + inlineOf(kids).replace(/\n/g, '\n  ');
           })
           .join('\n');
@@ -260,9 +262,10 @@ function blockOf(el) {
 
 const BLOCKS = /^(H[1-6]|P|DIV|UL|OL|PRE|TABLE|BLOCKQUOTE|HR|DETAILS|SECTION|ARTICLE)$/;
 
-function blocks(parent, keep) {
-  const out = [];
-  let loose = [];                                   // bare text between blocks
+// `parent` is an element, or any bare object with childNodes (nodesMd)
+function blocks(parent: { childNodes: Iterable<Node> }, keep?: (n: Node) => boolean): string {
+  const out: string[] = [];
+  let loose: Node[] = [];                                   // bare text between blocks
   const flush = () => {
     const s = inlineOf(loose).trim();
     loose = [];
@@ -270,9 +273,9 @@ function blocks(parent, keep) {
   };
   for (const n of parent.childNodes) {
     if (keep && !keep(n)) continue;
-    if (n.nodeType === 1 && (BLOCKS.test(n.tagName) || n.classList.contains('cb'))) {
+    if (n.nodeType === 1 && (BLOCKS.test((n as Element).tagName) || (n as Element).classList.contains('cb'))) {
       flush();
-      const s = blockOf(n)
+      const s = blockOf(n as HTMLElement)
         .replace(/[ \t]+$/gm, (t) => (t.length >= 2 ? '  ' : ''))   // keep hard breaks
         .replace(/[ \t]+$/, '');                                    // but not a dangling one
       if (s.trim()) out.push(s);
@@ -284,11 +287,11 @@ function blocks(parent, keep) {
   return out.join('\n\n');
 }
 
-export const htmlToMarkdown = (root) => blocks(root).replace(/\n{3,}/g, '\n\n').trim() + '\n';
+export const htmlToMarkdown = (root: Node): string => blocks(root).replace(/\n{3,}/g, '\n\n').trim() + '\n';
 
 // a list of nodes serialized as if they were a document — blocks() only
 // ever reads parent.childNodes, so a bare object is root enough
-const nodesMd = (nodes) =>
+const nodesMd = (nodes: Node[]): string =>
   blocks({ childNodes: nodes }).replace(/\n{3,}/g, '\n\n').trim();
 
 // ------------------------------------------------------------ patching
@@ -327,18 +330,19 @@ const nodesMd = (nodes) =>
 //    changed it is the whole document's business)
 //  - loose text typed at the article root
 const DEF_LINE = /^ {0,3}\[[^\]]*\]:/m;
-const isFnSection = (el) =>
+const isFnSection = (el: Element) =>
   el.tagName === 'SECTION' && el.classList.contains('footnotes');
 
-export const patchMarkdown = function patchMarkdown(src, liveRoot, freshRoot) {
+export const patchMarkdown = function patchMarkdown(src: string, liveRoot: Element,
+  freshRoot: Element): string | null {
   // the renderer's line numbers count \n-normalized lines; a CRLF file's
   // raw offsets wouldn't line up, so it takes the whole-document path
   if (src.includes('\r')) return null;
   for (const n of liveRoot.childNodes) {
-    if (n.nodeType === 3 && n.nodeValue.replace(/​/g, '').trim()) return null;
+    if (n.nodeType === 3 && n.nodeValue!.replace(/​/g, '').trim()) return null;
   }
-  let live = [...liveRoot.children];
-  let fresh = [...freshRoot.children];
+  let live = [...liveRoot.children] as HTMLElement[];
+  let fresh = [...freshRoot.children] as HTMLElement[];
 
   const lfn = live.length && isFnSection(live[live.length - 1])
     ? live[live.length - 1] : null;
@@ -346,7 +350,7 @@ export const patchMarkdown = function patchMarkdown(src, liveRoot, freshRoot) {
     ? fresh[fresh.length - 1] : null;
   if (!!lfn !== !!ffn) return null;
   if (lfn) {
-    if (nodesMd([lfn]) !== nodesMd([ffn])) return null;
+    if (nodesMd([lfn]) !== nodesMd([ffn!])) return null;
     live = live.slice(0, -1);
     fresh = fresh.slice(0, -1);
   }
@@ -361,7 +365,7 @@ export const patchMarkdown = function patchMarkdown(src, liveRoot, freshRoot) {
 
   const lineStart = [0];
   for (let i = 0; i < src.length; i++) if (src[i] === '\n') lineStart.push(i + 1);
-  const offAt = (ln) => (ln < lineStart.length ? lineStart[ln] : src.length);
+  const offAt = (ln: number) => (ln < lineStart.length ? lineStart[ln] : src.length);
   // a fresh block's RANGE runs to the next block's first line, so the
   // blank lines and definition lines after it travel with it untouched
   const freshEnd = freshLine.map((_, i) =>
@@ -369,12 +373,12 @@ export const patchMarkdown = function patchMarkdown(src, liveRoot, freshRoot) {
   const freshMd = fresh.map((el) => nodesMd([el]));
   const idxByLine = new Map(freshLine.map((d, i) => [d, i]));
 
-  const pieces = [];
-  let seg = [];              // live blocks awaiting fresh serialization
+  const pieces: string[] = [];
+  let seg: Node[] = [];              // live blocks awaiting fresh serialization
   let posLn = 0;             // first source line not yet accounted for
   let lastFresh = -1;
   let endedWithSeg = false;
-  const flushSeg = (uptoLn) => {
+  const flushSeg = (uptoLn: number) => {
     const replaced = src.slice(offAt(posLn), offAt(uptoLn));
     const out = seg.length ? nodesMd(seg) : '';
     seg = [];
@@ -395,7 +399,7 @@ export const patchMarkdown = function patchMarkdown(src, liveRoot, freshRoot) {
 
   for (const el of live) {
     const d = el.dataset && el.dataset.line != null ? +el.dataset.line : NaN;
-    const fi = idxByLine.has(d) ? idxByLine.get(d) : -1;
+    const fi = idxByLine.has(d) ? idxByLine.get(d)! : -1;
     if (fi > lastFresh && nodesMd([el]) === freshMd[fi]) {
       if (!flushSeg(freshLine[fi])) return null;
       pieces.push(src.slice(offAt(freshLine[fi]), offAt(freshEnd[fi])));

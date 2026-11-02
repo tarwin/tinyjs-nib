@@ -25,9 +25,36 @@ const CALLOUTS = [
   ['danger', 'Danger', '⛔'], ['success', 'Success', '✅'], ['bug', 'Bug', '🐞'],
 ];
 
-export const nibSlashItems = (prefs, { folder } = {}) => {
-  const p = prefs || {};
-  const items = [
+/** The Markdown Flavor switches the catalogue follows (a subset of the prefs). */
+export interface SlashPrefs {
+  hrBreaks?: boolean;
+  alerts?: boolean;
+  toc?: boolean;
+  math?: boolean;
+  mermaid?: boolean;
+  download?: boolean;
+  pagelink?: boolean;
+  embed?: boolean;
+}
+
+export type SlashRun = 'embed' | 'image' | 'link' | 'emoji';
+
+export interface SlashItem {
+  id: string;
+  label: string;
+  group: string;
+  icon: string;
+  /** the Markdown inserted (absent for a `run` entry) */
+  md?: string;
+  /** selector for the element whose text arrives selected */
+  sel?: string;
+  /** one of the app's own pickers instead of Markdown */
+  run?: SlashRun;
+}
+
+export const nibSlashItems = (prefs: SlashPrefs | null | undefined, { folder }: { folder?: boolean } = {}): SlashItem[] => {
+  const p: SlashPrefs = prefs || {};
+  const items: SlashItem[] = [
     { id: 'h1', label: 'Heading 1', group: 'Text', icon: 'H1', md: '# Heading', sel: 'self' },
     { id: 'h2', label: 'Heading 2', group: 'Text', icon: 'H2', md: '## Heading', sel: 'self' },
     { id: 'h3', label: 'Heading 3', group: 'Text', icon: 'H3', md: '### Heading', sel: 'self' },

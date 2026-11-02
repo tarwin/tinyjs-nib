@@ -19,17 +19,66 @@
 
 import { nibIcon } from './icons.ts';
 
-const split = (l) =>
+export type TableAlign = '' | 'left' | 'center' | 'right';
+
+/** A pipe table parsed out of the source lines. */
+export interface TableModel {
+  /** raw Markdown cells, row 0 the header */
+  cells: string[][];
+  /** each row's original line, or null once it must be rewritten */
+  raw: (string | null)[];
+  aligns: TableAlign[];
+  /** the separator line as written, or null once it must be rewritten */
+  sepRaw: string | null;
+  /** header line index */
+  start: number;
+  /** one past the last row's line */
+  end: number;
+  /** written with its pipes lined up */
+  padded: boolean;
+  deleted?: boolean;
+}
+
+/** Where the caret lands after an op: [row, col], null = unchanged. */
+export type TableCell = [number | null, number | null];
+
+type TableOps = {
+  insertRow(m: TableModel, at: number): TableCell;
+  deleteRow(m: TableModel, r: number): TableCell | null;
+  moveRow(m: TableModel, r: number, d: number): TableCell | null;
+  insertCol(m: TableModel, at: number): TableCell;
+  deleteCol(m: TableModel, c: number): TableCell | null;
+  moveCol(m: TableModel, c: number, d: number): TableCell | null;
+  deleteTable(m: TableModel): TableCell;
+  align(m: TableModel, c: number, a: TableAlign): TableCell;
+};
+export type TableOp = keyof TableOps;
+
+/** What doc.ts's rewrite hands back: the re-rendered table (null when it was deleted). */
+export interface TableEditResult {
+  table: HTMLTableElement | null;
+  cell: TableCell;
+}
+
+export interface TableGripOptions {
+  preview: HTMLElement;
+  /** is the preview editable right now */
+  editing: () => boolean;
+  /** run `mutate` on the source of `table`, write it back, re-render */
+  edit: (table: HTMLTableElement, mutate: (m: TableModel) => TableCell | null) => TableEditResult | null;
+}
+
+const split = (l: string) =>
   l.trim().replace(/^\|/, '').replace(/(?<!\\)\|$/, '')
     .split(/(?<!\\)\|/).map((c) => c.trim());
 
 const SEP = /^\s*\|?(\s*:?-{1,}:?\s*\|)*\s*:?-{1,}:?\s*\|?\s*$/;
 
 // the table whose header is lines[i] → model, or null if it isn't one
-function parse(lines, i) {
+function parse(lines: string[], i: number): TableModel | null {
   if (!lines[i] || !lines[i + 1] || !SEP.test(lines[i + 1])) return null;
-  const cells = [split(lines[i])], raw = [lines[i]];
-  const aligns = split(lines[i + 1]).map((c) =>
+  const cells = [split(lines[i])], raw: (string | null)[] = [lines[i]];
+  const aligns = split(lines[i + 1]).map((c): TableAlign =>
     /^:-+:$/.test(c) ? 'center' : /^-+:$/.test(c) ? 'right' : /^:-+$/.test(c) ? 'left' : '');
   let end = i + 2;
   while (end < lines.length && lines[end].includes('|') && lines[end].trim()) {
@@ -44,22 +93,22 @@ function parse(lines, i) {
   // a table written with its pipes lined up gets new lines lined up too;
   // a compact hand-written one stays compact
   const all = raw.concat(lines[i + 1]);
-  const padded = all.every((l) => l.trimEnd().length === all[0].trimEnd().length);
+  const padded = all.every((l) => l!.trimEnd().length === all[0]!.trimEnd().length);
   return { cells, raw, aligns, sepRaw: lines[i + 1], start: i, end, padded };
 }
 
-function serialize(m) {
+function serialize(m: TableModel): string[] {
   if (m.deleted) return [];
   const w = m.aligns.length;
-  const width = [];
+  const width: number[] = [];
   for (let c = 0; c < w; c++) {
     const colons = m.aligns[c] === 'center' ? 2 : m.aligns[c] ? 1 : 0;
     width.push(m.padded ? Math.max(3 + colons, ...m.cells.map((r) => (r[c] || '').length)) : 3);
   }
-  const row = (r) => '| ' + r.map((t, c) => (m.padded ? t.padEnd(width[c]) : t)).join(' | ') + ' |';
+  const row = (r: string[]) => '| ' + r.map((t, c) => (m.padded ? t.padEnd(width[c]) : t)).join(' | ') + ' |';
   // never fewer than three dashes: md.ts wants two, and ":-:" reads badly
-  const d = (n) => '-'.repeat(Math.max(3, n));
-  const dash = (a, n) =>
+  const d = (n: number) => '-'.repeat(Math.max(3, n));
+  const dash = (a: TableAlign, n: number) =>
     a === 'center' ? ':' + d(n - 2) + ':'
       : a === 'right' ? d(n - 1) + ':'
         : a === 'left' ? ':' + d(n - 1) : d(n);
@@ -72,8 +121,8 @@ function serialize(m) {
 // Each op changes the model in place and answers the cell the caret
 // should land in afterwards, [row, col] (row 0 is the header), or null
 // when it can't apply. A column op drops every raw line: they all change.
-const allNew = (m) => { m.raw = m.raw.map(() => null); m.sepRaw = null; };
-const ops = {
+const allNew = (m: TableModel) => { m.raw = m.raw.map(() => null); m.sepRaw = null; };
+const ops: TableOps = {
   insertRow(m, at) {                               // at ≥ 1: never above the header
     m.cells.splice(at, 0, m.aligns.map(() => ''));
     m.raw.splice(at, 0, null);
@@ -128,8 +177,8 @@ export const nibTable = { parse, serialize, ops };
 
 // ------------------------------------------------------------ the grips
 
-function setupTableGrips({ preview, editing, edit }) {
-  const mk = (cls, text, title) => {
+function setupTableGrips({ preview, editing, edit }: TableGripOptions): { hide: () => void } {
+  const mk = (cls: string, text: string, title: string) => {
     const b = document.createElement('button');
     b.className = 'tgrip ' + cls;
     b.textContent = text;
@@ -145,21 +194,21 @@ function setupTableGrips({ preview, editing, edit }) {
   menu.hidden = true;
   document.body.appendChild(menu);
 
-  let cur = null;                                  // { table, r, c }
+  let cur: { table: HTMLTableElement; r: number; c: number } | null = null;                                  // { table, r, c }
 
   // only top-level tables: one inside a callout or a list is written with
   // prefixes this line arithmetic doesn't speak
-  const cellOf = (n) => {
-    const el = n && (n.nodeType === 3 ? n.parentNode : n);
-    const cell = el && el.closest && el.closest('td, th');
+  const cellOf = (n: Node | EventTarget | null): HTMLTableCellElement | null => {
+    const el = (n && ((n as Node).nodeType === 3 ? (n as Node).parentNode : n)) as Element | null;
+    const cell = el && el.closest && el.closest<HTMLTableCellElement>('td, th');
     const table = cell && cell.closest('table');
     return table && table.parentNode === preview && table.dataset.line != null ? cell : null;
   };
 
-  function show(cell) {
+  function show(cell: HTMLTableCellElement) {
     if (!editing()) return hide();
-    const table = cell.closest('table');
-    cur = { table, r: cell.parentNode.rowIndex, c: cell.cellIndex };
+    const table = cell.closest('table')!;
+    cur = { table, r: (cell.parentNode as HTMLTableRowElement).rowIndex, c: cell.cellIndex };
     place();
   }
   function place() {
@@ -174,7 +223,7 @@ function setupTableGrips({ preview, editing, edit }) {
     rowGrip.style.left = Math.round(tr.left - rowGrip.offsetWidth / 2) + 'px';
     rowGrip.style.top = Math.round(rr.top + rr.height / 2 - rowGrip.offsetHeight / 2) + 'px';
   }
-  function hide() {
+  function hide(): void {
     cur = null;
     colGrip.hidden = rowGrip.hidden = true;
     hideMenu();
@@ -182,7 +231,7 @@ function setupTableGrips({ preview, editing, edit }) {
   const hideMenu = () => { menu.hidden = true; menu.textContent = ''; };
 
   // the caret into cell [r, c] of a (freshly rendered) table, at its end
-  function caretTo(table, r, c) {
+  function caretTo(table: HTMLTableElement | null, r: number, c: number) {
     const row = table && table.rows[Math.min(r, table.rows.length - 1)];
     const cell = row && row.cells[Math.min(c, row.cells.length - 1)];
     if (!cell) return;
@@ -190,30 +239,31 @@ function setupTableGrips({ preview, editing, edit }) {
     const range = document.createRange();
     range.selectNodeContents(cell);
     range.collapse(false);
-    const sel = getSelection();
+    const sel = getSelection()!;
     sel.removeAllRanges();
     sel.addRange(range);
     show(cell);
   }
 
-  function run(op, ...args) {
+  function run(op: TableOp, ...args: (number | TableAlign)[]) {
     if (!cur) return;
     const { r, c } = cur;
     hideMenu();
-    const done = edit(cur.table, (m) => ops[op](m, ...args));
+    // each op takes its own arguments after the model; the menu passes the right ones
+    const done = edit(cur.table, (m) => (ops[op] as (m: TableModel, ...a: (number | TableAlign)[]) => TableCell | null)(m, ...args));
     if (!done) return;
     if (!done.table) return hide();                // deleted: doc.ts placed the caret
     const [nr, nc] = done.cell;
     caretTo(done.table, nr ?? r, nc ?? c);
   }
 
-  function openMenu(which) {
+  function openMenu(which: 'row' | 'col') {
     if (!cur) return;
     const { table, r, c } = cur;
     const rows = table.rows.length, cols = table.rows[0].cells.length;
     const a = (table.rows[0].cells[c].style.textAlign || '');
     // [label, icon (icons.ts), action, ticked]
-    const items = which === 'row' ? [
+    const items: (false | '-' | [string, string, () => void, boolean?])[] = which === 'row' ? [
       r >= 1 && ['Insert row above', 'between-horizontal-start', () => run('insertRow', r)],
       ['Insert row below', 'between-horizontal-end', () => run('insertRow', r + 1)],
       r > 1 && ['Move row up', 'arrow-up', () => run('moveRow', r, -1)],
@@ -262,7 +312,7 @@ function setupTableGrips({ preview, editing, edit }) {
     menu.style.top = Math.round(Math.min(top, innerHeight - h - 8)) + 'px';
   }
 
-  for (const [g, which] of [[rowGrip, 'row'], [colGrip, 'col']]) {
+  for (const [g, which] of [[rowGrip, 'row'], [colGrip, 'col']] as [HTMLButtonElement, 'row' | 'col'][]) {
     // mousedown, so the caret the grip is about stays where it was
     g.addEventListener('mousedown', (e) => {
       e.preventDefault();
@@ -275,7 +325,7 @@ function setupTableGrips({ preview, editing, edit }) {
   // Hover shows the grips for the cell under the pointer; they stay while
   // the pointer is within reach of the table (the grips sit just outside
   // it), the caret is in it, or a menu is open.
-  let pointer = null;                              // last { x, y } seen
+  let pointer: { x: number; y: number } | null = null;                              // last { x, y } seen
   const nearTable = () => {
     if (!cur || !pointer) return false;
     const r = cur.table.getBoundingClientRect();
@@ -287,8 +337,8 @@ function setupTableGrips({ preview, editing, edit }) {
     if (!editing()) { if (cur) hide(); return; }
     const cell = cellOf(e.target);
     if (cell) { if (!cur || cur.table.rows[cur.r] !== cell.parentNode || cur.c !== cell.cellIndex) show(cell); return; }
-    if (!cur || !menu.hidden || e.target.closest('.tgrip')) return;
-    if (!nearTable() && !cellOf(getSelection().anchorNode)) hide();
+    if (!cur || !menu.hidden || (e.target as Element).closest('.tgrip')) return;
+    if (!nearTable() && !cellOf(getSelection()!.anchorNode)) hide();
   });
   // …and so does the caret, for the keyboard — and the caret LEAVING the
   // table (an arrow off its top or bottom) takes them away again, unless
@@ -306,7 +356,7 @@ function setupTableGrips({ preview, editing, edit }) {
   new ResizeObserver(() => { if (cur) place(); }).observe(preview);
   preview.addEventListener('input', () => { if (cur) place(); });
   addEventListener('mousedown', (e) => {
-    if (!menu.hidden && !menu.contains(e.target) && !e.target.closest('.tgrip')) hideMenu();
+    if (!menu.hidden && !menu.contains(e.target as Node) && !(e.target as Element).closest('.tgrip')) hideMenu();
   });
   addEventListener('keydown', (e) => { if (e.key === 'Escape' && !menu.hidden) hideMenu(); }, true);
 
@@ -318,13 +368,13 @@ function setupTableGrips({ preview, editing, edit }) {
     const cell = s && cellOf(s.anchorNode);
     if (!cell) return;
     e.preventDefault();
-    const table = cell.closest('table');
+    const table = cell.closest('table')!;
     const all = [...table.rows].flatMap((tr) => [...tr.cells]);
     const k = all.indexOf(cell) + (e.shiftKey ? -1 : 1);
     if (k < 0) return;
     if (k < all.length) {
       const n = all[k];
-      caretTo(table, n.parentNode.rowIndex, n.cellIndex);
+      caretTo(table, (n.parentNode as HTMLTableRowElement).rowIndex, n.cellIndex);
       return;
     }
     show(cell);

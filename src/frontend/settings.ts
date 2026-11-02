@@ -26,26 +26,122 @@
 
 import { nibApplyAppearance } from './appearance.ts';
 import { nibKey } from './icons.ts';
+import type { AiPanel, AiStatus } from './aipanel.ts';
 
-const $ = (id) => document.getElementById(id);
+const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
-const THEMES = [['paper', 'Paper'], ['ink', 'Ink'],
+/** A <select>'s choices: [value, label]. */
+type Pair = [string, string];
+
+/** The resolved theme/view/prefs/images — of every layer, or of Mine alone. */
+interface SettingsValues {
+  theme: string;
+  view: string;
+  prefs: Record<string, unknown>;
+  images: Record<string, unknown>;
+}
+
+/** Who answers a dotted path: the winning layer, and every layer holding it. */
+interface Provenance {
+  from: string | null;
+  set: string[];
+}
+
+interface SettingsFolder {
+  root: string;
+  name: string;
+  owns: boolean;
+  /** keeps its answers in .nib/settings.json, rather than on this Mac */
+  inFolder: boolean;
+  pinsOn: boolean;
+}
+
+/** The backend's settingsAll: everything this window draws, staged ops applied. */
+interface SettingsAll extends SettingsValues {
+  appearance: string;
+  zoom: number;
+  layers: string[];
+  projectKeys: string[];
+  mine: SettingsValues;
+  speechPossible: boolean;
+  defaults: Record<string, unknown>;
+  from: Record<string, Provenance>;
+  ai: AiStatus;
+  folder: SettingsFolder | null;
+}
+
+/** One change waiting for Save — replayed in order through the real setters. */
+type StagedOp =
+  | { op: 'set'; layer: string; path: string; value: unknown }
+  | { op: 'clear'; layer: string; path: string }
+  | { op: 'clearLayer'; layer: string }
+  | { op: 'flavor'; flavor: string; layer: string }
+  | { op: 'call'; name: string; params: unknown };
+
+/** A sidebar section: rows Settings builds, or a pane something else draws. */
+type Section = { id: string; title: string; icon: string } & (
+  | { rows: (HTMLElement | null)[]; custom?: undefined }
+  | { custom: (el: HTMLElement) => unknown; rows?: undefined });
+
+/** keymapAll's command rows (Settings ▸ Shortcuts). */
+interface KeyCommand {
+  id: string;
+  label: string;
+  /** where it lives in the menus, e.g. "View ▸ Split" */
+  path: string;
+  key: string | null;
+  /** the factory answer under the current preset */
+  def: string | null;
+  /** Nib's own answer */
+  base: string | null;
+  custom: boolean;
+}
+
+interface Keymap {
+  preset: string;
+  presets: Pair[];
+  customCount: number;
+  commands: KeyCommand[];
+}
+
+/** actionsTrusted's rows (backend trust.ts TrustRecord). */
+interface TrustRow {
+  key: string;
+  id: string;
+  label?: string;
+  summary: string;
+  root: string;
+}
+
+/** drawShortcuts keeps its latest-fetch token on itself */
+type Tokened = { tok?: number };
+
+export interface SettingsOptions {
+  ai: AiPanel;
+  toast: (text: string) => void;
+}
+
+export interface SettingsHandle {
+  load: () => Promise<void>;
+}
+
+const THEMES: Pair[] = [['paper', 'Paper'], ['ink', 'Ink'],
   ['typewriter', 'Typewriter'], ['night', 'Night']];
-const APPEARANCES = [['system', 'Match System'], ['light', 'Light'], ['dark', 'Dark']];
-const WIDTHS = [['narrow', 'Narrow'], ['normal', 'Normal'],
+const APPEARANCES: Pair[] = [['system', 'Match System'], ['light', 'Light'], ['dark', 'Dark']];
+const WIDTHS: Pair[] = [['narrow', 'Narrow'], ['normal', 'Normal'],
   ['wide', 'Wide'], ['full', 'Full']];
-const VIEWS = [['edit', 'Editor Only'], ['split', 'Split'], ['preview', 'Preview Only']];
-const FIND_HI = [['default', 'Default'], ['yellow', 'Marker Yellow'],
+const VIEWS: Pair[] = [['edit', 'Editor Only'], ['split', 'Split'], ['preview', 'Preview Only']];
+const FIND_HI: Pair[] = [['default', 'Default'], ['yellow', 'Marker Yellow'],
   ['green', 'Green'], ['pink', 'Pink'], ['orange', 'Orange']];
-const DESTS = [['beside', 'Beside the document'], ['sub', 'In a folder next to it'],
+const DESTS: Pair[] = [['beside', 'Beside the document'], ['sub', 'In a folder next to it'],
   ['root', 'In one folder at the project root']];
-const NAMINGS = [['heading', 'Document + heading'], ['doc', 'Document name'],
+const NAMINGS: Pair[] = [['heading', 'Document + heading'], ['doc', 'Document name'],
   ['stamp', 'Date and time'], ['custom', 'A template of my own']];
-const OPTIMIZE = [['off', 'Keep the original'], ['webp', 'Convert'],
+const OPTIMIZE: Pair[] = [['off', 'Keep the original'], ['webp', 'Convert'],
   ['same', 'Re-encode, same format']];
-const LINK_FROM = [['rel', 'Relative to the document'], ['root', 'From the link root'],
+const LINK_FROM: Pair[] = [['rel', 'Relative to the document'], ['root', 'From the link root'],
   ['pin', 'From the pinned folder']];
-const LINK_SEP = [['chev', '›'], ['slash', '/'], ['dash', '–'], ['gt', '>']];
+const LINK_SEP: Pair[] = [['chev', '›'], ['slash', '/'], ['dash', '–'], ['gt', '>']];
 
 const TAB_WHY = {
   mine: 'Yours, on this machine, in every folder. The answer everything else '
@@ -60,12 +156,12 @@ const TAB_WHY = {
 // Rows that aren't settings paths at all: about this machine or the app.
 const MINE_ONLY = new Set(['appearance', 'zoom', 'ai', 'speech']);
 
-function setupSettings({ ai, toast }) {
+function setupSettings({ ai, toast }: SettingsOptions): SettingsHandle {
   const side = $('setSide');
   const pane = $('setPane');
-  let all = null;
+  let all: SettingsAll | null = null;
   let section = 'general';
-  let tab = null;              // chosen on the first load: Project, if there is one
+  let tab: 'mine' | 'folder' | null = null;              // chosen on the first load: Project, if there is one
 
   // Nothing here applies until Save. Every control STAGES an op — the same
   // call Save will make, in order — and the backend shows the window its
@@ -73,8 +169,8 @@ function setupSettings({ ai, toast }) {
   // every row, ↺ and provenance tag already tells the truth about what Save
   // will do. Cancel (or esc) throws the list away. Shortcuts, AI and
   // Actions are editors of their own and still apply as you go.
-  let staged = [];
-  const stage = async (op) => { staged.push(op); await load(); };
+  let staged: StagedOp[] = [];
+  const stage = async (op: StagedOp) => { staged.push(op); await load(); };
 
   // ------------------------------------------------------------ the rows
 
@@ -84,47 +180,48 @@ function setupSettings({ ai, toast }) {
   // write to Mine, so they must show what Mine says — the folder-override
   // note explains the difference when there is one. The folder tab shows
   // what is in effect, which is what its controls edit.
-  const val = (path) => {
-    const src = tab === 'mine' && all.mine ? all.mine : all;
+  const val = (path: string): unknown => {
+    // every caller runs inside draw(), after load() has filled `all`
+    const src: Record<string, any> = tab === 'mine' && all!.mine ? all!.mine : all!;
     const [head, key] = path.split('.');
     return key === undefined ? src[head] : src[head][key];
   };
-  const prov = (path) => (all.from && all.from[path]) || { from: null, set: [] };
+  const prov = (path: string): Provenance => (all!.from && all!.from[path]) || { from: null, set: [] };
   // does the folder keep its settings IN the folder (.nib), or on this Mac?
-  const owns = () => !!(all.folder && all.folder.inFolder);
+  const owns = () => !!(all!.folder && all!.folder.inFolder);
 
   // Where a change made on this tab, to this row, actually goes. On the
   // folder tab that is the folder's storage — the shared file normally, the
   // this-Mac twin when the folder doesn't keep settings, and always the
   // this-Mac twin for a row that pinned itself there (the 📌), because
   // editing a value somewhere it wouldn't take effect is a trap.
-  const writeLayerFor = (path) => {
+  const writeLayerFor = (path: string) => {
     if (tab === 'mine') return 'mine';
     if (!owns()) return 'local';
     return prov(path).set.includes('local') ? 'local' : 'folder';
   };
 
-  const set = (path, value) => stage({ op: 'set', layer: writeLayerFor(path), path, value });
-  const reset = (path) => {
+  const set = (path: string, value: unknown) => stage({ op: 'set', layer: writeLayerFor(path), path, value });
+  const reset = (path: string) => {
     // undo what THIS tab is contributing: the winning layer of the pair
     const target = tab === 'mine' ? 'mine'
       : (prov(path).set.includes('local') ? 'local' : 'folder');
     return stage({ op: 'clear', layer: target, path });
   };
 
-  const SECTIONS = () => [
+  const SECTIONS = (): Section[] => [
     { id: 'general', title: 'General', icon: '⚙', rows: [
-      row('appearance', 'Appearance', pick(APPEARANCES, all.appearance,
+      row('appearance', 'Appearance', pick(APPEARANCES, all!.appearance,
         (v) => callPlain('setAppearance', { appearance: v })),
       'Nib’s own chrome. The preview has its own theme, under Preview.'),
       row('zoom', 'Zoom', pick([['0.9', '90%'], ['1', '100%'], ['1.1', '110%'],
-        ['1.25', '125%'], ['1.5', '150%']], String(all.zoom),
+        ['1.25', '125%'], ['1.5', '150%']], String(all!.zoom),
       (v) => callPlain('setZoom', { zoom: +v })),
       'Every window. ⌘+ and ⌘− do it too.'),
       row('view', 'Opens in', pick(VIEWS, val('view'), (v) => set('view', v)),
         'What a newly opened document shows.'),
-      row('speech', 'Dictation', all.speechPossible
-        ? check(all.ai.speech, (v) => callPlain('aiSet', { speech: v }))
+      row('speech', 'Dictation', all!.speechPossible
+        ? check(all!.ai.speech, (v) => callPlain('aiSet', { speech: v }))
         : note('Not available — this build’s web engine has no speech recogniser.'),
       'Shows the 🎙 button (⌃⌘D). It types what you say at the caret and knows '
         + 'nothing about AI — tidying the words up afterwards is an ordinary action.'),
@@ -248,9 +345,9 @@ function setupSettings({ ai, toast }) {
         text(val('images.linkRoot'), 'the folder itself', (v) => set('images.linkRoot', v))),
     ] },
 
-    { id: 'keys', title: 'Shortcuts', icon: '⌨️', custom: (el) => drawShortcuts(el) },
+    { id: 'keys', title: 'Shortcuts', icon: '⌨️', custom: (el: HTMLElement) => drawShortcuts(el) },
 
-    { id: 'ai', title: 'AI', icon: '✨', custom: (el) => ai.renderInto(el) },
+    { id: 'ai', title: 'AI', icon: '✨', custom: (el: HTMLElement) => ai.renderInto(el) },
 
     { id: 'actions', title: 'Actions', icon: '⚡', rows: [
       row(null, '', button('Manage Actions…', () => {
@@ -274,7 +371,7 @@ function setupSettings({ ai, toast }) {
   // itself only says "Project"; then the storage choice, because it is what
   // the whole tab MEANS: the same answers either travel in `.nib` or stay
   // on this Mac.
-  const folderSection = () => ({ id: 'folder', title: 'Project', icon: '📁', rows: [
+  const folderSection = (): Section => ({ id: 'folder', title: 'Project', icon: '📁', rows: [
     whichFolder(),
     row(null, 'Save settings in the folder', check(owns(),
       (v) => callPlain('setProjectSettings', { on: v })),
@@ -282,7 +379,7 @@ function setupSettings({ ai, toast }) {
       + 'commit it and everyone gets this setup. Off: the same answers are '
       + 'kept in Nib’s own settings, on this Mac only, and Nib never writes '
       + 'anything inside the folder. Remembered per folder.'),
-    row(null, 'Pinned folders', check(all.folder.pinsOn,
+    row(null, 'Pinned folders', check(all!.folder!.pinsOn,
       (v) => callPlain('setPinsOn', { on: v })),
     'Pins scope where a document’s images and links are resolved from.'),
     owns() ? row(null, '', button('Edit .nib/settings.json…',
@@ -295,21 +392,21 @@ function setupSettings({ ai, toast }) {
     const el = document.createElement('div');
     el.className = 'setwhich';
     const name = document.createElement('b');
-    name.textContent = '📁 ' + all.folder.name;
+    name.textContent = '📁 ' + all!.folder!.name;
     const path = document.createElement('div');
     path.className = 'ahint setpath';
-    path.textContent = all.folder.root;
+    path.textContent = all!.folder!.root;
     el.append(name, path);
     return el;
   }
 
   // Anything not routed through a layer: it is app-wide by nature. Staged
   // like the rest — Save makes the call.
-  const callPlain = (name, params) => stage({ op: 'call', name, params });
+  const callPlain = (name: string, params: unknown) => stage({ op: 'call', name, params });
 
   // ------------------------------------------------------ little builders
 
-  function row(path, label, control, hint) {
+  function row(path: string | null, label: string, control: Node, hint?: string) {
     const el = document.createElement('div');
     el.className = 'setrow' + (label ? '' : ' nolabel');
     if (path) el.dataset.path = path;     // the folder tab filters on this
@@ -336,7 +433,7 @@ function setupSettings({ ai, toast }) {
         // On Mine there is nothing underneath to inherit FROM, so holding a
         // key means nothing on its own — what matters is whether it differs
         // from the built-in default.
-        if (val(path) !== all.defaults[path]) {
+        if (val(path) !== all!.defaults[path]) {
           tag.classList.add('here');
           tag.textContent = 'set here';
           const undo = document.createElement('button');
@@ -353,7 +450,7 @@ function setupSettings({ ai, toast }) {
           el.classList.add('overridden');
           const o = document.createElement('div');
           o.className = 'ahint setover';
-          o.textContent = '📁 ' + (all.folder ? all.folder.name : 'The folder')
+          o.textContent = '📁 ' + (all!.folder ? all!.folder.name : 'The folder')
             + ' is answering this right now — your setting here is the '
             + 'default for folders that don’t.';
           body.appendChild(line);
@@ -414,7 +511,7 @@ function setupSettings({ ai, toast }) {
     return el;
   }
 
-  function head(text, hint) {
+  function head(text: string, hint?: string) {
     const el = document.createElement('div');
     el.className = 'setgroup';
     const h = document.createElement('div');
@@ -430,7 +527,7 @@ function setupSettings({ ai, toast }) {
     return el;
   }
 
-  function check(on, onChange) {
+  function check(on: unknown, onChange: (v: boolean) => void) {
     const el = document.createElement('input');
     el.type = 'checkbox';
     el.checked = !!on;
@@ -438,7 +535,7 @@ function setupSettings({ ai, toast }) {
     return el;
   }
 
-  function pick(pairs, value, onChange) {
+  function pick(pairs: Pair[], value: unknown, onChange: (v: string) => void) {
     const el = document.createElement('select');
     for (const [v, label] of pairs) {
       const o = document.createElement('option');
@@ -446,33 +543,34 @@ function setupSettings({ ai, toast }) {
       o.textContent = label;
       el.appendChild(o);
     }
-    el.value = value;
+    el.value = value as string;
     el.onchange = () => onChange(el.value);
     return el;
   }
 
-  function text(value, placeholder, onChange) {
+  function text(value: unknown, placeholder: string, onChange: (v: string) => void) {
     const el = document.createElement('input');
     el.type = 'text';
     el.spellcheck = false;
-    el.value = value || '';
+    el.value = (value || '') as string;
     el.placeholder = placeholder || '';
     el.onchange = () => onChange(el.value);
     return el;
   }
 
-  function number(value, min, max, onChange) {
+  function number(value: unknown, min: number, max: number, onChange: (v: number) => void) {
     const el = document.createElement('input');
     el.type = 'number';
-    el.min = min;
-    el.max = max;
-    el.value = value;
+    // numbers, which the DOM writes as strings
+    el.min = min as unknown as string;
+    el.max = max as unknown as string;
+    el.value = value as string;
     el.className = 'setnum';
     el.onchange = () => onChange(+el.value);
     return el;
   }
 
-  function button(label, onClick) {
+  function button(label: string, onClick: (this: GlobalEventHandlers, ev: MouseEvent) => unknown) {
     const el = document.createElement('button');
     el.className = 'setbtn';
     el.textContent = label;
@@ -480,7 +578,7 @@ function setupSettings({ ai, toast }) {
     return el;
   }
 
-  function note(text) {
+  function note(text: string) {
     const el = document.createElement('span');
     el.className = 'ahint';
     el.textContent = text;
@@ -504,13 +602,13 @@ function setupSettings({ ai, toast }) {
   // business rebinding your keys), so this only ever appears on Mine.
   // Recording writes what AppKit accelerators can spell: ⌘x, ⇧⌘X, ⌥⌘x —
   // anything else is refused out loud rather than silently not binding.
-  async function drawShortcuts(el) {
+  async function drawShortcuts(el: HTMLElement) {
     // both a keymapSet and the settings-refresh it pushes redraw this pane;
     // the token lets whichever fetch finishes last be the only one drawing
-    const tok = (drawShortcuts.tok = (drawShortcuts.tok || 0) + 1);
+    const tok = ((drawShortcuts as Tokened).tok = ((drawShortcuts as Tokened).tok || 0) + 1);
     el.textContent = 'Reading…';
-    const km = await tiny.api.call('keymapAll');
-    if (drawShortcuts.tok !== tok || !el.isConnected) return;
+    const km: Keymap = await tiny.api.call('keymapAll');
+    if ((drawShortcuts as Tokened).tok !== tok || !el.isConnected) return;
     el.textContent = '';
 
     const presetSel = document.createElement('select');
@@ -558,13 +656,13 @@ function setupSettings({ ai, toast }) {
     if (say.textContent) el.appendChild(say);
 
     // who holds which key, for saying "that's taken" inline
-    const byKey = new Map();
+    const byKey = new Map<string | null, KeyCommand[]>();
     for (const c of km.commands) {
       if (c.key) byKey.set(c.key, [...(byKey.get(c.key) || []), c]);
     }
 
-    let recording = null;                    // the chip currently listening
-    const record = (c, chip) => {
+    let recording: { done: () => void } | null = null;                    // the chip currently listening
+    const record = (c: KeyCommand, chip: HTMLButtonElement) => {
       if (recording) recording.done();
       chip.classList.add('recording');
       chip.textContent = 'press keys…';
@@ -573,7 +671,7 @@ function setupSettings({ ai, toast }) {
         chip.classList.remove('recording');
         recording = null;
       };
-      const onKey = async (e) => {
+      const onKey = async (e: KeyboardEvent) => {
         if (['Shift', 'Alt', 'Control', 'Meta'].includes(e.key)) return;
         e.preventDefault();
         e.stopPropagation();
@@ -654,7 +752,7 @@ function setupSettings({ ai, toast }) {
     const box = document.createElement('div');
     box.className = 'settrust';
     box.textContent = 'Reading…';
-    tiny.api.call('actionsTrusted').then((rows) => {
+    tiny.api.call('actionsTrusted').then((rows: TrustRow[] | null) => {
       box.textContent = '';
       if (!rows || !rows.length) {
         box.appendChild(note('Nothing approved yet.'));
@@ -688,16 +786,16 @@ function setupSettings({ ai, toast }) {
   function drawTabs() {
     const box = $('setTabs');
     box.textContent = '';
-    const tabs = [];
+    const tabs: ['mine' | 'folder', string, string][] = [];
     // Two tabs, not three: where the folder's answers are STORED (shared
     // .nib or this Mac) is a switch on its tab, not a tab of its own.
     // The label is the fixed word — a folder's name is an unbounded string
     // that would wear the tab as a hat; WHICH folder is answered inside,
     // at the top of the Project section, with the full path. Project comes
     // FIRST: with a folder open, the folder's setup is what you came for.
-    if (all.folder) {
+    if (all!.folder) {
       tabs.push(['folder', 'Project',
-        '📁 ' + all.folder.root + '\n'
+        '📁 ' + all!.folder.root + '\n'
           + (owns() ? TAB_WHY.folder : TAB_WHY.folderLocal)]);
     }
     tabs.push(['mine', 'Mine', TAB_WHY.mine]);
@@ -718,12 +816,12 @@ function setupSettings({ ai, toast }) {
   function sectionsFor() {
     const list = SECTIONS();
     if (tab === 'mine') return list;
-    const keep = new Set([...(all.projectKeys || []), '_presets']);
-    const out = [folderSection()];
+    const keep = new Set([...(all!.projectKeys || []), '_presets']);
+    const out: Section[] = [folderSection()];
     for (const s of list) {
       if (s.custom) continue;
       const rows = [];
-      let pendingHead = null;      // a group heading earns its place only
+      let pendingHead: HTMLElement | null = null;      // a group heading earns its place only
       for (const r of s.rows) {    // if a kept row follows it
         if (!r) continue;
         if (r.classList.contains('setgroup')) { pendingHead = r; continue; }
@@ -737,7 +835,7 @@ function setupSettings({ ai, toast }) {
     return out;
   }
 
-  function drawSide(sections) {
+  function drawSide(sections: Section[]) {
     side.textContent = '';
     for (const s of sections) {
       const el = document.createElement('button');
@@ -769,8 +867,8 @@ function setupSettings({ ai, toast }) {
     const foot = $('setNote');
     foot.textContent = tab === 'mine' ? 'Writing to your settings'
       : owns()
-        ? 'Writing to ' + all.folder.name + '/.nib/settings.json — travels with the folder'
-        : 'Kept on this Mac — nothing is written inside ' + all.folder.name;
+        ? 'Writing to ' + all.folder!.name + '/.nib/settings.json — travels with the folder'
+        : 'Kept on this Mac — nothing is written inside ' + all.folder!.name;
     // Only the folder tab can be emptied — clearing Mine would just be
     // "restore all defaults", which is a different promise.
     if (tab === 'folder' && countSetHere()) {
@@ -795,8 +893,8 @@ function setupSettings({ ai, toast }) {
   // Cancel and Save, bottom right. Save is live only with something staged;
   // the note beside them counts it, or — on the sections that are editors
   // of their own — says those don't wait for Save.
-  function drawSaveBar(s) {
-    let bar = $('setSave');
+  function drawSaveBar(s: Section) {
+    let bar: HTMLElement | null = $('setSave');
     if (!bar) {
       bar = document.createElement('span');
       bar.id = 'setSave';
@@ -826,7 +924,7 @@ function setupSettings({ ai, toast }) {
     // a field mid-edit commits on blur (its change event stages it), and
     // that has to happen before the list is read
     if (document.activeElement && document.activeElement !== document.body) {
-      document.activeElement.blur();
+      (document.activeElement as HTMLElement).blur();
     }
     saving = true;
     const ops = staged;
@@ -842,7 +940,7 @@ function setupSettings({ ai, toast }) {
       }
       staged = [];
       tiny.win.close();
-    } catch (e) {
+    } catch (e: any) {
       // what landed has landed; keep the rest so nothing is silently lost
       staged = ops.slice(i);
       toast('Couldn’t save everything: ' + (e && e.message ? e.message : e));
@@ -858,8 +956,8 @@ function setupSettings({ ai, toast }) {
   // — what the footer offers to clear, and the honest size of "this folder
   // overrides things".
   function countSetHere() {
-    if (!all.from) return 0;
-    return Object.values(all.from)
+    if (!all!.from) return 0;
+    return Object.values(all!.from)
       .filter((p) => p.set.includes('folder') || p.set.includes('local')).length;
   }
 
@@ -877,7 +975,7 @@ function setupSettings({ ai, toast }) {
     'ui-zoom', 'actions', 'ai-config', 'project', 'settings-refresh']) {
     tiny.api.on(ev, () => load());
   }
-  tiny.api.on('settings-section', ({ section: want, layer: wantLayer }) => {
+  tiny.api.on('settings-section', ({ section: want, layer: wantLayer }: { section?: string; layer?: string }) => {
     if (want) section = want;
     if (wantLayer) tab = wantLayer === 'mine' ? 'mine' : 'folder';
     load();
@@ -885,7 +983,7 @@ function setupSettings({ ai, toast }) {
 
   // esc is Cancel, ⌘S is Save. ⌘W with changes staged asks, since
   // "close" doesn't say which of the two you meant.
-  addEventListener('keydown', async (e) => {
+  addEventListener('keydown', async (e: KeyboardEvent) => {
     const mod = e.metaKey || e.ctrlKey;
     if (document.querySelector('.keychip.recording')) return;   // the chip wants it
     if (e.key === 'Escape') { e.preventDefault(); cancelAll(); }
@@ -909,22 +1007,22 @@ function setupSettings({ ai, toast }) {
 // Light / Dark / Match System — the shared helper in appearance.ts, which
 // every window uses and which also stamps the answer before first paint.
 let appearance = 'system';
-export const nibAppearance = async (a) => {
+export const nibAppearance = async (a?: string | null): Promise<void> => {
   appearance = a || 'system';
   await nibApplyAppearance(appearance);
 };
 // the OS switching under us, and the setting changing in another window
 tiny.theme.on(() => { if (appearance === 'system') nibAppearance('system'); });
-tiny.api.on('appearance', ({ appearance: a }) => nibAppearance(a));
+tiny.api.on('appearance', ({ appearance: a }: { appearance?: string }) => nibAppearance(a));
 
 // The window's own toast, since it has no document to borrow one from.
-let toastTimer = null;
-export const nibToast = (text) => {
+let toastTimer: ReturnType<typeof setTimeout> | null = null;
+export const nibToast = (text: string): void => {
   const t = document.getElementById('toast');
   if (!t) return;
   t.textContent = text;
   t.hidden = false;
-  clearTimeout(toastTimer);
+  clearTimeout(toastTimer!);
   toastTimer = setTimeout(() => { t.hidden = true; }, 1800);
 };
 

@@ -10,24 +10,218 @@
 // again in the backend, so a page could not talk itself into trust.
 
 import { nibActIcon, nibKey } from './icons.ts';
+import type { NibIconed, NibIconSvg } from './icons.ts';
+
+/** What the document knows that the backend can't: which file, what's
+ *  selected, where the caret is. Sent with every list and run. */
+export interface ActionContext {
+  file: string | null;
+  sheetId?: string;
+  text: string;
+  dirty?: boolean;
+  sel: string;
+  line?: number;
+  col?: number;
+  heading?: string | null;
+}
+
+/** What happens to what an action printed. */
+export type ActionOutput = 'panel' | 'replace' | 'insert' | 'doc' | 'toast' | 'notify' | 'alert' | 'none';
+
+/** One row of the backend's actionsList (main.ts actionRow). */
+export interface ActionRow extends NibIconed {
+  scope: 'global' | 'project';
+  id: string;
+  label: string;
+  type: string;
+  needs?: string;
+  output: ActionOutput;
+  stdin: string;
+  save?: boolean;
+  confirm?: boolean;
+  /** 'trusted', 'changed', or not yet approved */
+  trust: string;
+  description?: string;
+  toolbar?: boolean;
+  selection?: boolean;
+  /** has an `ask` form in front of it */
+  asks: boolean;
+  key: string | null;
+  fileScoped: boolean;
+  /** why it can't run here, or null when it can */
+  why: string | null;
+  missing: boolean;
+}
+
+/** ctx.prompt in a js action: one field, mid-run. */
+interface ActionPrompt {
+  askId: string;
+  label?: string;
+  type?: 'text' | 'number' | 'choice' | 'multiline';
+  choices?: string[];
+  placeholder?: string;
+  value?: string;
+}
+
+/** ctx.confirm in a js action. */
+interface ActionConfirm {
+  askId: string;
+  question?: string;
+  detail?: string;
+  ok?: string;
+  cancel?: string;
+}
+
+interface ActionsList {
+  list: ActionRow[];
+  problems: string[];
+  root: string | null;
+  folderSettingsOff: boolean;
+}
+
+/** One field of an action's `ask` form (backend actions.ts normalizeAsk). */
+interface AskField {
+  name: string;
+  label: string;
+  type: 'text' | 'number' | 'choice' | 'multiline' | 'check' | 'file' | 'folder';
+  placeholder: string;
+  hint: string;
+  value: string;
+  required: boolean;
+  choices: string[] | null;
+}
+
+interface NeedsInput {
+  label: string;
+  icon?: string | null;
+  iconSvg?: NibIconSvg | null;
+  ask: AskField[];
+}
+
+/** What a run will really do, for the sheet to show (backend summarize). */
+interface RunSummary {
+  kind: string;
+  body: string;
+  cwd: string;
+}
+
+interface NeedsTrust extends RunSummary {
+  state: string;
+  label: string;
+  scope: string;
+  id: string;
+}
+
+/** actionRun's answer: a reason not to, a question to ask first, or a run. */
+interface RunAnswer {
+  error?: string;
+  needsInput?: NeedsInput;
+  needsTrust?: NeedsTrust;
+  needsConfirm?: RunSummary & { label: string };
+  runId: string;
+  label: string;
+  mode: ActionOutput;
+  command?: string;
+  cwd?: string;
+}
+
+interface StartOpts {
+  /** a context other than the document's (the file tree's right-click) */
+  ctx?: Partial<ActionContext>;
+  trust?: 'once' | 'always';
+  confirmed?: boolean;
+  inputs?: Record<string, string>;
+}
+
+/** The run in flight. */
+interface RunState {
+  runId: string;
+  label: string;
+  mode: ActionOutput;
+  a: ActionRow;
+}
+
+/** The 'action-done' push. */
+interface ActionDone {
+  runId: string;
+  ok: boolean;
+  ms: number;
+  error?: string;
+  code?: number;
+  /** the ANSWER, when the backend can tell it from the transcript */
+  text?: string | null;
+  output?: string;
+}
+
+/** A sheet waiting on an answer, and the run it will resume. */
+interface Pending<N> {
+  need: N;
+  a: ActionRow;
+  opts: StartOpts;
+}
+
+export interface ActionsOptions {
+  button: HTMLElement;
+  menu: HTMLElement;
+  panel: HTMLElement;
+  grip: HTMLElement;
+  out: HTMLElement;
+  head: HTMLElement;
+  title: HTMLElement;
+  meta: HTMLElement;
+  dot: HTMLElement;
+  stop: HTMLElement;
+  clear: HTMLElement;
+  close: HTMLElement;
+  shade: HTMLElement;
+  sheet: HTMLElement;
+  pins?: HTMLElement | null;
+  /** live.ts's format bubble, and the ⚡ + menu this file owns inside it */
+  bubble?: HTMLElement | null;
+  bubbleActs?: HTMLElement | null;
+  bubbleActsMenu?: HTMLElement | null;
+  /** the ⚡ appeared or went away — the bubble re-measures */
+  onSelActs?: () => void;
+  context: () => ActionContext;
+  /** the whole document, as its own undo step */
+  applyText: (text: string) => void;
+  insertText: (text: string, opts?: { select?: boolean }) => void;
+  toast: (text: string) => void;
+  onBusy?: (on: boolean) => void;
+  onManage?: () => void;
+}
+
+/** An action the file tree's right-click can offer for one file. */
+export interface FileAction {
+  label: string;
+  scope: 'global' | 'project';
+  run: () => Promise<void>;
+}
+
+export interface ActionsHandle {
+  refresh: () => Promise<ActionsList | null>;
+  openMenu: (x: number, y: number) => Promise<void>;
+  runById(scope: string, id: string): Promise<void>;
+  forFile(file: string): Promise<FileAction[]>;
+}
 
 function setupActions({
   button, menu, panel, grip, out, head, title, meta, dot, stop, clear, close,
   shade, sheet, pins, bubble, bubbleActs, bubbleActsMenu, onSelActs,
   // what only the document knows
   context, applyText, insertText, toast, onBusy, onManage,
-}) {
-  let list = [];                 // the last actionsList answer
-  let menuAt = null;             // where the ⚡ menu last opened, for redraws
-  let run = null;                // the run in flight: { runId, label, mode }
-  let pending = null;            // a trust prompt waiting on an answer
+}: ActionsOptions): ActionsHandle {
+  let list: ActionRow[] = [];                 // the last actionsList answer
+  let menuAt: { x: number; y: number } | null = null;             // where the ⚡ menu last opened, for redraws
+  let run: RunState | null = null;                // the run in flight: { runId, label, mode }
+  let pending: Pending<NeedsTrust> | null = null;            // a trust prompt waiting on an answer
   let tail = true;               // is the drawer scrolled to the bottom?
 
   // ------------------------------------------------------------- the menu
 
   const hideMenu = () => { menu.hidden = true; menu.textContent = ''; };
-  addEventListener('mousedown', (e) => {
-    if (!menu.hidden && !menu.contains(e.target) && e.target !== button) hideMenu();
+  addEventListener('mousedown', (e: MouseEvent) => {
+    if (!menu.hidden && !menu.contains(e.target as Node) && e.target !== button) hideMenu();
   });
   addEventListener('blur', hideMenu);
 
@@ -37,11 +231,11 @@ function setupActions({
   // mousedown keeps focus, and the highlight, in the editor; the click on
   // the ⚡, a pin, or a menu row still lands. Same trick the bubble ⚡ uses.
   for (const el of [button, menu, pins]) {
-    if (el) el.addEventListener('mousedown', (e) => e.preventDefault());
+    if (el) el.addEventListener('mousedown', (e: MouseEvent) => e.preventDefault());
   }
 
   async function refresh() {
-    const r = await tiny.api.call('actionsList', { ctx: context() });
+    const r: ActionsList | null = await tiny.api.call('actionsList', { ctx: context() });
     list = (r && r.list) || [];
     // The ⚡ only appears once there is something behind it — an empty menu
     // is a worse answer than no button. Actions ▸ Edit… is always in the
@@ -104,32 +298,32 @@ function setupActions({
   function openSelMenu() {
     const rows = selectionActions();
     if (!rows.length) return hideSelMenu();
-    bubbleActsMenu.textContent = '';
+    bubbleActsMenu!.textContent = '';
     for (const a of rows) {
       const b = withIcon(document.createElement('button'), a, a.label);
       if (a.description) b.title = a.description;
       // mousedown, not click: a click would have cleared the selection the
       // action is about before the handler ever ran
       b.onmousedown = (e) => { e.preventDefault(); hideSelMenu(); start(a); };
-      bubbleActsMenu.appendChild(b);
+      bubbleActsMenu!.appendChild(b);
     }
-    bubbleActsMenu.hidden = false;
+    bubbleActsMenu!.hidden = false;
     // right-aligned under the ⚡; above the bubble when it would land on the
     // selected text (the bubble usually sits just over the selection)
-    const r = bubbleActs.getBoundingClientRect();
-    const w = bubbleActsMenu.offsetWidth, h = bubbleActsMenu.offsetHeight;
-    bubbleActsMenu.style.left = Math.round(Math.min(Math.max(8, r.right - w),
+    const r = bubbleActs!.getBoundingClientRect();
+    const w = bubbleActsMenu!.offsetWidth, h = bubbleActsMenu!.offsetHeight;
+    bubbleActsMenu!.style.left = Math.round(Math.min(Math.max(8, r.right - w),
       innerWidth - w - 8)) + 'px';
     const above = r.top - h - 6;
-    bubbleActsMenu.style.top = Math.round(above > 6 ? above : r.bottom + 6) + 'px';
+    bubbleActsMenu!.style.top = Math.round(above > 6 ? above : r.bottom + 6) + 'px';
   }
 
   if (bubbleActs) {
     // preventDefault keeps the selection; live.ts's click handler skips any
     // bubble button without a data-cmd, so this one never reaches execCommand
-    bubbleActs.addEventListener('mousedown', (e) => {
+    bubbleActs.addEventListener('mousedown', (e: MouseEvent) => {
       e.preventDefault();
-      if (bubbleActsMenu.hidden) openSelMenu(); else hideSelMenu();
+      if (bubbleActsMenu!.hidden) openSelMenu(); else hideSelMenu();
     });
     // the menu dies with the selection, the bubble, or a click elsewhere
     document.addEventListener('selectionchange', () => {
@@ -137,9 +331,9 @@ function setupActions({
       if (!s || s.isCollapsed || (bubble && bubble.hidden)) hideSelMenu();
     });
     addEventListener('scroll', hideSelMenu, true);
-    addEventListener('mousedown', (e) => {
-      if (!bubbleActsMenu.hidden && !bubbleActsMenu.contains(e.target)
-          && !bubbleActs.contains(e.target)) hideSelMenu();
+    addEventListener('mousedown', (e: MouseEvent) => {
+      if (!bubbleActsMenu!.hidden && !bubbleActsMenu!.contains(e.target as Node)
+          && !bubbleActs!.contains(e.target as Node)) hideSelMenu();
     });
     addEventListener('blur', hideSelMenu);
   }
@@ -151,9 +345,9 @@ function setupActions({
   // refresh the list. Re-ask the moment a selection appears or goes away:
   // availability() only looks at presence, so a drag growing the selection
   // settles to a single refresh rather than churning per tick.
-  let hadSel = null, selTick = null;
+  let hadSel: boolean | null = null, selTick: ReturnType<typeof setTimeout> | null = null;
   document.addEventListener('selectionchange', () => {
-    clearTimeout(selTick);
+    clearTimeout(selTick!);
     selTick = setTimeout(() => {
       const has = !!context().sel;
       if (has === hadSel) return;
@@ -166,7 +360,7 @@ function setupActions({
   // space gets you. Every place an icon sits next to a name uses this —
   // handed the whole action (or anything with {icon, iconSvg}), so an
   // Iconify pick draws as its SVG and an emoji as itself.
-  function withIcon(el, src, label) {
+  function withIcon<T extends HTMLElement>(el: T, src: NibIconed, label: string): T {
     const node = nibActIcon(src);
     if (node) {
       const ico = document.createElement('span');
@@ -178,7 +372,7 @@ function setupActions({
     return el;
   }
 
-  function rowFor(a) {
+  function rowFor(a: ActionRow) {
     const el = document.createElement('div');
     el.className = 'citem' + (a.why ? ' off' : '');
     // The icon is a glyph in a fixed-width slot, so a menu of six actions
@@ -224,13 +418,13 @@ function setupActions({
     return el;
   }
 
-  async function openMenu(x, y) {
+  async function openMenu(x: number, y: number) {
     menuAt = { x, y };
     const r = await refresh();
     menu.textContent = '';
     const mine = list.filter((a) => a.scope === 'global');
     const theirs = list.filter((a) => a.scope === 'project');
-    const section = (label, rows) => {
+    const section = (label: string, rows: ActionRow[]) => {
       if (!rows.length) return;
       if (menu.children.length) {
         const sep = document.createElement('div');
@@ -257,7 +451,7 @@ function setupActions({
     // One way in for everything: the editor sheet knows which files exist
     // and offers only those, so there is no greyed row here saying that a
     // folder you haven't opened has no actions.
-    const edit = (label) => {
+    const edit = (label: string) => {
       const el = document.createElement('div');
       el.className = 'citem';
       const name = document.createElement('span');
@@ -277,7 +471,7 @@ function setupActions({
     menu.style.top = Math.round(Math.min(y, innerHeight - h - 8)) + 'px';
   }
 
-  const nameOf = (p) => p.split('/').filter(Boolean).pop() || p;
+  const nameOf = (p: string) => p.split('/').filter(Boolean).pop() || p;
 
   button.onclick = () => {
     if (!menu.hidden) return hideMenu();
@@ -287,32 +481,32 @@ function setupActions({
 
   // ------------------------------------------------------------ the sheet
 
-  function askTrust(need, a, opts) {
+  function askTrust(need: NeedsTrust, a: ActionRow, opts?: StartOpts) {
     pending = { need, a, opts: opts || {} };
     title_(need);
     shade.hidden = false;
-    document.getElementById('trustAlways').focus();
+    document.getElementById('trustAlways')!.focus();
   }
 
-  function title_(need) {
+  function title_(need: NeedsTrust) {
     const changed = need.state === 'changed';
-    document.getElementById('trustTitle').textContent =
+    document.getElementById('trustTitle')!.textContent =
       (changed ? 'This action has changed: ' : 'Run ') + '“' + need.label + '”?';
-    document.getElementById('trustWhy').textContent = changed
+    document.getElementById('trustWhy')!.textContent = changed
       ? 'You approved it before, but its command has been edited since. '
         + 'Read it again before letting it run.'
       : 'This action came with the folder, not from your own actions file. '
         + 'It runs on your machine, with your permissions.';
-    document.getElementById('trustKind').textContent = need.kind;
-    document.getElementById('trustCmd').textContent = need.body;
-    document.getElementById('trustCwd').textContent = need.cwd;
+    document.getElementById('trustKind')!.textContent = need.kind;
+    document.getElementById('trustCmd')!.textContent = need.body;
+    document.getElementById('trustCwd')!.textContent = need.cwd;
   }
 
   const hideSheet = () => { shade.hidden = true; pending = null; };
-  document.getElementById('trustCancel').onclick = hideSheet;
-  document.getElementById('trustOnce').onclick = () => answer('once');
-  document.getElementById('trustAlways').onclick = () => answer('always');
-  function answer(how) {
+  document.getElementById('trustCancel')!.onclick = hideSheet;
+  document.getElementById('trustOnce')!.onclick = () => answer('once');
+  document.getElementById('trustAlways')!.onclick = () => answer('always');
+  function answer(how: 'once' | 'always') {
     const p = pending;
     hideSheet();
     if (p) start(p.a, { ...p.opts, trust: how });
@@ -325,23 +519,24 @@ function setupActions({
   // remembers what you last typed per action, because the second run of
   // "Deploy to {environment}" is nearly always the same answer as the first.
 
-  const askShade = document.getElementById('askShade');
-  let askPending = null;
+  const askShade = document.getElementById('askShade')!;
+  let askPending: Pending<NeedsInput> | null = null;
 
-  const lastAnswers = (id) => {
+  // what was typed last time, per action — strings, as the form sent them
+  const lastAnswers = (id: string): Record<string, string | boolean> => {
     try { return JSON.parse(localStorage.getItem('nib.ask.' + id) || '{}'); }
     catch { return {}; }
   };
 
-  function askInput(need, a, opts) {
+  function askInput(need: NeedsInput, a: ActionRow, opts?: StartOpts) {
     askPending = { need, a, opts: opts || {} };
     const was = lastAnswers(a.scope + ':' + a.id);
     // an element rather than two spaces, because CSS collapses whitespace
     // and the icon would end up welded to the name
-    const t = document.getElementById('askTitle');
+    const t = document.getElementById('askTitle')!;
     t.textContent = '';
     withIcon(t, need, need.label);
-    const box = document.getElementById('askFields');
+    const box = document.getElementById('askFields')!;
     box.textContent = '';
     for (const f of need.ask) {
       const wrap = document.createElement('label');
@@ -350,7 +545,7 @@ function setupActions({
       lab.textContent = f.label;
       wrap.appendChild(lab);
 
-      let input;
+      let input: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
       if (f.type === 'choice') {
         input = document.createElement('select');
         for (const c of f.choices || []) {
@@ -390,10 +585,10 @@ function setupActions({
       input.dataset.name = f.name;
       input.dataset.required = f.required ? '1' : '';
       input.spellcheck = false;
-      if (f.placeholder) input.placeholder = f.placeholder;
+      if (f.placeholder) (input as HTMLInputElement).placeholder = f.placeholder;
       const start = was[f.name] !== undefined ? was[f.name] : f.value;
-      if (f.type === 'check') input.checked = start === 'true' || start === true;
-      else if (start !== '') input.value = start;
+      if (f.type === 'check') (input as HTMLInputElement).checked = start === 'true' || start === true;
+      else if (start !== '') input.value = start as string;
       if (!wrap.contains(input)) wrap.appendChild(input);
       box.appendChild(wrap);
 
@@ -405,63 +600,66 @@ function setupActions({
       }
     }
     askShade.hidden = false;
-    const first = box.querySelector('input, select, textarea');
+    const first = box.querySelector<HTMLElement>('input, select, textarea');
     if (first) first.focus();
   }
 
   const hideAsk = () => { askShade.hidden = true; askPending = null; };
-  document.getElementById('askCancel').onclick = () => {
+  document.getElementById('askCancel')!.onclick = () => {
     if (promptLive) return answerPrompt(null);
     hideAsk();
   };
-  document.getElementById('askGo').onclick = () => {
+  document.getElementById('askGo')!.onclick = () => {
     if (promptLive) {
-      const el = document.getElementById('askFields').querySelector('[data-live]');
+      const el = document.getElementById('askFields')!.querySelector<HTMLInputElement>('[data-live]');
       return answerPrompt(el ? el.value : '');
     }
     const p = askPending;
     if (!p) return;
-    const inputs = {};
-    for (const el of document.getElementById('askFields')
-      .querySelectorAll('[data-name]')) {
+    const inputs: Record<string, string> = {};
+    for (const el of document.getElementById('askFields')!
+      .querySelectorAll<HTMLInputElement>('[data-name]')) {
       const v = el.type === 'checkbox' ? String(el.checked) : el.value;
       if (el.dataset.required && !String(v).trim()) {
         el.focus();
-        return toast('“' + el.previousSibling.textContent + '” is needed');
+        return toast('“' + el.previousSibling!.textContent + '” is needed');
       }
-      inputs[el.dataset.name] = v;
+      inputs[el.dataset.name!] = v;
     }
     hideAsk();
     try { localStorage.setItem('nib.ask.' + p.a.scope + ':' + p.a.id, JSON.stringify(inputs)); }
     catch { /* a full quota is not worth failing a run over */ }
     start(p.a, { ...p.opts, inputs });
   };
-  askShade.addEventListener('keydown', (e) => {
+  askShade.addEventListener('keydown', (e: KeyboardEvent) => {
     // ⌘⏎ from a textarea, ⏎ from anywhere else
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey || e.target.tagName !== 'TEXTAREA')) {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey || (e.target as Element).tagName !== 'TEXTAREA')) {
       e.preventDefault();
-      document.getElementById('askGo').click();
+      document.getElementById('askGo')!.click();
     }
   });
 
   // ------------------------------------------------------ the alert sheet
 
-  const alertShade = document.getElementById('alertShade');
-  function showAlert(src, title, body) {
-    const t = document.getElementById('alertTitle');
+  const alertShade = document.getElementById('alertShade')!;
+  function showAlert(src: NibIconed, title: string, body: string) {
+    const t = document.getElementById('alertTitle')!;
     t.textContent = '';
     withIcon(t, src, title);
-    document.getElementById('alertBody').textContent = body;
+    document.getElementById('alertBody')!.textContent = body;
     alertShade.hidden = false;
-    document.getElementById('alertOk').focus();
+    document.getElementById('alertOk')!.focus();
   }
-  document.getElementById('alertOk').onclick = () => {
+  document.getElementById('alertOk')!.onclick = () => {
     alertShade.hidden = true;
     // a ctx.alert is waiting on this OK — let the script carry on
     if (alertLive) { tiny.api.call('actionAnswer', { askId: alertLive, value: true }); alertLive = null; }
   };
-  document.getElementById('alertCopy').onclick = () => {
-    tiny.clipboard.writeText(document.getElementById('alertBody').textContent);
+  document.getElementById('alertCopy')!.onclick = () => {
+    // NOTE: tiny.clipboard has no writeText (only write({ text })) — this
+    // throws at runtime. Left as it was; the cast only names what it expects.
+    (tiny.clipboard as unknown as { writeText(text: string): unknown })
+      .writeText(document.getElementById('alertBody')!.textContent!);
     toast('Copied');
   };
 
@@ -473,31 +671,31 @@ function setupActions({
   // confirm is the app's own dialog. The script is parked on a promise in
   // the backend until actionAnswer goes back; the backend's patience turns
   // a sheet nobody answers into a cancel, so nothing hangs forever.
-  let promptLive = null;               // the askId while a ctx.prompt is up
-  let alertLive = null;                // …and while a ctx.alert is up
+  let promptLive: string | null = null;               // the askId while a ctx.prompt is up
+  let alertLive: string | null = null;                // …and while a ctx.alert is up
 
-  const answerPrompt = (value) => {
+  const answerPrompt = (value: string | null) => {
     const askId = promptLive;
     promptLive = null;
     askShade.hidden = true;
-    document.getElementById('askGo').textContent = 'Run';   // the sheet's day job
+    document.getElementById('askGo')!.textContent = 'Run';   // the sheet's day job
     tiny.api.call('actionAnswer', { askId, value });
   };
 
-  tiny.api.on('action-prompt', (p) => {
+  tiny.api.on('action-prompt', (p: ActionPrompt) => {
     if (promptLive) answerPrompt(null);            // a newer ask wins
     promptLive = p.askId;
-    const t = document.getElementById('askTitle');
+    const t = document.getElementById('askTitle')!;
     t.textContent = '';
     withIcon(t, (run && run.a) || {}, (run && run.label) || 'Action');
-    const box = document.getElementById('askFields');
+    const box = document.getElementById('askFields')!;
     box.textContent = '';
     const wrap = document.createElement('label');
     wrap.className = 'afield';
     const lab = document.createElement('span');
     lab.textContent = p.label || 'Value';
     wrap.appendChild(lab);
-    let input;
+    let input: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
     if (p.type === 'choice') {
       input = document.createElement('select');
       for (const c of p.choices || []) {
@@ -515,30 +713,30 @@ function setupActions({
     }
     input.dataset.live = '1';
     input.spellcheck = false;
-    if (p.placeholder) input.placeholder = p.placeholder;
+    if (p.placeholder) (input as HTMLInputElement).placeholder = p.placeholder;
     if (p.value) input.value = p.value;
     wrap.appendChild(input);
     box.appendChild(wrap);
     // mid-run, the button answers rather than launches
-    document.getElementById('askGo').textContent = 'OK';
+    document.getElementById('askGo')!.textContent = 'OK';
     askShade.hidden = false;
     input.focus();
-    if (input.select) input.select();
+    if ((input as HTMLInputElement).select) (input as HTMLInputElement).select();
   });
 
-  tiny.api.on('action-alert', (p) => {
+  tiny.api.on('action-alert', (p: { askId: string; title?: string; body?: string }) => {
     alertLive = p.askId;
     showAlert((run && run.a) || {}, p.title || (run && run.label) || 'Action', p.body || '');
   });
 
   // ctx.pickFile / ctx.pickFolder — the system dialog is the whole sheet
-  tiny.api.on('action-pick', async (p) => {
+  tiny.api.on('action-pick', async (p: { askId: string; kind: 'file' | 'folder' }) => {
     const r = p.kind === 'folder' ? await tiny.dialog.pickFolder() : await tiny.dialog.openFile();
     const path = Array.isArray(r) ? r[0] : r;
     tiny.api.call('actionAnswer', { askId: p.askId, value: path || null });
   });
 
-  tiny.api.on('action-confirm', async (p) => {
+  tiny.api.on('action-confirm', async (p: ActionConfirm) => {
     const ok = await tiny.dialog.confirm(p.question || 'Continue?', {
       detail: p.detail || '', ok: p.ok || 'OK', cancel: p.cancel || 'Cancel',
     });
@@ -547,7 +745,7 @@ function setupActions({
 
   // ------------------------------------------------------------ the drawer
 
-  function showPanel(on) {
+  function showPanel(on: boolean) {
     panel.hidden = !on;
     grip.hidden = !on;
     document.body.toggleAttribute('data-run', !!on);
@@ -564,7 +762,7 @@ function setupActions({
   // which tool it reached for, which model answered, what it cost — and it
   // is dimmed rather than mixed in, because the run's OUTPUT is the thing
   // you came to read and a transcript of it thinking is not.
-  function write(text, stream) {
+  function write(text: string, stream?: string) {
     const node = document.createElement(stream === 'err' ? 'b' : 'span');
     if (stream === 'meta') node.className = 'rmeta';
     node.textContent = text;
@@ -574,12 +772,12 @@ function setupActions({
 
   // The drawer's height, dragged and remembered — the same grip idea as the
   // sidebars, in the other axis.
-  let dragFrom = null;
-  grip.addEventListener('mousedown', (e) => {
+  let dragFrom: { y: number; h: number } | null = null;
+  grip.addEventListener('mousedown', (e: MouseEvent) => {
     dragFrom = { y: e.clientY, h: panel.offsetHeight };
     e.preventDefault();
   });
-  addEventListener('mousemove', (e) => {
+  addEventListener('mousemove', (e: MouseEvent) => {
     if (!dragFrom) return;
     const h = Math.min(Math.max(80, dragFrom.h + (dragFrom.y - e.clientY)), innerHeight - 160);
     document.body.style.setProperty('--runh', Math.round(h) + 'px');
@@ -594,7 +792,7 @@ function setupActions({
 
   // ------------------------------------------------------------- running
 
-  async function start(a, opts = {}) {
+  async function start(a: ActionRow, opts: StartOpts = {}) {
     if (run) return toast('An action is still running');
     // The document's context, unless the caller had another file in mind —
     // the file tree's right-click runs on the row you clicked, not on the
@@ -608,7 +806,7 @@ function setupActions({
       if (!r || r.needsPath) return toast('Save the document first');
     }
 
-    const r = await tiny.api.call('actionRun', {
+    const r: RunAnswer | null = await tiny.api.call('actionRun', {
       scope: a.scope, id: a.id, ctx,
       trust: opts.trust, confirmed: opts.confirmed, inputs: opts.inputs,
     });
@@ -641,7 +839,7 @@ function setupActions({
     if (onBusy) onBusy(true);
   }
 
-  tiny.api.on('action-out', (p) => {
+  tiny.api.on('action-out', (p: { runId: string; stream: string; text: string }) => {
     if (!run || p.runId !== run.runId) return;
     // ctx.log means "show the person this" — the drawer opens for it even
     // when the output mode keeps it shut. A returned result stays 'out'.
@@ -649,7 +847,7 @@ function setupActions({
     write(p.text, p.stream);
   });
 
-  tiny.api.on('action-done', (p) => {
+  tiny.api.on('action-done', (p: ActionDone) => {
     if (!run || p.runId !== run.runId) return;
     const r = run;
     run = null;
@@ -670,7 +868,7 @@ function setupActions({
     applyOutput(r, p);
   });
 
-  function applyOutput(r, p) {
+  function applyOutput(r: RunState, p: ActionDone) {
     // `text` is the ANSWER when the backend can tell the two apart — a js
     // action's return value, an AI action's reply. `output` is everything
     // the drawer saw, which for those two includes whatever they logged on
@@ -715,7 +913,7 @@ function setupActions({
 
   // Actions ▸ <one of them> in the menu bar: the backend can't know what
   // this window is showing, so it asks the window to do it.
-  tiny.api.on('run-action', async ({ scope, id }) => {
+  tiny.api.on('run-action', async ({ scope, id }: { scope: string; id: string }) => {
     await refresh();
     const a = list.find((x) => x.scope === scope && x.id === id);
     if (!a) return toast('That action is gone — Actions ▸ Reload');
@@ -731,7 +929,7 @@ function setupActions({
     else refresh();
   });
 
-  addEventListener('keydown', (e) => {
+  addEventListener('keydown', (e: KeyboardEvent) => {
     if (e.key === 'Escape') {
       if (!menu.hidden) { hideMenu(); return; }
       if (!shade.hidden) { hideSheet(); return; }
@@ -753,7 +951,7 @@ function setupActions({
     refresh,
     openMenu,
     // the editor's "Run it now", once the file it just wrote is reloaded
-    async runById(scope, id) {
+    async runById(scope: string, id: string) {
       await refresh();
       const a = list.find((x) => x.scope === scope && x.id === id);
       if (!a) return toast('That action is gone — Actions ▸ Reload');
@@ -767,8 +965,8 @@ function setupActions({
     // that don't act on the open editor: "run this on that file" is the
     // gesture, so a formatter that would pipe the document you're looking
     // at into a file you merely right-clicked has no business in this menu.
-    async forFile(file) {
-      const r = await tiny.api.call('actionsList', { ctx: { ...context(), file } });
+    async forFile(file: string) {
+      const r: ActionsList | null = await tiny.api.call('actionsList', { ctx: { ...context(), file } });
       return ((r && r.list) || []).filter((a) => !a.why && a.fileScoped
         && a.stdin === 'none' && a.output !== 'replace' && a.output !== 'insert').map((a) => ({
         label: a.label,

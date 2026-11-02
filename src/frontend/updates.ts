@@ -5,13 +5,29 @@
 // The daily background check stays a notification (onUpdateAvailable in the
 // backend) — that one is unsolicited, so it shouldn't stop what you're doing.
 
-export const checkForUpdatesUI = async () => {
-  let r;
+/** update.check's answer (tinyjs's updater, via the backend). */
+interface UpdateCheck {
+  current?: string;
+  available?: boolean;
+  latest?: string;
+  notes?: string;
+}
+
+/** installCli's answer (main.ts). */
+interface CliInstall {
+  status: 'ok' | 'dev' | 'cancelled' | 'failed';
+  note?: 'new-terminal' | 'add-path';
+  path?: string;
+  error?: string;
+}
+
+export const checkForUpdatesUI = async (): Promise<void> => {
+  let r: UpdateCheck | null;
   try {
     r = await tiny.api.call('update.check');
   } catch (e) {
     await tiny.dialog.alert('Couldn’t check for updates',
-      String((e && e.message) || e) + '\n\nCheck your connection and try again.');
+      String((e && (e as Error).message) || e) + '\n\nCheck your connection and try again.');
     return;
   }
   const now = (r && r.current) ? 'v' + r.current : 'This version';
@@ -28,7 +44,7 @@ export const checkForUpdatesUI = async () => {
   try {
     await tiny.api.call('update.install');
   } catch (e) {
-    await tiny.dialog.alert('Update failed', String((e && e.message) || e));
+    await tiny.dialog.alert('Update failed', String((e && (e as Error).message) || e));
   }
 };
 
@@ -37,10 +53,10 @@ export const checkForUpdatesUI = async () => {
 // The backend writes the shim (installCli in main.ts says where and what per
 // platform); this turns its answer into a dialog. Running it again is the
 // repair for a moved app — the shim just gets rewritten.
-export const installCliUI = async () => {
-  let r;
+export const installCliUI = async (): Promise<void> => {
+  let r: CliInstall;
   try { r = await tiny.api.call('installCli'); }
-  catch (e) { r = { status: 'failed', error: String((e && e.message) || e) }; }
+  catch (e) { r = { status: 'failed', error: String((e && (e as Error).message) || e) }; }
   if (r.status === 'ok') {
     const extra = r.note === 'new-terminal'
       ? '\n\nAlready-open terminals keep their old PATH — open a new one first.'
@@ -74,7 +90,7 @@ export const installCliUI = async () => {
 // It's a menu item and not something asked on first launch, for the reason
 // tinyjs gives for not doing it automatically: claiming a scheme competes
 // with nobody, and claiming .md competes with the user's editor.
-export const makeDefaultUI = async () => {
+export const makeDefaultUI = async (): Promise<void> => {
   let r;
   try { r = await tiny.app.setAsDefaultHandler('md'); } catch { r = 'failed'; }
   if (r === 'ok') {

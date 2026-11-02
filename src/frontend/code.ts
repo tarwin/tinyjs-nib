@@ -8,8 +8,8 @@
 // survives Export as HTML and printing without any script. Everything is
 // escaped here; md.ts hands us raw source and expects markup back.
 
-const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
-const esc = (s) => String(s).replace(/[&<>]/g, (c) => ESC[c]);
+const ESC: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
+const esc = (s: unknown) => String(s).replace(/[&<>]/g, (c) => ESC[c]);
 
 // Rules use non-capturing groups ONLY — the fused regex gives each rule
 // exactly one group, and that's how we know which one matched.
@@ -18,7 +18,10 @@ const CLIKE_STR = /"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'/;
 const SLASH_CM = /\/\/[^\n]*|\/\*[\s\S]*?\*\//;
 const HASH_CM = /#[^\n]*/;
 
-const kw = (words) => new RegExp('\\b(?:' + words.trim().split(/\s+/).join('|') + ')\\b');
+/** [class suffix, pattern] */
+type Rule = [string, RegExp];
+
+const kw = (words: string) => new RegExp('\\b(?:' + words.trim().split(/\s+/).join('|') + ')\\b');
 
 const JS_KW = kw(`await async break case catch class const continue debugger default delete do
     else export extends finally for from function get if implements import in instanceof interface
@@ -44,7 +47,7 @@ const IDENT_FN = /[A-Za-z_$][\w$]*(?=\s*\()/;
 const PUNCT = /[{}[\]();,.:]/;
 const OP = /[+\-*/%=<>!&|^~?]+/;
 
-const clike = (keywords, extra = []) => [
+const clike = (keywords: RegExp, extra: Rule[] = []): Rule[] => [
   ['cm', SLASH_CM], ['str', CLIKE_STR], ...extra,
   ['num', NUM], ['kw', keywords],
   ['lit', /\b(?:true|false|null|nil|undefined|NaN|None|True|False)\b/],
@@ -52,7 +55,7 @@ const clike = (keywords, extra = []) => [
   ['op', OP], ['pun', PUNCT],
 ];
 
-const LANGS = {
+const LANGS: Record<string, Rule[]> = {
   js: clike(JS_KW, [['str', /`(?:\\.|[^`\\])*`/], ['attr', /\B#[A-Za-z_$][\w$]*/]]),
   json: [
     ['key', /"(?:\\.|[^"\\\n])*"(?=\s*:)/], ['str', /"(?:\\.|[^"\\\n])*"/],
@@ -108,7 +111,7 @@ const LANGS = {
   go: clike(GO_KW, [['str', /`[^`]*`/]]),
 };
 
-const ALIAS = {
+const ALIAS: Record<string, string> = {
   javascript: 'js', jsx: 'js', ts: 'js', typescript: 'js', tsx: 'js', mjs: 'js', cjs: 'js',
   python: 'py', bash: 'sh', shell: 'sh', zsh: 'sh', console: 'sh', sh: 'sh',
   scss: 'css', less: 'css', xml: 'html', svg: 'html', vue: 'html',
@@ -117,9 +120,9 @@ const ALIAS = {
   swift: 'go', kotlin: 'go', kt: 'go', cs: 'go', csharp: 'go', php: 'go', dart: 'go',
 };
 
-const cache = new Map();
-function fused(lang) {
-  if (cache.has(lang)) return cache.get(lang);
+const cache = new Map<string, { re: RegExp; cls: string[] }>();
+function fused(lang: string) {
+  if (cache.has(lang)) return cache.get(lang)!;
   const rules = LANGS[lang];
   const re = new RegExp(rules.map(([, r]) => '(' + r.source + ')').join('|'),
     'g' + (rules.some(([, r]) => r.multiline) ? 'm' : '')
@@ -129,12 +132,12 @@ function fused(lang) {
   return out;
 }
 
-export const highlightCode = (src, lang) => {
+export const highlightCode = (src: string, lang?: string | null): string => {
   const key = ALIAS[String(lang || '').toLowerCase()] || String(lang || '').toLowerCase();
   if (!LANGS[key]) return esc(src);
   const { re, cls } = fused(key);
   re.lastIndex = 0;
-  let out = '', last = 0, m;
+  let out = '', last = 0, m: RegExpExecArray | null;
   while ((m = re.exec(src))) {
     if (m[0] === '') { re.lastIndex++; continue; }      // never spin
     let which = -1;

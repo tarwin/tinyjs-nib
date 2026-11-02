@@ -13,14 +13,14 @@
 // authoring serious AsciiDoc has Asciidoctor.
 
 // the inline constructs that differ from Markdown
-function inline(s) {
+function inline(s: string): string {
   return s
     // https://host[label] — AsciiDoc's bare-url-with-label form
-    .replace(/(https?:\/\/[^\s[\]]+)\[([^\]]*)\]/g, (_, u, t) => (t ? `[${t}](${u})` : `<${u}>`))
+    .replace(/(https?:\/\/[^\s[\]]+)\[([^\]]*)\]/g, (_, u: string, t: string) => (t ? `[${t}](${u})` : `<${u}>`))
     // link:target[label] and xref:target[label]
-    .replace(/\b(?:link|xref):([^\s[\]]+)\[([^\]]*)\]/g, (_, u, t) => `[${t || u}](${u})`)
+    .replace(/\b(?:link|xref):([^\s[\]]+)\[([^\]]*)\]/g, (_, u: string, t: string) => `[${t || u}](${u})`)
     // inline image:path[alt]
-    .replace(/\bimage:([^\s[\]:][^\s[\]]*)\[([^\]]*)\]/g, (_, u, t) => `![${t.split(',')[0]}](${u})`)
+    .replace(/\bimage:([^\s[\]:][^\s[\]]*)\[([^\]]*)\]/g, (_, u: string, t: string) => `![${t.split(',')[0]}](${u})`)
     // *bold* — single stars are BOLD in AsciiDoc (Markdown would read italic)
     .replace(/(^|[\s(>])\*([^*\n]+)\*(?=$|[\s).,;:!?<])/g, '$1**$2**')
     // +monospace+
@@ -28,8 +28,8 @@ function inline(s) {
   // _italic_ and `mono` already mean the same thing
 }
 
-export const adocToMarkdown = (src) => {
-  const out = [];
+export const adocToMarkdown = (src: string): string => {
+  const out: string[] = [];
   const lines = String(src).split('\n');
   let lang = '';        // [source,x] remembered for the ---- that follows
   let code = false;     // inside ---- or .... delimiters

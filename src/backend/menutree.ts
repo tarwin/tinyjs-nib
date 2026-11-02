@@ -16,12 +16,17 @@
 // ones whose number actually changes are written.
 
 import { tokenizeJS, findDefaultExport, safeKey } from './menuparse.ts';
+import type {
+  Parsed, ReadResult, KeyInfo, FileReader, FmFlavor, Menu, MenuItem, MenuOp, MetaRef, EditResult, FileWrite,
+} from './menuparse.ts';
 
-const join = (...parts) => parts.filter((x) => x !== undefined && x !== null && x !== '').join('/');
+const join = (...parts: (string | null | undefined)[]) => parts.filter((x) => x !== undefined && x !== null && x !== '').join('/');
 
 // ------------------------------------------------------------ front matter
 
-function yamlVal(v) {
+type FmValue = string | number | boolean;
+
+function yamlVal(v: FmValue) {
   if (typeof v === 'number' || typeof v === 'boolean') return String(v);
   const s = String(v);
   if (/^[\w][\w .,/()&+-]*$/.test(s) && !/^(true|false|null|yes|no|~|-?\d+(\.\d+)?)$/i.test(s) && !/\s$/.test(s)) return s;
@@ -31,7 +36,7 @@ function yamlVal(v) {
 // Set (or with value null, remove) `path` — 'title' or one level deep,
 // 'sidebar.order' — in a document's front matter, touching only that line.
 // Hugo's TOML front matter (+++) takes flat keys.
-export function setFrontMatter(text, path, value) {
+export function setFrontMatter(text: string, path: string, value: FmValue | null): string | null {
   const keys = path.split('.');
   const nl = text.includes('\r\n') ? '\r\n' : '\n';
   const lines = text.split(/\r?\n/);
@@ -54,7 +59,7 @@ export function setFrontMatter(text, path, value) {
   let end = -1;
   for (let n = 1; n < lines.length; n++) if (lines[n] === '---' || lines[n] === '...') { end = n; break; }
   if (end < 0) return null;
-  const top = (k) => lines.slice(1, end).findIndex((l) => new RegExp('^' + k + '\\s*:').test(l)) + 1 || -1;
+  const top = (k: string) => lines.slice(1, end).findIndex((l) => new RegExp('^' + k + '\\s*:').test(l)) + 1 || -1;
   if (keys.length === 1) {
     const at = top(keys[0]);
     if (at > 0) {
@@ -72,7 +77,7 @@ export function setFrontMatter(text, path, value) {
     if (!/^[^:]+:\s*$/.test(lines[at])) return null;            // `sidebar: { … }` — not ours to rewrite
     let e = at + 1, pad = '  ', hit = -1;
     for (; e < end && /^\s+\S/.test(lines[e]); e++) {
-      pad = lines[e].match(/^\s+/)[0];
+      pad = lines[e].match(/^\s+/)![0];
       if (new RegExp('^\\s+' + keys[1] + '\\s*:').test(lines[e])) hit = e;
     }
     if (hit >= 0) { if (value === null) lines.splice(hit, 1); else lines[hit] = pad + keys[1] + ': ' + yamlVal(value); }
@@ -85,7 +90,7 @@ export function setFrontMatter(text, path, value) {
 }
 
 // a top-level `key: value` in a small YAML file (_category_.yml, index.yml)
-function setYamlTop(text, key, value) {
+function setYamlTop(text: string | null, key: string, value: FmValue) {
   const lines = (text || '').split('\n');
   const at = lines.findIndex((l) => new RegExp('^' + key + '\\s*:').test(l));
   if (at >= 0) lines[at] = key + ': ' + yamlVal(value);
@@ -97,14 +102,14 @@ function setYamlTop(text, key, value) {
 }
 
 // the file's indent step: its smallest one (the first indented line may be nested)
-const indentOfJson = (text) => {
-  let best = null;
+const indentOfJson = (text: string | null) => {
+  let best: string | null = null;
   for (const m of (text || '').matchAll(/\n([ \t]+)\S/g)) if (!best || m[1].length < best.length) best = m[1];
   return best || '  ';
 };
 // written the way the file already was: one line stays one line, and the
 // last newline is kept or not as it was
-const jsonOut = (obj, like) => {
+const jsonOut = (obj: Parsed, like: string | null) => {
   const oneLine = like && !/\n\s*\S/.test(like.trim());
   const body = oneLine ? JSON.stringify(obj) : JSON.stringify(obj, null, indentOfJson(like));
   return body + (!like || like.endsWith('\n') ? '\n' : '');
@@ -114,16 +119,23 @@ const jsonOut = (obj, like) => {
 
 // Pending writes, read-modify-written through: several edits to one file
 // (renumbering in a folder of category files) land as one write.
-function writer(ctx) {
-  const texts = new Map();
+interface Writer {
+  get(rel: string): Promise<string | null>;
+  put(rel: string, text: string): Promise<void>;
+  fm(rel: string, path: string, value: FmValue | null): Promise<void>;
+  out(): FileWrite[];
+}
+
+function writer(ctx: FileReader): Writer {
+  const texts = new Map<string, { text: string | null; changed: boolean }>();
   return {
     async get(rel) {
       if (!texts.has(rel)) texts.set(rel, { text: await ctx.read(rel), changed: false });
-      return texts.get(rel).text;
+      return texts.get(rel)!.text;
     },
     async put(rel, text) {
       await this.get(rel);
-      const t = texts.get(rel);
+      const t = texts.get(rel)!;
       if (t.text !== text) { t.text = text; t.changed = true; }
     },
     async fm(rel, path, value) {
@@ -133,14 +145,23 @@ function writer(ctx) {
       if (next == null) throw new Error(rel + ' writes its ' + path.split('.')[0] + ' in a way Nib won’t rewrite — change it there.');
       await this.put(rel, next);
     },
-    out: () => [...texts].filter(([, t]) => t.changed).map(([file, t]) => ({ file, text: t.text })),
+    // a changed entry was always put() a string
+    out: () => [...texts].filter(([, t]) => t.changed).map(([file, t]) => ({ file, text: t.text! })),
   };
 }
 
 // ----------------------------------------------------------- the flavors
 
 // key names in each system's front matter, and what a folder writes to
-const FM = {
+interface FmSpec {
+  pos: string;
+  label: string;
+  hide: [string, FmValue] | null;
+  whyNoHide?: string;
+  desc?: boolean;
+}
+
+const FM: Record<FmFlavor, FmSpec> = {
   docusaurus: { pos: 'sidebar_position', label: 'sidebar_label', hide: null,
     whyNoHide: 'Docusaurus has no “hide from the sidebar” switch for one page — list the sidebar in sidebars.js, or make the page a draft.' },
   starlight: { pos: 'sidebar.order', label: 'sidebar.label', hide: ['sidebar.hidden', true] },
@@ -150,7 +171,7 @@ const FM = {
   retype: { pos: 'order', label: 'label', hide: ['visibility', 'hidden'], desc: true },
 };
 
-async function categoryFile(ctx, dir) {
+async function categoryFile(ctx: FileReader, dir: string | undefined) {
   for (const n of ['_category_.json', '_category_.yml', '_category_.yaml']) {
     if ((await ctx.read(join(dir, n))) != null) return join(dir, n);
   }
@@ -159,7 +180,7 @@ async function categoryFile(ctx, dir) {
 
 // Write one entry's sort position (ascending "sort space"; Retype's
 // higher-first order is flipped on the way out)
-async function writePos(w, ctx, flavor, node, sortPos) {
+async function writePos(w: Writer, ctx: FileReader, flavor: FmFlavor, node: MenuItem, sortPos: number) {
   const f = FM[flavor];
   const value = f.desc ? -sortPos : sortPos;
   if (node.dir && flavor === 'docusaurus') {
@@ -167,7 +188,7 @@ async function writePos(w, ctx, flavor, node, sortPos) {
     const file = cat || join(node.dir, '_category_.json');
     const text = await w.get(file);
     if (file.endsWith('.json')) {
-      let obj = {};
+      let obj: Record<string, Parsed> = {};
       try { obj = text ? JSON.parse(text) : {}; } catch { throw new Error(file + ' isn’t valid JSON.'); }
       obj.position = value;
       await w.put(file, jsonOut(obj, text));
@@ -183,24 +204,25 @@ async function writePos(w, ctx, flavor, node, sortPos) {
   await w.fm(node.file, f.pos, value);
 }
 
-function canPlace(flavor, node) {
+function canPlace(flavor: FmFlavor, node: MenuItem) {
   if (flavor === 'starlight') return !node.dir;           // Starlight folders sort by name
   if (flavor === 'hugo') return !!node.file;              // a section needs its _index.md
   return !!(node.file || node.dir);
 }
 
 // The new order of a list: renumber, or squeeze the moved one in
-async function placeAll(w, ctx, flavor, order, moved) {
+async function placeAll(w: Writer, ctx: FileReader, flavor: FmFlavor, order: MenuItem[], moved: MenuItem) {
   const k = order.indexOf(moved);
   const others = order.filter((n) => n !== moved && canPlace(flavor, n));
   const placed = others.every((n) => n.pos !== null && n.pos !== undefined);
   const mono = placed && order.filter((n) => n !== moved && canPlace(flavor, n))
-    .every((n, i, a) => i === 0 || a[i - 1].pos < n.pos);
+    .every((n, i, a) => i === 0 || a[i - 1].pos! < n.pos!);
   if (mono) {
     const before = order.slice(0, k).reverse().find((n) => canPlace(flavor, n));
     const after = order.slice(k + 1).find((n) => canPlace(flavor, n));
-    const lo = before ? before.pos : null, hi = after ? after.pos : null;
-    let cand = lo === null && hi === null ? 1 : lo === null ? Math.ceil(hi) - 1 : hi === null ? Math.floor(lo) + 1
+    // every placeable entry has a position here (`placed`)
+    const lo = before ? before.pos! : null, hi = after ? after.pos! : null;
+    let cand: number | null = lo === null && hi === null ? 1 : lo === null ? Math.ceil(hi!) - 1 : hi === null ? Math.floor(lo) + 1
       : (Math.floor(lo) + 1 < hi ? Math.floor(lo) + 1 : null);
     // Hugo reads weight 0 as "no weight"; Retype's order 0 is its default
     if (cand !== null && (flavor === 'hugo' || flavor === 'docusaurus' || flavor === 'jtd') && cand < 1) cand = null;
@@ -215,25 +237,29 @@ async function placeAll(w, ctx, flavor, order, moved) {
   }
 }
 
-function locate(menu, at) {
+interface Located { item: MenuItem | null; list: MenuItem[]; index: number; parent: MenuItem | null }
+
+function locate(menu: Menu, at: string | null | undefined): Located | null {
   if (at === null || at === undefined) return { item: null, list: menu.items, index: -1, parent: null };
   const ids = String(at).split('.').map(Number);
-  let list = menu.items, parent = null, item = null;
+  // a missing `items` is caught by the `!item` on the next step
+  let list: MenuItem[] = menu.items, parent: MenuItem | null = null, item: MenuItem | null = null;
   for (let k = 0; k < ids.length; k++) {
     item = list && list[ids[k]];
     if (!item) return null;
-    if (k < ids.length - 1) { parent = item; list = item.items; }
+    if (k < ids.length - 1) { parent = item; list = item.items!; }
   }
   return { item, list, index: ids[ids.length - 1], parent };
 }
 
 // ------------------------------------------------------- front-matter edit
 
-export async function fmEdit(ctx, menu, op) {
+export async function fmEdit(ctx: FileReader, menu: Menu, op: MenuOp): Promise<EditResult> {
   const at = locate(menu, op.at);
   if (!at || !at.item) return { error: 'That entry isn’t there any more.' };
   const it = at.item;
-  const flavor = it.fm;
+  // editMenu only sends entries that have one
+  const flavor = it.fm!;
   const f = FM[flavor];
   const w = writer(ctx);
   try {
@@ -242,7 +268,7 @@ export async function fmEdit(ctx, menu, op) {
       if (!name) return { error: 'A name can’t be empty.' };
       if (flavor === 'jtd') {
         // the title IS the key its children hang from: re-aim them too
-        await w.fm(it.file, 'title', name);
+        await w.fm(it.file!, 'title', name);
         for (const kid of it.items || []) {
           if (kid.file) await w.fm(kid.file, 'parent', name);
           for (const gk of kid.items || []) if (gk.file) await w.fm(gk.file, 'grand_parent', name);
@@ -251,7 +277,7 @@ export async function fmEdit(ctx, menu, op) {
         const cat = (await categoryFile(ctx, it.dir)) || join(it.dir, '_category_.json');
         const text = await w.get(cat);
         if (cat.endsWith('.json')) {
-          let obj = {};
+          let obj: Record<string, Parsed> = {};
           try { obj = text ? JSON.parse(text) : {}; } catch { return { error: cat + ' isn’t valid JSON.' }; }
           obj.label = name;
           await w.put(cat, jsonOut(obj, text));
@@ -283,15 +309,15 @@ export async function fmEdit(ctx, menu, op) {
 
     if (flavor === 'jtd') {
       // a new parent is a front matter edit; then the order among the new siblings
-      let parent, list;
-      if (op.where === 'inside') { parent = to.item; list = to.item.items || []; }
+      let parent: MenuItem | null, list: MenuItem[];
+      if (op.where === 'inside') { parent = to.item; list = to.item!.items || []; }
       else if (!to.item) { parent = null; list = menu.items; }
       else { parent = to.parent; list = to.list; }
       if (parent && !parent.file) return { error: 'Only a page can hold others in Just the Docs.' };
       const grand = parent ? findParent(menu.items, parent) ?? null : null;
       if (parent !== at.parent) {
-        await w.fm(it.file, 'parent', parent ? parent.text : null);
-        await w.fm(it.file, 'grand_parent', grand ? grand.text : null);
+        await w.fm(it.file!, 'parent', parent ? parent.text : null);
+        await w.fm(it.file!, 'grand_parent', grand ? grand.text : null);
         for (const kid of it.items || []) if (kid.file) await w.fm(kid.file, 'grand_parent', parent ? parent.text : null);
       }
       const order = list.filter((n) => n !== it);
@@ -313,12 +339,12 @@ export async function fmEdit(ctx, menu, op) {
     await placeAll(w, ctx, flavor, order, it);
     return { writes: w.out() };
   } catch (e) {
-    return { error: e.message };
+    return { error: (e as Error).message };
   }
 }
 
 // the entry `target` sits under — null at the top, undefined if absent
-function findParent(items, target, parent = null) {
+function findParent(items: MenuItem[] | undefined, target: MenuItem, parent: MenuItem | null = null): MenuItem | null | undefined {
   for (const it of items || []) {
     if (it === target) return parent;
     const p = findParent(it.items, target, it);
@@ -330,7 +356,7 @@ function findParent(items, target, parent = null) {
 // --------------------------------------------------------- meta-file edit
 
 // The meta file a folder's order lives in, per system
-async function metaFileFor(ctx, menu, dir) {
+async function metaFileFor(ctx: FileReader, menu: Menu, dir: string) {
   if (menu.flavor === 'fumadocs') return join(dir, 'meta.json');
   if (menu.flavor === 'rspress') return join(dir, '_meta.json');
   for (const n of ['_meta.json', '_meta.js', '_meta.ts', '_meta.jsx', '_meta.tsx']) {
@@ -341,10 +367,13 @@ async function metaFileFor(ctx, menu, dir) {
   return join(dir, '_meta.' + ext);
 }
 
-export async function metaEdit(ctx, menu, op) {
+// a meta-tree entry: the reader gives every one its MetaRef
+type MetaItem = MenuItem & { meta: MetaRef };
+
+export async function metaEdit(ctx: FileReader, menu: Menu, op: MenuOp): Promise<EditResult> {
   const at = locate(menu, op.at);
   if (!at || !at.item || !at.item.meta) return { error: 'That entry isn’t there any more.' };
-  const it = at.item;
+  const it = at.item as MetaItem;
   const dir = it.meta.dir;
   if (at.list.some((n) => n.meta && n.meta.dir !== dir)) {
     return { error: 'Part of this list is spread in from another folder — edit that folder’s meta file.' };
@@ -360,7 +389,7 @@ export async function metaEdit(ctx, menu, op) {
         if (it.dir) {
           const sub = join(it.dir, 'meta.json');
           const t = await w.get(sub);
-          let obj = {};
+          let obj: Record<string, Parsed> = {};
           try { obj = t ? JSON.parse(t) : {}; } catch { return { error: sub + ' isn’t valid JSON.' }; }
           obj.title = name;
           await w.put(sub, jsonOut(obj, t));
@@ -377,26 +406,26 @@ export async function metaEdit(ctx, menu, op) {
         await w.put(file, jsonOut(arr, text));
         return { writes: w.out() };
       }
-      await w.put(file, nextraSet(text, file, it.meta.key, { title: name }));
+      await w.put(file, nextraSet(text, file, it.meta.key!, { title: name }));
       return { writes: w.out() };
     }
 
     if (op.kind === 'remove') {
       if (menu.flavor === 'fumadocs') {
         const obj = parseObj(text, file);
-        const pages = Array.isArray(obj.pages) ? obj.pages : ['...'];
+        const pages: Parsed[] = Array.isArray(obj.pages) ? obj.pages : ['...'];
         const kept = pages.filter((p) => p !== it.meta.key);
         // a page `...` would bring back gets a `!` — a divider or link just goes
         if (it.kind !== 'sep' && it.kind !== 'link' && (kept.includes('...') || kept.includes('z...a'))) kept.push('!' + it.meta.key);
         obj.pages = kept;
         await w.put(file, jsonOut(obj, text));
       } else if (menu.flavor === 'rspress') {
-        const arr = text ? parseArr(text, file) : at.list.map((n) => n.meta.entry);
+        const arr = text ? parseArr(text, file) : at.list.map((n) => (n as MetaItem).meta.entry);
         const i = entryIndex(arr, it);
         if (i >= 0) arr.splice(i, 1);
         await w.put(file, jsonOut(arr, text));
-      } else if (it.kind === 'sep') await w.put(file, nextraDrop(text, file, it.meta.key));
-      else await w.put(file, nextraSet(text, file, it.meta.key, { display: 'hidden' }, it.text));
+      } else if (it.kind === 'sep') await w.put(file, nextraDrop(text as string, file, it.meta.key!));
+      else await w.put(file, nextraSet(text, file, it.meta.key!, { display: 'hidden' }, it.text));
       return { writes: w.out() };
     }
 
@@ -405,12 +434,12 @@ export async function metaEdit(ctx, menu, op) {
     if (!to || op.where === 'inside' || !to.item || to.list !== at.list) {
       return { error: 'This menu follows the folders — to move a page to another group, move its file in the Project tab.' };
     }
-    const order = at.list.filter((n) => n !== it);
-    order.splice(order.indexOf(to.item) + (op.where === 'after' ? 1 : 0), 0, it);
+    const order = at.list.filter((n) => n !== it) as MetaItem[];
+    order.splice(order.indexOf(to.item as MetaItem) + (op.where === 'after' ? 1 : 0), 0, it);
 
     if (menu.flavor === 'fumadocs') {
       const obj = parseObj(text, file);
-      const old = Array.isArray(obj.pages) ? obj.pages : [];
+      const old: Parsed[] = Array.isArray(obj.pages) ? obj.pages : [];
       const rest = old.find((p) => p === '...' || p === 'z...a');
       const excluded = old.filter((p) => typeof p === 'string' && p.startsWith('!'));
       const keys = order.map((n) => n.meta.key);
@@ -430,31 +459,31 @@ export async function metaEdit(ctx, menu, op) {
     }
     return { writes: w.out() };
   } catch (e) {
-    return { error: e.message };
+    return { error: (e as Error).message };
   }
 }
 
-function parseObj(text, file) {
+function parseObj(text: string | null, file: string): Parsed {
   if (!text) return {};
   try { return JSON.parse(text); } catch { throw new Error(file + ' isn’t valid JSON.'); }
 }
-function parseArr(text, file) {
+function parseArr(text: string | null, file: string): Parsed[] {
   const v = text ? parseObj(text, file) : [];
   if (!Array.isArray(v)) throw new Error(file + ' isn’t a list.');
   return v;
 }
-const entryIndex = (arr, it) => arr.findIndex((e) => (typeof e === 'string' ? e : e && e.name) === it.meta.key
+const entryIndex = (arr: Parsed[], it: MetaItem) => arr.findIndex((e) => (typeof e === 'string' ? e : e && e.name) === it.meta.key
   || JSON.stringify(e) === JSON.stringify(it.meta.entry));
 
 // ------------------------------------------------------------ Nextra _meta
 
-const isJsonMeta = (file) => file.endsWith('.json');
-const q = (s) => "'" + String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
-const keyLit = (k) => (/^[A-Za-z_$][\w$]*$/.test(k) ? k : q(k));
+const isJsonMeta = (file: string) => file.endsWith('.json');
+const q = (s: string) => "'" + String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
+const keyLit = (k: string) => (/^[A-Za-z_$][\w$]*$/.test(k) ? k : q(k));
 
 // Set fields of one key's entry (`title`, `display`); a string entry
 // becomes an object when it needs more than a title.
-function nextraSet(text, file, key, fields, fallbackTitle) {
+function nextraSet(text: string | null, file: string, key: string, fields: Record<string, string>, fallbackTitle?: string): string {
   if (!safeKey(key)) throw new Error('Nib won’t write a key called “' + key + '”.');
   if (!text || isJsonMeta(file)) {
     const obj = parseObj(text, file);
@@ -470,7 +499,7 @@ function nextraSet(text, file, key, fields, fallbackTitle) {
   const toks = tokenizeJS(text);
   const got = findDefaultExport(text, toks);
   if (!got || !got.v || typeof got.v !== 'object' || !got.v.$keys) throw new Error(file + ' builds its menu in code — edit it there.');
-  const k = got.v.$keys.find((x) => x.key === key);
+  const k = got.v.$keys.find((x: KeyInfo) => x.key === key);
   const cur = got.v[key];
   if (!k) {
     // not listed yet: add it at the end
@@ -485,9 +514,9 @@ function nextraSet(text, file, key, fields, fallbackTitle) {
   if (cur && typeof cur === 'object' && cur.$keys) {
     let out = text;
     // last first, so earlier offsets hold
-    const edits = [];
+    const edits: { s: number; e: number; t: string }[] = [];
     for (const [f, v] of Object.entries(fields)) {
-      const fk = cur.$keys.find((x) => x.key === f);
+      const fk = cur.$keys.find((x: KeyInfo) => x.key === f);
       if (fk) edits.push({ s: fk.s, e: fk.e, t: q(v) });
       else edits.push({ s: k.s + 1, e: k.s + 1, t: ' ' + f + ': ' + q(v) + ',' });
     }
@@ -499,44 +528,46 @@ function nextraSet(text, file, key, fields, fallbackTitle) {
 }
 
 // take a key out altogether (a separator has nothing to hide)
-function nextraDrop(text, file, key) {
+// (a separator is listed in the meta file, so the file is there to read)
+function nextraDrop(text: string, file: string, key: string): string {
+
   if (isJsonMeta(file)) {
     const obj = parseObj(text, file);
     delete obj[key];
     return jsonOut(obj, text);
   }
   const got = findDefaultExport(text, tokenizeJS(text));
-  const k = got && got.v && got.v.$keys && got.v.$keys.find((x) => x.key === key);
+  const k = got && got.v && got.v.$keys && got.v.$keys.find((x: KeyInfo) => x.key === key);
   if (!k) return text;
-  const tail = /^\s*,?[ \t]*\n?/.exec(text.slice(k.e))[0];
+  const tail = /^\s*,?[ \t]*\n?/.exec(text.slice(k.e))![0];
   const ls = text.lastIndexOf('\n', k.ks) + 1;
   const own = !text.slice(ls, k.ks).trim() && tail.endsWith('\n');
   return own ? text.slice(0, ls) + text.slice(k.e + tail.length) : text.slice(0, k.ks) + text.slice(k.e + tail.length);
 }
 
-function jsLiteral(obj) {
+function jsLiteral(obj: Record<string, Parsed>) {
   return '{ ' + Object.entries(obj).map(([k, v]) => keyLit(k) + ': ' + (typeof v === 'string' ? q(v) : JSON.stringify(v))).join(', ') + ' }';
 }
 
-function insertProp(text, got, propText) {
-  const keys = got.v.$keys;
+function insertProp(text: string, got: ReadResult, propText: string) {
+  const keys: KeyInfo[] = got.v.$keys;
   if (!keys.length) return text.slice(0, got.s) + '{\n  ' + propText + ',\n}' + text.slice(got.e);
   const last = keys[keys.length - 1];
   const ls = text.lastIndexOf('\n', last.ks) + 1;
-  const pad = /^\s*/.exec(text.slice(ls, last.ks))[0];
+  const pad = /^\s*/.exec(text.slice(ls, last.ks))![0];
   const comma = /^\s*,/.test(text.slice(last.e));
   return text.slice(0, last.e) + (comma ? '' : ',') + '\n' + pad + propText + (comma ? ',' : '') + text.slice(last.e);
 }
 
 // Rewrite the key order: the moved list first, in its new order; then every
 // other key the file had (top-bar pages, hidden ones, '*') as they were.
-function nextraOrder(text, file, order) {
-  const keys = order.map((n) => n.meta.key);
+function nextraOrder(text: string | null, file: string, order: MetaItem[]): string {
+  const keys = order.map((n) => n.meta.key!);
   if (keys.some((k) => !safeKey(k))) throw new Error('Nib won’t write a key called “__proto__”.');
   if (!text || isJsonMeta(file)) {
     const old = parseObj(text, file);
-    const out = {};
-    for (const n of order) out[n.meta.key] = Object.prototype.hasOwnProperty.call(old, n.meta.key) ? old[n.meta.key] : n.text;
+    const out: Record<string, Parsed> = {};
+    for (const n of order) out[n.meta.key!] = Object.prototype.hasOwnProperty.call(old, n.meta.key!) ? old[n.meta.key!] : n.text;
     for (const [k, v] of Object.entries(old)) if (safeKey(k) && !Object.prototype.hasOwnProperty.call(out, k)) out[k] = v;
     if (!text && !isJsonMeta(file)) {
       return 'export default {\n' + Object.entries(out).map(([k, v]) => '  ' + keyLit(k) + ': ' + (typeof v === 'string' ? q(v) : JSON.stringify(v))).join(',\n') + ',\n}\n';
@@ -546,13 +577,14 @@ function nextraOrder(text, file, order) {
   const toks = tokenizeJS(text);
   const got = findDefaultExport(text, toks);
   if (!got || !got.v || !got.v.$keys || got.v.$spread) throw new Error(file + ' builds its menu in code — edit it there.');
-  const props = new Map(got.v.$keys.map((k) => [k.key, text.slice(k.ks, k.e)]));
-  const first = got.v.$keys[0];
+  const props = new Map<string, string>(got.v.$keys.map((k: KeyInfo) => [k.key, text.slice(k.ks, k.e)]));
+  const first: KeyInfo | undefined = got.v.$keys[0];
   const ls = first ? text.lastIndexOf('\n', first.ks) + 1 : got.s;
-  const pad = first ? (/^\s*/.exec(text.slice(ls, first.ks))[0] || '  ') : '  ';
+  const pad = first ? (/^\s*/.exec(text.slice(ls, first.ks))![0] || '  ') : '  ';
   const closePad = pad.slice(0, Math.max(0, pad.length - 2));
-  const ordered = [];
-  for (const n of order) ordered.push(props.get(n.meta.key) ?? (keyLit(n.meta.key) + ': ' + q(n.text)));
+  const ordered: string[] = [];
+  for (const n of order) ordered.push(props.get(n.meta.key!) ?? (keyLit(n.meta.key!) + ': ' + q(n.text)));
+
   for (const [k, p] of props) if (!keys.includes(k)) ordered.push(p);
   return text.slice(0, got.s) + '{\n' + ordered.map((p) => pad + p).join(',\n') + ',\n' + closePad + '}' + text.slice(got.e);
 }

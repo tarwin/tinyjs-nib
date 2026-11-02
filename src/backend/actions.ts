@@ -25,6 +25,156 @@
 
 import { generate, aiConfig, providerConfig, effectivePolicy } from './ai.ts';
 import { buildTools, framePrompt, GUARD } from './aitools.ts';
+import type { ToolsLevel, ApproveLevel, AiConfig, ProviderConfig, Policy, Cancel, Usage, AiEvent } from './ai.ts';
+import type { ApprovalRequest, TidyAction } from './aitools.ts';
+
+export type ActionType = 'cli' | 'js' | 'ai';
+export type ActionScope = 'global' | 'project';
+export type ActionNeeds = 'none' | 'folder' | 'file' | 'selection';
+export type ActionOutput = 'panel' | 'replace' | 'insert' | 'doc' | 'toast' | 'alert' | 'notify' | 'none';
+export type ActionStdin = 'none' | 'doc' | 'selection';
+export type AskType = 'text' | 'multiline' | 'number' | 'choice' | 'file' | 'folder' | 'check';
+
+/** One field of an action's `ask` form. */
+export interface AskField {
+  name: string;
+  label: string;
+  type: AskType;
+  placeholder: string;
+  hint: string;
+  value: string;
+  required: boolean;
+  choices: string[] | null;
+}
+
+/** An action, normalised from its actions file (see normalize). */
+export interface Action {
+  scope: ActionScope;
+  id: string;
+  label: string;
+  type: ActionType;
+  needs: ActionNeeds;
+  match: string[] | null;
+  os: string[] | null;
+  cwd: string | null;
+  env: Record<string, unknown> | null;
+  path: string[] | null;
+  stdin: ActionStdin;
+  output: ActionOutput;
+  confirm: boolean;
+  timeout: number;
+  save: boolean;
+  shell: boolean;
+  icon: string | null;
+  description: string | null;
+  toolbar: boolean;
+  selection: boolean;
+  ask: AskField[] | null;
+  // cli
+  run?: string[];
+  // js
+  script?: string;
+  file?: string;
+  /** a project script file's bytes, read once at load (null: unreadable) */
+  fileSrc?: string | null;
+  // ai
+  prompt?: string;
+  system?: string | null;
+  tools?: ToolsLevel | null;
+  approve?: ApproveLevel | null;
+  temperature?: number;
+  provider?: string | null;
+  model?: string | null;
+  // added by loadActions
+  trusted?: boolean;
+  root?: string | null;
+  hash?: string;
+}
+
+/** What the asking window is looking at (main.ts fills in the folder). */
+export interface ActionCtx {
+  root?: string | null;
+  file?: string | null;
+  text?: string;
+  sel?: string;
+  pin?: string | null;
+  line?: number;
+  col?: number;
+  heading?: string | null;
+  /** the `ask` form's answers */
+  inputs?: Record<string, unknown>;
+}
+
+/** The template variables: {file}, {dir}, {sel}, {dir1}, ask answers… */
+export type Vars = Record<string, string>;
+
+/** The asks a run can make of the person, answered by the page (main.ts aiHostFor). */
+export interface ActionHost {
+  ask?: (req: ApprovalRequest) => Promise<unknown>;
+  promptUser?: (req: { label: string; type: string; value: string; placeholder?: string; choices?: string[] }) => Promise<unknown>;
+  confirmUser?: (req: { question: string; detail: string; ok: string; cancel: string }) => Promise<unknown>;
+  alertUser?: (req: { title: string; body: string }) => Promise<unknown>;
+  pickUser?: (req: { kind: 'file' | 'folder' }) => Promise<unknown>;
+  applyDoc?: (text: string) => Promise<unknown>;
+  addAction?: (action: TidyAction) => Promise<unknown>;
+}
+
+/** Output streams of a run: the child's, a script's log, and Nib's own notes. */
+export type RunStream = 'out' | 'err' | 'log' | 'meta';
+export type Push = (stream: RunStream, text: string) => void;
+
+/** A chunk of a run's output, as pushed to the page. */
+export interface RunChunk {
+  runId: string;
+  stream: RunStream;
+  text: string;
+}
+
+/** How a run ended. */
+export interface RunEnd {
+  ok: boolean;
+  code: number;
+  error?: string | null;
+  signal?: tjs.Signal | null;
+  text?: string | null;
+  usage?: Usage | null;
+  note?: string | null;
+}
+
+export interface RunDone extends RunEnd {
+  runId: string;
+  ms: number;
+  output: string;
+}
+
+export interface RunHandle {
+  runId: string;
+  cwd: string;
+  command: string;
+}
+
+/** What a js or ai action's work comes back with. */
+interface JobResult {
+  text?: string | null;
+  error?: string;
+  usage?: Usage | null;
+  note?: string;
+}
+
+/** A live run, for cancelRun. */
+interface RunRecord {
+  proc?: tjs.Process;
+  cancel?: Cancel;
+  kill(): void;
+  timedOut?: boolean;
+}
+
+/** What actions.json looks like once parsed: an array, or { actions, … }. */
+interface ActionsFile {
+  list: Action[];
+  problems: string[];
+  config?: Record<string, unknown>;
+}
 
 const dec = new TextDecoder();
 const enc = new TextEncoder();
@@ -61,10 +211,10 @@ const EXTRA_PATH = () => {
   ];
 };
 
-const base = (p) => p.split(/[\\/]/).pop();
-const dirOf = (p) => p.replace(/[\\/][^\\/]*$/, '') || '/';
-const stemOf = (p) => base(p).replace(/\.[^.]+$/, '');
-const extOf = (p) => (/\.([^.\\/]+)$/.exec(base(p)) || [null, ''])[1];
+const base = (p: string) => p.split(/[\\/]/).pop()!;
+const dirOf = (p: string) => p.replace(/[\\/][^\\/]*$/, '') || '/';
+const stemOf = (p: string) => base(p).replace(/\.[^.]+$/, '');
+const extOf = (p: string) => (/\.([^.\\/]+)$/.exec(base(p)) || [null, ''])[1];
 
 // ---------------------------------------------------------------- loading
 
@@ -72,15 +222,17 @@ const extOf = (p) => (/\.([^.\\/]+)$/.exec(base(p)) || [null, ''])[1];
 // once, so nothing downstream has to ask whether `run` is really an array.
 // Dropped ones come back as `problems` — an action that silently isn't there
 // is worse than one that says why.
-function normalize(raw, i, scope, problems) {
+// `raw` is one entry of a hand-written JSON file: anything at all, which is
+// what this function is for.
+function normalize(raw: any, i: number, scope: ActionScope, problems: string[]): Action | null {
   const where = raw && raw.label ? `“${raw.label}”` : `#${i + 1}`;
-  const bad = (why) => { problems.push(`${where}: ${why}`); return null; };
+  const bad = (why: string) => { problems.push(`${where}: ${why}`); return null; };
   if (!raw || typeof raw !== 'object') return bad('not an object');
 
   const type = raw.type || 'cli';
   if (!ACTION_TYPES.has(type)) return bad(`unknown type “${type}”`);
 
-  const a = {
+  const a: Action = {
     scope,
     id: String(raw.id || raw.label || '').trim() || 'action-' + (i + 1),
     label: String(raw.label || raw.id || 'Action').trim(),
@@ -229,10 +381,10 @@ const LOADER_ENV = new RegExp('^(' + [
 // something `{...}` can actually address, and a name that would collide with a
 // built-in variable ({file}, {sel}, …) is refused rather than silently losing
 // to it — a form field that does nothing is a bad afternoon.
-function normalizeAsk(raw, where, problems) {
+function normalizeAsk(raw: any, where: string, problems: string[]): AskField[] | null {
   if (!raw) return null;
-  const list = [].concat(raw);
-  const out = [];
+  const list: any[] = [].concat(raw);
+  const out: AskField[] = [];
   const taken = new Set(RESERVED_VARS);
   list.forEach((one, i) => {
     const o = typeof one === 'string' ? { label: one } : (one || {});
@@ -266,7 +418,8 @@ const RESERVED_VARS = ['file', 'dir', 'root', 'rel', 'name', 'stem', 'ext', 'doc
 // survive the way they do in every other editor's config. Strings are walked
 // rather than regexed past, because a `//` inside a URL is not a comment and
 // finding that out from a broken build would be a miserable afternoon.
-export function parseJsonc(text) {
+// The result is whatever the file holds.
+export function parseJsonc(text: string): any {
   let out = '';
   for (let i = 0; i < text.length; i++) {
     const c = text[i], d = text[i + 1];
@@ -286,20 +439,20 @@ export function parseJsonc(text) {
   return JSON.parse(out.replace(/,(\s*[}\]])/g, '$1'));   // and a trailing comma is forgiven
 }
 
-async function readActionsFile(path, scope) {
+async function readActionsFile(path: string, scope: ActionScope): Promise<ActionsFile> {
   let raw;
   try { raw = parseJsonc(dec.decode(await tjs.readFile(path))); }
   catch (e) {
     // ENOENT is the normal case — most folders have no actions
-    if (/no such file|ENOENT/i.test(e.message || '')) return { list: [], problems: [] };
-    return { list: [], problems: ['couldn’t read ' + base(path) + ': ' + e.message] };
+    if (/no such file|ENOENT/i.test((e as Error).message || '')) return { list: [], problems: [] };
+    return { list: [], problems: ['couldn’t read ' + base(path) + ': ' + (e as Error).message] };
   }
   const arr = Array.isArray(raw) ? raw : Array.isArray(raw.actions) ? raw.actions : [];
-  const problems = [];
-  const list = arr.map((r, i) => normalize(r, i, scope, problems)).filter(Boolean);
+  const problems: string[] = [];
+  const list = arr.map((r: unknown, i: number) => normalize(r, i, scope, problems)).filter(Boolean) as Action[];
   // two actions with one id would make a trust grant ambiguous; last wins, and
   // the shadowed one says so
-  const seen = new Map();
+  const seen = new Map<string, Action>();
   for (const a of list) {
     if (seen.has(a.id)) problems.push(`duplicate id “${a.id}” — the later one wins`);
     seen.set(a.id, a);
@@ -307,8 +460,8 @@ async function readActionsFile(path, scope) {
   return { list: [...seen.values()], problems, config: Array.isArray(raw) ? {} : raw };
 }
 
-export const globalActionsPath = async (app) => (await app.paths()).data + '/actions.json';
-export const projectActionsPath = (root) => root + '/.nib/actions.json';
+export const globalActionsPath = async (app: TinyApp): Promise<string> => (await app.paths()).data + '/actions.json';
+export const projectActionsPath = (root: string): string => root + '/.nib/actions.json';
 
 // What Actions ▸ Edit… writes when there is no file yet. It is the whole
 // documentation of the format, in the place you will be standing when you
@@ -422,20 +575,20 @@ export const STARTER_PROJECT = `{
 // is inside the app's own data directory, which nothing but the person using
 // the app can write; asking them to approve their own file would train them to
 // click through the prompt that matters.
-export async function loadActions(app, root, allowProject) {
+export async function loadActions(app: TinyApp, root: string | null | undefined, allowProject: boolean): Promise<{ list: Action[]; problems: string[] }> {
   const g = await readActionsFile(await globalActionsPath(app), 'global');
   const p = root && allowProject
     ? await readActionsFile(projectActionsPath(root), 'project')
     : { list: [], problems: [] };
 
-  const out = [];
+  const out: Action[] = [];
   for (const a of g.list) out.push({ ...a, trusted: true, hash: await hashAction(a) });
   for (const a of p.list) {
     // A script FILE is snapshotted here and that snapshot is what gets hashed
     // and what runs: approving `"file": "tools/fmt.js"` approves those bytes,
     // not whatever a later `git pull` puts at that path.
     if (a.type === 'js' && !a.script && a.file) {
-      try { a.fileSrc = dec.decode(await tjs.readFile(isAbs(a.file) ? a.file : join(root, a.file))); }
+      try { a.fileSrc = dec.decode(await tjs.readFile(isAbs(a.file) ? a.file : join(root!, a.file))); }
       catch { a.fileSrc = null; }
     }
     out.push({ ...a, root, hash: await hashAction(a) });
@@ -450,7 +603,7 @@ export async function loadActions(app, root, allowProject) {
 // What the trust grant is pinned to: everything that decides what the action
 // DOES. Label and cosmetics are left out on purpose — renaming a button
 // shouldn't ask you to approve it again; changing its command must.
-export async function hashAction(a) {
+export async function hashAction(a: Action): Promise<string> {
   const material = JSON.stringify([a.type, a.run || null, a.shell, a.script || null,
     a.file || null, a.fileSrc ?? null, a.cwd, a.env, a.path, a.stdin, a.output,
     // an AI action's command IS its prompt — edit the prompt and the approval
@@ -465,12 +618,12 @@ export async function hashAction(a) {
 // Whether this action can run right now, and if not, in one word why — the
 // menu greys the row and puts the reason in its tooltip rather than hiding it,
 // because a button that vanishes teaches nothing.
-export function availability(a, ctx) {
+export function availability(a: Action, ctx: ActionCtx): string | null {
   if (a.os && !a.os.includes(OS())) return 'not for ' + OS();
   if (a.needs === 'folder' && !ctx.root) return 'needs a folder';
   if ((a.needs === 'file' || a.match) && !ctx.file) return 'needs a saved file';
   if (a.needs === 'selection' && !ctx.sel) return 'needs a selection';
-  if (a.match && ctx.file && !a.match.some((g) => globMatch(g, ctx.file, ctx.root))) {
+  if (a.match && ctx.file && !a.match.some((g) => globMatch(g, ctx.file!, ctx.root))) {
     return 'not for this file';
   }
   return null;
@@ -479,7 +632,7 @@ export function availability(a, ctx) {
 // Enough glob for what a match line is ever asked to say: *.md, docs/**,
 // **/*.png, README.md. Matched against the path relative to the folder when
 // there is one, and against the bare name either way.
-function globMatch(pattern, file, root) {
+function globMatch(pattern: string, file: string, root: string | null | undefined): boolean {
   const rel = root && file.startsWith(root + '/') ? file.slice(root.length + 1) : base(file);
   // one pass, so a `**` can't be re-read by a later replace: each token is
   // either a wildcard or a literal run that gets escaped
@@ -502,14 +655,14 @@ function globMatch(pattern, file, root) {
 // a command means by a directory. The counted folder NAMES are {dir1},
 // {dir2}… as before.
 
-export function vars(ctx) {
+export function vars(ctx: ActionCtx): Vars {
   const file = ctx.file || '';
   const root = ctx.root || (file ? dirOf(file) : '');
   const dir = file ? dirOf(file) : root;
   const rel = file && root && file.startsWith(root + '/') ? file.slice(root.length + 1) : base(file);
   const now = new Date();
-  const two = (n) => String(n).padStart(2, '0');
-  const v = {
+  const two = (n: number) => String(n).padStart(2, '0');
+  const v: Vars = {
     file, dir, root, rel,
     name: base(file), stem: stemOf(file), ext: extOf(file),
     doc: stemOf(file),                       // what the image templates call it
@@ -540,9 +693,9 @@ export function vars(ctx) {
 
 // {{ is a literal brace; an unknown variable expands to nothing, which is what
 // the naming templates do and what a shell would do with $NOPE.
-export function expand(s, v) {
+export function expand(s: string, v: Vars): string {
   if (typeof s !== 'string') return s;
-  return s.replace(/\{\{|\}\}|\{(\w+)\}/g, (m, k) =>
+  return s.replace(/\{\{|\}\}|\{(\w+)\}/g, (m, k: string) =>
     m === '{{' ? '{' : m === '}}' ? '}' : (v[k] !== undefined ? v[k] : ''));
 }
 
@@ -560,10 +713,10 @@ export function expand(s, v) {
 // cmd.exe gets the same with delayed expansion (`/v:on`, !NIB_V_file!), which
 // also happens after parsing — %VAR% would not, it is textual. A value with a
 // " in it is still refused there: see below.
-export function shellLine(s, v, win = OS() === 'windows') {
-  let line = '', q = null, esc = false;
-  const outer = [];                  // the quote state each open $( returns to
-  const vals = {};
+export function shellLine(s: string, v: Vars, win = OS() === 'windows'): { line: string; vals: Record<string, string> } {
+  let line = '', q: string | null | undefined = null, esc = false;
+  const outer: (string | null | undefined)[] = [];   // the quote state each open $( returns to
+  const vals: Record<string, string> = {};
   for (let i = 0; i < s.length; i++) {
     const m = /^(?:\{\{|\}\}|\{(\w+)\})/.exec(s.slice(i, i + 64));
     if (m) {
@@ -608,21 +761,21 @@ export function shellLine(s, v, win = OS() === 'windows') {
 // The command line a cli action runs, plus the variables a shell line refers
 // to — shared by the run and the approval sheet, so what you approve is
 // character for character what runs.
-function commandFor(a, v) {
-  if (!a.shell) return { argv: a.run.map((s) => expand(s, v)), vals: {} };
-  const { line, vals } = shellLine(a.run.join(' '), v);
+function commandFor(a: Action, v: Vars): { argv: string[]; vals: Record<string, string> } {
+  if (!a.shell) return { argv: a.run!.map((s) => expand(s, v)), vals: {} };
+  const { line, vals } = shellLine(a.run!.join(' '), v);
   return { argv: [line], vals };
 }
 
 // ---------------------------------------------------------------- running
 
-const runs = new Map();          // runId -> { proc, cancel, win }
+const runs = new Map<string, RunRecord>();          // runId -> { proc, cancel, win }
 let runSeq = 0;
 
-const isAbs = (p) => /^([a-zA-Z]:[\\/]|[\\/])/.test(p);
-const join = (a, b) => (isAbs(b) ? b : (a.replace(/[\\/]$/, '') + '/' + b));
+const isAbs = (p: string) => /^([a-zA-Z]:[\\/]|[\\/])/.test(p);
+const join = (a: string, b: string) => (isAbs(b) ? b : (a.replace(/[\\/]$/, '') + '/' + b));
 
-async function isExec(p) {
+async function isExec(p: string): Promise<boolean> {
   try {
     const st = await tjs.stat(p);
     return !st.isDirectory && (OS() === 'windows' || (st.mode & 0o111) !== 0);
@@ -636,7 +789,7 @@ async function isExec(p) {
 // An action's own `path` normally wins over yours (that's how it picks the
 // repo's node_modules/.bin). A folder's action gets it AFTER yours instead:
 // otherwise a cloned repo's ./bin/git is what an approved `git …` runs.
-export async function whichBin(cmd, extraPath, extraFirst = true) {
+export async function whichBin(cmd: string, extraPath?: string[] | null, extraFirst = true): Promise<string | null> {
   if (!cmd) return null;
   if (cmd.includes('/') || cmd.includes('\\')) return (await isExec(cmd)) ? cmd : null;
   const sys = (tjs.env.PATH || '').split(OS() === 'windows' ? ';' : ':');
@@ -652,8 +805,8 @@ export async function whichBin(cmd, extraPath, extraFirst = true) {
   return null;
 }
 
-function childEnv(a, v, vals) {
-  const env = { ...tjs.env };
+function childEnv(a: Action, v: Vars, vals?: Record<string, string>): Record<string, string> {
+  const env: Record<string, string> = { ...tjs.env };
   const sep = OS() === 'windows' ? ';' : ':';
   const extra = [...(a.path || []).map((p) => expand(p, v)), ...EXTRA_PATH()];
   const have = new Set((env.PATH || '').split(sep));
@@ -667,7 +820,7 @@ function childEnv(a, v, vals) {
 // One place decides where a command runs: what the action said, expanded, or
 // the closest pinned folder above the document, or the folder, or — with no
 // folder at all — the document's own directory. A loose file is still a place.
-function cwdFor(a, v) {
+function cwdFor(a: Action, v: Vars): string {
   const want = a.cwd ? expand(a.cwd, v) : (v.pin || v.root || v.dir);
   return want && want !== '' ? want : (v.dir || tjs.homeDir);
 }
@@ -675,27 +828,29 @@ function cwdFor(a, v) {
 // A run is a handle, not a promise the caller waits on: the api call returns
 // the id at once and the output arrives as pushes, so a five-minute build and
 // a 40ms formatter are the same shape and neither can time the bridge out.
-export async function startRun(app, a, ctx, { onChunk, onDone, aiHost }) {
+export async function startRun(app: TinyApp, a: Action, ctx: ActionCtx, { onChunk, onDone, aiHost }: {
+  onChunk: (p: RunChunk) => void; onDone: (p: RunDone) => void; aiHost?: ActionHost;
+}): Promise<RunHandle> {
   const id = 'r' + (++runSeq);
   const v = vars(ctx);
   const cwd = cwdFor(a, v);
   const started = Date.now();
   let out = '';
   const CAP = 2 * 1024 * 1024;               // a runaway `yes` shouldn't eat the app
-  const push = (stream, text) => {
+  const push: Push = (stream, text) => {
     if (out.length < CAP) out += text;
     onChunk({ runId: id, stream, text });
   };
 
-  const finish = (r) => {
+  const finish = (r: RunEnd) => {
     runs.delete(id);
     if (tmpIn) tjs.remove(tmpIn).catch(() => { /* it was a temp file */ });
     onDone({ runId: id, ms: Date.now() - started, output: out, ...r });
   };
-  let tmpIn = null;                          // set below if this run has stdin
+  let tmpIn: string | null = null;           // set below if this run has stdin
 
   if (a.type === 'js' || a.type === 'ai') {
-    const cancel = { stopped: false };
+    const cancel: Cancel = { stopped: false };
     runs.set(id, { cancel, kill: () => { cancel.stopped = true; } });
     const work = a.type === 'js'
       ? runJs(app, a, ctx, v, cwd, push, cancel, aiHost)
@@ -707,7 +862,7 @@ export async function startRun(app, a, ctx, { onChunk, onDone, aiHost }) {
     // the drawer's "$ …" line: for an AI action the prompt IS the command,
     // so its first line is what belongs there
     return { runId: id, cwd,
-      command: a.type === 'ai' ? expand(a.prompt, v).split('\n')[0].slice(0, 120) : a.label };
+      command: a.type === 'ai' ? expand(a.prompt!, v).split('\n')[0].slice(0, 120) : a.label };
   }
 
   // A per-platform action with no block for this one: the menus grey it out,
@@ -716,10 +871,10 @@ export async function startRun(app, a, ctx, { onChunk, onDone, aiHost }) {
     finish({ ok: false, code: 1, error: 'no command for ' + OS() });
     return { runId: id, command: a.label, cwd };
   }
-  let argv, vals;
+  let argv: string[], vals: Record<string, string>;
   try { ({ argv, vals } = commandFor(a, v)); }
   catch (e) {
-    finish({ ok: false, code: 1, error: e.message });
+    finish({ ok: false, code: 1, error: (e as Error).message });
     return { runId: id, command: a.label, cwd };
   }
   let spawnArgs = argv;
@@ -757,7 +912,7 @@ export async function startRun(app, a, ctx, { onChunk, onDone, aiHost }) {
         ? ['cmd', '/c', spawnArgs.map((s) => '"' + s + '"').join(' ') + ' < "' + tmpIn + '"']
         : ['/bin/sh', '-c', 'exec "$@" < "$0"', tmpIn, ...spawnArgs];
     } catch (e) {
-      finish({ ok: false, code: 1, error: 'couldn’t stage stdin: ' + e.message });
+      finish({ ok: false, code: 1, error: 'couldn’t stage stdin: ' + (e as Error).message });
       return { runId: id, command: argv.join(' '), cwd };
     }
   }
@@ -778,7 +933,7 @@ export async function startRun(app, a, ctx, { onChunk, onDone, aiHost }) {
   if (OS() === 'windows' && !a.shell) {
     const target = await whichBin(argv[0], (a.path || []).map((p) => expand(p, v)), a.scope !== 'project');
     const plain = target && target.replace(/(::\$DATA)?[. ]*$/i, '');
-    if (target && !/\.(exe|com)$/i.test(plain)) {
+    if (target && !/\.(exe|com)$/i.test(plain as string)) {
       const badArg = argv.slice(1).find((s) => /["&|<>^%!()\r\n]/.test(s));
       if (badArg !== undefined) {
         finish({ ok: false, code: 1, error: 'an argument to ' + argv[0] + ' contains one of " & | < > ^ % ! ( ) '
@@ -788,13 +943,13 @@ export async function startRun(app, a, ctx, { onChunk, onDone, aiHost }) {
     }
   }
 
-  let proc;
+  let proc: tjs.Process;
   try {
     proc = tjs.spawn([bin, ...spawnArgs.slice(1)], {
       cwd, env, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore',
     });
   } catch (e) {
-    finish({ ok: false, code: 127, error: e.message });
+    finish({ ok: false, code: 127, error: (e as Error).message });
     return { runId: id, command: argv.join(' '), cwd };
   }
 
@@ -804,7 +959,7 @@ export async function startRun(app, a, ctx, { onChunk, onDone, aiHost }) {
   }, a.timeout);
   runs.set(id, { proc, kill: () => { try { proc.kill(); } catch { /* gone */ } } });
 
-  const pump = async (stream, tag) => {
+  const pump = async (stream: ReadableStream<Uint8Array>, tag: RunStream) => {
     const rd = stream.getReader();
     for (;;) {
       const { done, value } = await rd.read();
@@ -812,11 +967,11 @@ export async function startRun(app, a, ctx, { onChunk, onDone, aiHost }) {
       push(tag, dec.decode(value));
     }
   };
-  Promise.all([pump(proc.stdout, 'out').catch(() => {}), pump(proc.stderr, 'err').catch(() => {})])
+  Promise.all([pump(proc.stdout!, 'out').catch(() => {}), pump(proc.stderr!, 'err').catch(() => {})])
     .then(() => proc.wait())
     .then((st) => {
       clearTimeout(timer);
-      const rec = runs.get(id) || {};
+      const rec: Partial<RunRecord> = runs.get(id) || {};
       const killed = !!st.term_signal;
       finish({
         ok: !killed && st.exit_status === 0,
@@ -830,7 +985,7 @@ export async function startRun(app, a, ctx, { onChunk, onDone, aiHost }) {
   return { runId: id, command: argv.join(' '), cwd };
 }
 
-export function cancelRun(runId) {
+export function cancelRun(runId: string): boolean {
   const r = runs.get(runId);
   if (!r) return false;
   r.kill();
@@ -846,7 +1001,8 @@ export function cancelRun(runId) {
 // QuickJS can't preempt itself. The timeout below can end a script that is
 // WAITING; it cannot end one that is spinning. That is exactly why project
 // actions need approval before they get here.
-async function runJs(app, a, ctx, v, cwd, push, cancel, host) {
+async function runJs(app: TinyApp, a: Action, ctx: ActionCtx, v: Vars, cwd: string, push: Push,
+  cancel: Cancel, host?: ActionHost): Promise<JobResult> {
   let src = a.script;
   if (!src && a.file && a.scope === 'project') {
     // the bytes that were hashed and approved, never a fresh read
@@ -856,19 +1012,19 @@ async function runJs(app, a, ctx, v, cwd, push, cancel, host) {
     const p = isAbs(a.file) ? a.file : join(v.root || cwd, a.file);
     src = dec.decode(await tjs.readFile(p));
   }
-  return runJsBody(app, a, src, jsApi(app, a, ctx, v, cwd, push, host), push, cancel);
+  return runJsBody(app, a, src!, jsApi(app, a, ctx, v, cwd, push, host), push, cancel);
 }
 
 // The harness itself, lifted out of runJs because the AI's `run_js` tool hands
 // a model the very same one — same helpers, same cwd, same PATH. Two ways in,
 // one thing to reason about.
-export function jsApi(app, a, ctx, v, cwd, push, host) {
-  const resolve = (p) => (isAbs(p) ? p : join(cwd, p));
+export function jsApi(app: TinyApp, a: Action, ctx: ActionCtx, v: Vars, cwd: string, push: Push, host?: ActionHost) {
+  const resolve = (p: string) => (isAbs(p) ? p : join(cwd, p));
   // Time spent waiting on the person is nobody's timeout: a prompt left up
   // over lunch must not fail the action at the 120s mark. The tally is read
   // by runJsBody's guard, which extends its patience by exactly this much.
-  const waited = { ms: 0, live: [] };
-  const attended = async (work) => {
+  const waited: { ms: number; live: number[] } = { ms: 0, live: [] };
+  const attended = async <T>(work: Promise<T>): Promise<T> => {
     const t0 = Date.now();
     waited.live.push(t0);           // counted while STILL waiting — the guard
     try { return await work; }      // must not fire in the middle of a prompt
@@ -884,48 +1040,48 @@ export function jsApi(app, a, ctx, v, cwd, push, host) {
     text: ctx.text || '',
     cwd,
     os: OS(),
-    read: async (p) => dec.decode(await tjs.readFile(resolve(p))),
-    write: async (p, s) => tjs.writeFile(resolve(p), enc.encode(String(s))),
-    exists: async (p) => { try { await tjs.stat(resolve(p)); return true; } catch { return false; } },
-    list: async (p) => {
-      const out = [];
+    read: async (p: string) => dec.decode(await tjs.readFile(resolve(p))),
+    write: async (p: string, s: unknown) => tjs.writeFile(resolve(p), enc.encode(String(s))),
+    exists: async (p: string) => { try { await tjs.stat(resolve(p)); return true; } catch { return false; } },
+    list: async (p?: string) => {
+      const out: string[] = [];
       for await (const e of await tjs.readDir(resolve(p || '.'))) out.push(e.name);
       return out;
     },
-    mkdir: (p) => tjs.makeDir(resolve(p), { recursive: true }),
-    remove: (p) => tjs.remove(resolve(p)),
+    mkdir: (p: string) => tjs.makeDir(resolve(p), { recursive: true }),
+    remove: (p: string) => tjs.remove(resolve(p)),
     // named so they can't collide with the VARIABLES above — ctx.stem is the
     // open file's stem, ctx.stemname() is the function that made it
     join, resolve, basename: base, dirname: dirOf, stemname: stemOf, extname: extOf,
     // its own stream, not 'out': log means "show the person this", so the
     // drawer opens for it even when the output mode keeps the drawer shut —
     // a returned result stays 'out' and doesn't
-    log: (...args) => push('log', args.map((x) =>
+    log: (...args: unknown[]) => push('log', args.map((x) =>
       typeof x === 'string' ? x : JSON.stringify(x)).join(' ') + '\n'),
     // shelling out from a script, without re-implementing spawn each time
-    run: async (argv, opts = {}) => {
+    run: async (argv: string | string[], opts: { cwd?: string } = {}) => {
       const cmd = typeof argv === 'string' ? ['/bin/sh', '-c', argv] : argv;
       const bin = await whichBin(cmd[0], []);
       if (!bin) throw new Error(cmd[0] + ': command not found');
       const p = tjs.spawn([bin, ...cmd.slice(1)],
         { cwd: opts.cwd ? resolve(opts.cwd) : cwd, env: childEnv(a, v), stdout: 'pipe', stderr: 'pipe' });
-      const read = async (s) => {
+      const read = async (s: ReadableStream<Uint8Array>) => {
         const rd = s.getReader(); let t = '';
         for (;;) { const { done, value } = await rd.read(); if (done) return t; t += dec.decode(value); }
       };
-      const [o, e] = await Promise.all([read(p.stdout), read(p.stderr)]);
+      const [o, e] = await Promise.all([read(p.stdout!), read(p.stderr!)]);
       const st = await p.wait();
       return { code: st.exit_status, out: o, err: e, ok: st.exit_status === 0 };
     },
-    fetch: (...args) => fetch(...args),
-    notify: (title, body) => app.notify(title || 'Nib', body || '', { sound: false }),
+    fetch: (...args: Parameters<typeof fetch>) => fetch(...args),
+    notify: (title?: string, body?: string) => app.notify(title || 'Nib', body || '', { sound: false }),
     // ---- talking to the person mid-run. The window's own sheets do the
     // drawing (main.ts aiHostFor pushes, the page answers); the script parks
     // on the promise. No window, or no answer inside the backend's patience,
     // and these resolve like a cancel rather than hanging the run.
-    prompt: async (label, opts = {}) => {
+    prompt: async (label?: unknown, opts: { type?: string; default?: unknown; placeholder?: unknown } = {}) => {
       if (!host || !host.promptUser) return null;
-      const type = ['text', 'multiline', 'number'].includes(opts.type) ? opts.type : 'text';
+      const type = ['text', 'multiline', 'number'].includes(opts.type!) ? opts.type! : 'text';
       const r = await attended(host.promptUser({
         label: String(label ?? 'Value'), type,
         value: opts.default !== undefined ? String(opts.default) : '',
@@ -938,7 +1094,7 @@ export function jsApi(app, a, ctx, v, cwd, push, host) {
       }
       return String(r);
     },
-    confirm: async (question, opts = {}) => {
+    confirm: async (question?: unknown, opts: { detail?: unknown; ok?: unknown; cancel?: unknown } = {}) => {
       if (!host || !host.confirmUser) return false;
       return (await attended(host.confirmUser({
         question: String(question ?? 'Continue?'),
@@ -946,7 +1102,7 @@ export function jsApi(app, a, ctx, v, cwd, push, host) {
         ok: opts.ok ? String(opts.ok) : '', cancel: opts.cancel ? String(opts.cancel) : '',
       }))) === true;
     },
-    alert: async (body, title) => {
+    alert: async (body?: unknown, title?: unknown) => {
       if (!host || !host.alertUser) return;
       await attended(host.alertUser({
         title: title !== undefined ? String(title) : (a.label || 'Nib'),
@@ -955,8 +1111,8 @@ export function jsApi(app, a, ctx, v, cwd, push, host) {
     },
     // …and the rest of what an `ask` form can ask, callable: one of a list,
     // a file, a folder. All null on cancel, like prompt.
-    choose: async (label, choices, opts = {}) => {
-      const list = [].concat(choices || []).map(String).filter(Boolean);
+    choose: async (label?: unknown, choices?: unknown, opts: { default?: unknown } = {}) => {
+      const list = ([] as unknown[]).concat(choices || []).map(String).filter(Boolean);
       if (!host || !host.promptUser || !list.length) return null;
       const r = await attended(host.promptUser({
         label: String(label ?? 'Pick one'), type: 'choice', choices: list,
@@ -977,34 +1133,40 @@ export function jsApi(app, a, ctx, v, cwd, push, host) {
   };
 }
 
+/** The `ctx` a js action (and the AI's run_js) gets. */
+export type JsApi = ReturnType<typeof jsApi>;
+
 // The one wrapper both the runner and the save-time check compile: the
 // script is this function's body, which is why top-level `return` and
 // `await` mean what they look like.
-const compileJs = (src) => new Function('ctx', 'tiny',
+const compileJs = (src: string) => new Function('ctx', 'tiny',
   '"use strict"; return (async () => {\n' + src + '\n})();');
 
 // Does it parse? Compiled by the engine that will RUN it, never executed —
 // so what Manage Actions vets at save time is exactly what pressing the
 // button gets. The wrapper puts one line above the script; any line number
 // the engine reports is shifted back up before a person sees it.
-export function checkJsSyntax(src) {
+type EngineError = Error & { lineNumber?: number };
+
+export function checkJsSyntax(src: string): { message: string; line: number | null } | null {
   try {
     compileJs(src);
     return null;
   } catch (e) {
-    const stack = /(?:<anonymous>|<input>|eval[^:\n]*):(\d+)/.exec(e.stack || '');
-    const said = /\(line (\d+)\)|line (\d+)/i.exec(e.message || '');
-    const raw = typeof e.lineNumber === 'number' ? e.lineNumber
+    // an engine's SyntaxError (QuickJS adds lineNumber)
+    const stack = /(?:<anonymous>|<input>|eval[^:\n]*):(\d+)/.exec((e as EngineError).stack || '');
+    const said = /\(line (\d+)\)|line (\d+)/i.exec((e as EngineError).message || '');
+    const raw = typeof (e as EngineError).lineNumber === 'number' ? (e as EngineError).lineNumber!
       : stack ? +stack[1] : said ? +(said[1] || said[2]) : null;
-    return { message: e.message || String(e), line: raw && raw > 1 ? raw - 1 : null };
+    return { message: (e as EngineError).message || String(e), line: raw && raw > 1 ? raw - 1 : null };
   }
 }
 
-async function runJsBody(app, a, src, api, push, cancel) {
+async function runJsBody(app: TinyApp, a: Action, src: string, api: JsApi, push: Push, cancel: Cancel): Promise<JobResult> {
   const fn = compileJs(src);
   const work = (async () => {
     const r = await fn(api, api);
-    if (r === undefined || r === null) return { text: null };
+    if (r === undefined || r === null) return { text: null } as JobResult;
     if (typeof r === 'string') return { text: r };
     if (typeof r === 'object' && typeof r.text === 'string') return { text: r.text };
     return { text: JSON.stringify(r, null, 2) };
@@ -1014,8 +1176,8 @@ async function runJsBody(app, a, src, api, push, cancel) {
   // long the script spent waiting on the person (api.__waited, tallied by
   // jsApi), so the timeout stays a measure of the script, not the reader.
   const started = Date.now();
-  let timer = null;
-  const guard = new Promise((_, rej) => {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const guard = new Promise<never>((_, rej) => {
     const arm = () => {
       const now = Date.now();
       const w = api.__waited;
@@ -1032,10 +1194,10 @@ async function runJsBody(app, a, src, api, push, cancel) {
     if (r.text) push('out', r.text.endsWith('\n') ? r.text : r.text + '\n');
     return r;
   } catch (e) {
-    push('err', String(e && e.stack ? e.stack : e) + '\n');
-    return { error: e.message || String(e) };
+    push('err', String(e && (e as Error).stack ? (e as Error).stack : e) + '\n');
+    return { error: (e as Error).message || String(e) };
   } finally {
-    clearTimeout(timer);
+    clearTimeout(timer!);
   }
 }
 
@@ -1058,7 +1220,7 @@ async function runJsBody(app, a, src, api, push, cancel) {
 // run must not be able to disagree: a sheet that read `a.tools` said "may
 // read files in this folder" for an action that, saying nothing, inherited
 // your full-and-never.
-export async function aiPolicy(app, a) {
+export async function aiPolicy(app: TinyApp, a: Action): Promise<{ cfg: AiConfig; pconf: ProviderConfig | null; policy: Policy }> {
   const cfg = await aiConfig(app);
   const pconf = await providerConfig(app, a.provider || cfg.provider);
   const policy = effectivePolicy({
@@ -1070,7 +1232,8 @@ export async function aiPolicy(app, a) {
   return { cfg, pconf, policy };
 }
 
-async function runAi(app, a, ctx, v, cwd, push, cancel, host = {}) {
+async function runAi(app: TinyApp, a: Action, ctx: ActionCtx, v: Vars, cwd: string, push: Push,
+  cancel: Cancel, host: ActionHost = {}): Promise<JobResult> {
   const { cfg, pconf, policy } = await aiPolicy(app, a);
   if (!cfg.enabled) {
     return { error: 'AI is off — turn it on in Actions ▸ AI Settings…' };
@@ -1088,16 +1251,16 @@ async function runAi(app, a, ctx, v, cwd, push, cancel, host = {}) {
     file: v.file || null,
     text: ctx.text || '',
     cwd,
-    log: (s) => push('meta', s),
+    log: (s: string) => push('meta', s),
     ask: host.ask || (async () => false),
     applyDoc: host.applyDoc || null,
     addAction: host.addAction || null,
-    spawn: (command) => api.run(command),
+    spawn: (command: string) => api.run(command),
     jsApi: () => api,
   }, { tier, approve: policy.approve });
 
   const prompt = framePrompt({
-    prompt: expand(a.prompt, v),
+    prompt: expand(a.prompt!, v),
     text: a.stdin === 'doc' ? (ctx.text || '') : '',
     sel: a.stdin === 'selection' ? (ctx.sel || '') : '',
     file: v.file || null,
@@ -1115,8 +1278,8 @@ async function runAi(app, a, ctx, v, cwd, push, cancel, host = {}) {
       tools,
       temperature: a.temperature,
       cancel,
-      onDelta: (d) => { text += d; push('out', d); },
-      onEvent: (e) => {
+      onDelta: (d: string) => { text += d; push('out', d); },
+      onEvent: (e: AiEvent) => {
         if (e.type === 'tool') {
           push('meta', '⟶ ' + e.name + ' '
             + JSON.stringify(e.args || {}).slice(0, 160) + '\n');
@@ -1136,14 +1299,14 @@ async function runAi(app, a, ctx, v, cwd, push, cancel, host = {}) {
     return { text: answer.replace(/\s+$/, ''), usage: r.usage || null, note };
   } catch (e) {
     if (cancel.stopped) return { error: 'stopped' };
-    push('err', (e.message || String(e)) + '\n');
-    return { error: e.message || String(e) };
+    push('err', ((e as Error).message || String(e)) + '\n');
+    return { error: (e as Error).message || String(e) };
   }
 }
 
 // Tokens, or the truth about a local one. No prices: a pricing table in an app
 // that updates monthly is a wrong number waiting to happen.
-function usageOf(r) {
+function usageOf(r: { usage: Usage | null }): string {
   if (!r.usage || (!r.usage.input && !r.usage.output)) return '';
   return r.usage.input + ' in / ' + r.usage.output + ' out';
 }
@@ -1153,7 +1316,7 @@ function usageOf(r) {
 // a JSON.stringify round trip would throw all of them away. So the array's
 // closing bracket is found by scanning (strings walked, not regexed past — the
 // same reason parseJsonc does it) and the new entry is spliced in front of it.
-export function appendActionText(text, action) {
+export function appendActionText(text: string | null, action: TidyAction): string | null {
   const body = JSON.stringify(action, null, 2)
     .split('\n').map((l, i) => (i ? '    ' + l : l)).join('\n');
 
@@ -1172,7 +1335,7 @@ export function appendActionText(text, action) {
 
 // The `[` and the matching `]` of the actions array, whichever shape the file
 // is in — `{ "actions": [...] }` or a bare array at the root.
-function findActionsArray(text) {
+function findActionsArray(text: string): { open: number; close: number } | null {
   let i = 0;
   const skipString = () => {
     for (i++; i < text.length; i++) {
@@ -1221,7 +1384,7 @@ function findActionsArray(text) {
 // `policy` is aiPolicy()'s answer for an AI action — what the run WILL get,
 // not what the action asked for. Without it the sheet can only guess from
 // `a.tools`, which is null for every action that didn't say.
-export function summarize(a, ctx, policy) {
+export function summarize(a: Action, ctx: ActionCtx, policy?: Policy): { kind: string; body: string; cwd: string } {
   const v = vars(ctx);
   if (a.type === 'ai') {
     // What approving this really means: your model, your key, this prompt —
@@ -1237,7 +1400,7 @@ export function summarize(a, ctx, policy) {
           : 'and it may read files in this folder';
     return {
       kind: 'A prompt, sent to your AI provider (' + what + ')',
-      body: expand(a.prompt, v),
+      body: expand(a.prompt!, v),
       cwd: cwdFor(a, v),
     };
   }
@@ -1247,11 +1410,11 @@ export function summarize(a, ctx, policy) {
     const src = a.script || a.fileSrc || ('(from ' + a.file + ')');
     return { kind: 'JavaScript, in Nib’s own backend', body: src, cwd: cwdFor(a, v) };
   }
-  let argv, vals, body;
+  let argv: string[], vals: Record<string, string>, body: string;
   try {
     ({ argv, vals } = commandFor(a, v));
     body = a.shell ? argv[0] : argv.map((s) => (/\s/.test(s) ? JSON.stringify(s) : s)).join(' ');
-  } catch (e) { body = '(won’t run: ' + e.message + ')'; vals = {}; }
+  } catch (e) { body = '(won’t run: ' + (e as Error).message + ')'; vals = {}; }
   if (Object.keys(vals).length) {
     body += '\n\nwhere:\n' + Object.entries(vals).map(([k, val]) => '  ' + k + ' = ' + val).join('\n');
   }

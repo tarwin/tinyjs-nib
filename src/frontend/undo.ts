@@ -20,8 +20,33 @@ const GROUP_MAX = 80;        // …until the step holds about a line
 const MAX_ENTRIES = 1000;    // per sheet
 const MAX_CHARS = 1 << 20;   // ~1 MB of stored spans per sheet, oldest out
 
+/** One step: at `at`, `del` was replaced by `ins`. */
+interface Span { at: number; del: string; ins: string }
+interface Step extends Span {
+  ts: number;
+  /** a backspace run rather than one gesture */
+  grew?: boolean;
+}
+interface Stacks { undo: Step[]; redo: Step[]; chars: number }
+
+/** What undo/redo hand back for the buffer. */
+export interface HistoryResult {
+  text: string;
+  caret: number;
+  /** a selection to restore instead of a bare caret */
+  sel?: [number, number] | null;
+}
+
+export interface History {
+  open(id: string, text: string | null | undefined): void;
+  drop(id: string): void;
+  record(text: string, hard?: boolean): boolean;
+  undo(text: string): HistoryResult | null;
+  redo(text: string): HistoryResult | null;
+}
+
 // the changed span, or null if nothing moved
-function diff(a, b) {
+function diff(a: string, b: string): Span | null {
   if (a === b) return null;
   let s = 0;
   const max = Math.min(a.length, b.length);
@@ -31,24 +56,24 @@ function diff(a, b) {
   return { at: s, del: a.slice(s, ea), ins: b.slice(s, eb) };
 }
 
-function setupHistory() {
-  const stacks = new Map();            // sheetId -> { undo: [], redo: [], chars }
-  let cur = null;                      // the active sheet's stacks
+function setupHistory(): History {
+  const stacks = new Map<string, Stacks>();            // sheetId -> { undo: [], redo: [], chars }
+  let cur: Stacks | null = null;                      // the active sheet's stacks
   let prev = '';                       // the buffer as last recorded
 
-  const forSheet = (id) => {
+  const forSheet = (id: string) => {
     if (!stacks.has(id)) stacks.set(id, { undo: [], redo: [], chars: 0 });
-    return stacks.get(id);
+    return stacks.get(id)!;
   };
   const trim = () => {
-    while (cur.undo.length > MAX_ENTRIES || cur.chars > MAX_CHARS) {
-      const e = cur.undo.shift();
+    while (cur!.undo.length > MAX_ENTRIES || cur!.chars > MAX_CHARS) {
+      const e = cur!.undo.shift();
       if (!e) break;
-      cur.chars -= e.del.length + e.ins.length;
+      cur!.chars -= e.del.length + e.ins.length;
     }
   };
 
-  const record = (text, hard) => {
+  const record = (text: string, hard?: boolean) => {
     if (!cur) return false;
     const d = diff(prev, String(text));
     if (!d) return false;
@@ -85,7 +110,7 @@ function setupHistory() {
       record(text);
       const e = cur && cur.undo.pop();
       if (!e) return null;
-      cur.redo.push(e);
+      cur!.redo.push(e);
       prev = prev.slice(0, e.at) + e.del + prev.slice(e.at + e.ins.length);
       // A step that swallowed text in ONE gesture — a selection deleted,
       // cut, or typed over — hands it back SELECTED: the selection you had
@@ -98,7 +123,7 @@ function setupHistory() {
       record(text);
       const e = cur && cur.redo.pop();
       if (!e) return null;
-      cur.undo.push(e);
+      cur!.undo.push(e);
       prev = prev.slice(0, e.at) + e.ins + prev.slice(e.at + e.del.length);
       return { text: prev, caret: e.at + e.ins.length };
     },

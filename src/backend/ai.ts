@@ -31,11 +31,224 @@
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
+// ------------------------------------------------------------------ types
+
+/** Which adapter answers. */
+export type ProviderKind = 'apple' | 'anthropic' | 'openai';
+/** What a model may touch: nothing, the folder read-only, or everything. */
+export type ToolsLevel = 'off' | 'read' | 'full';
+/** How often it asks first. */
+export type ApproveLevel = 'never' | 'writes' | 'always';
+
+/** A provider as Nib ships it (PROVIDERS). */
+export interface ProviderPreset {
+  kind: ProviderKind;
+  label: string;
+  base?: string;
+  local?: boolean;
+  needsKey: boolean;
+  keyHint?: string;
+  model?: string;
+  keyUrl?: string;
+  note?: string;
+  os?: string;
+}
+
+/** Your overrides for one provider, as stored — read from disk, so the policy
+ *  fields are checked against TOOL_RANK / APPROVE_RANK before use. */
+export interface ProviderOverride {
+  model?: string;
+  base?: string;
+  off?: boolean;
+  tools?: string | null;
+  approve?: string | null;
+}
+
+/** The preset with your overrides on top (providerConfig). */
+export interface ProviderConfig extends ProviderPreset {
+  id: string;
+  base: string;
+  model: string;
+  off: boolean;
+  tools: ToolsLevel | null;
+  approve: ApproveLevel | null;
+}
+
+/** The app's AI settings (store key 'ai'). */
+export interface AiConfig {
+  enabled: boolean;
+  provider: string;
+  providers: Record<string, ProviderOverride>;
+  tools: ToolsLevel;
+  approve: ApproveLevel;
+  maxTurns: number;
+  speech: boolean;
+}
+
+/** One opinion about policy; unset or unknown values don't count. */
+export interface PolicyOpinion {
+  tools?: string | null;
+  approve?: string | null;
+}
+
+export interface Policy {
+  tools: ToolsLevel;
+  approve: ApproveLevel;
+  /** the action asked for more tools than it got (falsy when it didn't) */
+  cappedTools: boolean | string | null | undefined;
+}
+
+export interface KeyResult {
+  ok: boolean;
+  where?: 'secrets' | 'store';
+  why?: string;
+}
+
+export interface ProviderState {
+  id: string;
+  ok: boolean;
+  why: string | null;
+  status?: TinyAiAvailability;
+}
+
+export interface ProviderRow extends ProviderState {
+  label: string;
+  kind: ProviderKind;
+  local: boolean;
+  note: string | null;
+  base: string;
+  model: string;
+  needsKey: boolean;
+  keyHint: string | null;
+  keyUrl: string | null;
+  hasKey: boolean;
+  off: boolean;
+  tools: ToolsLevel | null;
+  approve: ApproveLevel | null;
+}
+
+export interface AiStatus {
+  enabled: boolean;
+  provider: string;
+  tools: ToolsLevel;
+  approve: ApproveLevel;
+  speech: boolean;
+  keyStore: 'secrets' | 'store';
+  providers: ProviderRow[];
+  ready: boolean;
+}
+
+/** One JSON Schema property of a tool's arguments. */
+export interface ToolProp {
+  type?: string;
+  description?: string;
+}
+
+/** A tool, in the one shape every adapter converts from. */
+export interface AiTool {
+  name: string;
+  description: string;
+  properties?: Record<string, ToolProp>;
+  required?: string[];
+  // args are whatever JSON the model sent
+  run(args: Record<string, any>): unknown;
+}
+
+/** Progress from a run's tool calls. */
+export type AiEvent =
+  | { type: 'tool'; name: string; args: Record<string, any> }
+  | { type: 'tool-done'; name: string; ok: boolean; result: string };
+
+/** A stop flag the caller can set mid-run. */
+export interface Cancel {
+  stopped?: boolean;
+}
+
+/** One block of an Anthropic-style message, or a tool result. */
+export interface ContentBlock {
+  type: string;
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: unknown;
+  tool_use_id?: string;
+  content?: string;
+  is_error?: boolean;
+}
+
+/** A conversation turn, in either provider's dialect. */
+export interface ChatMessage {
+  role: string;
+  content: string | ContentBlock[] | null;
+  tool_calls?: { id: string; type: 'function'; function: { name: string; arguments: string } }[];
+  tool_call_id?: string;
+}
+
+/** What a tool call did — the record to trust, not the prose. */
+export interface ToolCallRecord {
+  name: string;
+  arguments: Record<string, any>;
+  result: string;
+  ok: boolean;
+}
+
+export interface Usage {
+  input: number;
+  output: number;
+}
+
+export interface GenerateOptions {
+  provider?: string;
+  model?: string;
+  system?: string;
+  prompt?: string;
+  messages?: ChatMessage[];
+  tools?: AiTool[];
+  maxTurns?: number;
+  temperature?: number;
+  maxTokens?: number;
+  onDelta?: (text: string) => void;
+  onEvent?: (e: AiEvent) => void;
+  cancel?: Cancel;
+}
+
+/** What an adapter hands back. */
+interface AdapterResult {
+  text: string;
+  calls: ToolCallRecord[];
+  usage: Usage | null;
+  turns: number;
+  capped?: boolean;
+  finish?: string | null;
+}
+
+export interface GenerateResult extends AdapterResult {
+  provider: string;
+  providerLabel: string;
+  model: string;
+}
+
+/** Everything an adapter needs for one generate() call. */
+interface AdapterOptions {
+  p: ProviderConfig;
+  model: string;
+  system?: string;
+  msgs: ChatMessage[];
+  tools: AiTool[];
+  turns: number;
+  temperature?: number;
+  maxTokens: number;
+  onDelta?: (text: string) => void;
+  onEvent?: (e: AiEvent) => void;
+  cancel: Cancel;
+  app: TinyApp;
+}
+
 // Every provider Nib knows how to reach. `kind` is which adapter answers;
 // everything else is what the settings panel needs to draw a row. A local one
 // takes no key and sends nothing anywhere — worth saying in the UI, so it's a
 // flag here rather than a hardcoded list over there.
-export const PROVIDERS = {
+export const PROVIDERS: Record<string, ProviderPreset> = {
   apple: {
     kind: 'apple', label: 'Apple on-device', local: true, needsKey: false,
     note: 'Runs on this Mac. Offline, private, free. Needs macOS 26 with Apple Intelligence on.',
@@ -87,7 +300,7 @@ const OS = () => (tjs.env.OS === 'Windows_NT' ? 'windows'
 
 // Defaults chosen so that an untouched install is OFF and reaches nothing.
 // Nothing about AI appears in the app until this says otherwise.
-const DEFAULTS = {
+const DEFAULTS: AiConfig = {
   enabled: false,
   // The on-device one where it exists, and the local server everywhere else —
   // so the first thing offered is always the one that costs nothing and sends
@@ -101,18 +314,18 @@ const DEFAULTS = {
   speech: true,
 };
 
-let cache = null;
+let cache: AiConfig | null = null;
 
-export async function aiConfig(app) {
+export async function aiConfig(app: TinyApp): Promise<AiConfig> {
   if (cache) return cache;
-  const saved = (await app.store.get('ai')) || {};
+  const saved: Partial<AiConfig> = (await app.store.get('ai')) || {};
   cache = { ...DEFAULTS, ...saved, providers: { ...(saved.providers || {}) } };
   return cache;
 }
 
-export async function setAiConfig(app, patch) {
+export async function setAiConfig(app: TinyApp, patch: Partial<AiConfig>): Promise<AiConfig> {
   const c = await aiConfig(app);
-  const next = { ...c, ...patch };
+  const next: AiConfig = { ...c, ...patch };
   if (patch && patch.providers) next.providers = { ...c.providers, ...patch.providers };
   cache = next;
   await app.store.set('ai', next);
@@ -122,7 +335,7 @@ export async function setAiConfig(app, patch) {
 // What a provider is actually configured as: the preset, with your overrides
 // on top. `base` is normalised here so a pasted url with a trailing slash —
 // or one that already ends in /v1 — reaches the same place.
-export async function providerConfig(app, id) {
+export async function providerConfig(app: TinyApp, id: string): Promise<ProviderConfig | null> {
   const p = PROVIDERS[id];
   if (!p) return null;
   const c = await aiConfig(app);
@@ -137,8 +350,8 @@ export async function providerConfig(app, id) {
     off: own.off === true,
     // The two policy fields. Unset means "whatever the general setting says";
     // set, they are a LIMIT rather than a preference — see effectivePolicy.
-    tools: TOOL_RANK[own.tools] !== undefined ? own.tools : null,
-    approve: APPROVE_RANK[own.approve] !== undefined ? own.approve : null,
+    tools: TOOL_RANK[own.tools!] !== undefined ? own.tools as ToolsLevel : null,
+    approve: APPROVE_RANK[own.approve!] !== undefined ? own.approve as ApproveLevel : null,
   };
 }
 
@@ -155,9 +368,10 @@ export async function providerConfig(app, id) {
 // rely on: an action naming `"tools": "full"` gets `read` on Ollama, because
 // the provider's limit is not a suggestion. An action can still ask for less
 // than it is allowed, which is what a rewriting prompt should do.
-export const TOOL_RANK = { off: 0, read: 1, full: 2 };
-export const APPROVE_RANK = { never: 0, writes: 1, always: 2 };
-const byRank = (rank, pick) => Object.keys(rank).find((k) => rank[k] === pick);
+// keyed by string: the values looked up are often unvalidated ones from disk
+export const TOOL_RANK: Record<string, number> = { off: 0, read: 1, full: 2 };
+export const APPROVE_RANK: Record<string, number> = { never: 0, writes: 1, always: 2 };
+const byRank = (rank: Record<string, number>, pick: number) => Object.keys(rank).find((k) => rank[k] === pick);
 
 //
 // And a FOURTH opinion, which only ever narrows: where the action came from.
@@ -169,18 +383,20 @@ const byRank = (rank, pick) => Object.keys(rank).find((k) => rank[k] === pick);
 // write files and run commands without a single sheet. So the folder is a
 // limit in its own right: tools no wider than read, approve no quieter than
 // writes, whatever the other three say.
-export function effectivePolicy({ general, provider, action, scope }) {
+export function effectivePolicy({ general, provider, action, scope }: {
+  general: PolicyOpinion; provider: PolicyOpinion; action: PolicyOpinion; scope?: string;
+}): Policy {
   const tools = [general.tools, provider.tools, action.tools]
-    .filter((v) => TOOL_RANK[v] !== undefined).map((v) => TOOL_RANK[v]);
+    .filter((v) => TOOL_RANK[v!] !== undefined).map((v) => TOOL_RANK[v!]);
   const approve = [general.approve, provider.approve, action.approve]
-    .filter((v) => APPROVE_RANK[v] !== undefined).map((v) => APPROVE_RANK[v]);
+    .filter((v) => APPROVE_RANK[v!] !== undefined).map((v) => APPROVE_RANK[v!]);
   if (scope === 'project') {
     tools.push(TOOL_RANK.read);
     approve.push(APPROVE_RANK.writes);
   }
   return {
-    tools: byRank(TOOL_RANK, tools.length ? Math.min(...tools) : TOOL_RANK.read),
-    approve: byRank(APPROVE_RANK, approve.length ? Math.max(...approve) : APPROVE_RANK.writes),
+    tools: byRank(TOOL_RANK, tools.length ? Math.min(...tools) : TOOL_RANK.read) as ToolsLevel,
+    approve: byRank(APPROVE_RANK, approve.length ? Math.max(...approve) : APPROVE_RANK.writes) as ApproveLevel,
     // what an action asked for but didn't get, so a run can say so rather
     // than quietly doing less than the prompt assumed
     cappedTools: action.tools && TOOL_RANK[action.tools] > Math.min(...tools),
@@ -193,10 +409,10 @@ export function effectivePolicy({ general, provider, action, scope }) {
 // home; the store is the fallback and never a silent one — `keyStore()` tells
 // the settings panel which of the two answered, so it can say so on screen.
 
-const keyName = (id) => 'ai.' + id + '.key';
-let secretsBroken = null;                    // null = not tried yet
+const keyName = (id: string) => 'ai.' + id + '.key';
+let secretsBroken: boolean | null = null;                    // null = not tried yet
 
-export async function setKey(app, id, value) {
+export async function setKey(app: TinyApp, id: string, value: unknown): Promise<KeyResult> {
   const v = String(value || '');
   if (!v) return deleteKey(app, id);
   try {
@@ -208,11 +424,11 @@ export async function setKey(app, id, value) {
   } catch (e) {
     secretsBroken = true;
     await app.store.set('aikey:' + id, v);
-    return { ok: true, where: 'store', why: e.message || String(e) };
+    return { ok: true, where: 'store', why: (e as Error).message || String(e) };
   }
 }
 
-export async function getKey(app, id) {
+export async function getKey(app: TinyApp, id: string): Promise<string | null> {
   try {
     const v = await app.secrets.get(keyName(id));
     if (v) return v;
@@ -220,27 +436,27 @@ export async function getKey(app, id) {
   return (await app.store.get('aikey:' + id)) || null;
 }
 
-export async function deleteKey(app, id) {
+export async function deleteKey(app: TinyApp, id: string): Promise<KeyResult> {
   try { await app.secrets.delete(keyName(id)); } catch { /* may never have been there */ }
   await app.store.delete('aikey:' + id);
   return { ok: true };
 }
 
-export const keyStore = () => (secretsBroken === true ? 'store' : 'secrets');
+export const keyStore = (): 'secrets' | 'store' => (secretsBroken === true ? 'store' : 'secrets');
 
 // ------------------------------------------------------------ availability
 //
 // Why a provider can't answer right now, in one line, or null when it can.
 // Same idea as an action's greyed row: a reason beats a disappearance.
 
-export async function providerState(app, id) {
+export async function providerState(app: TinyApp, id: string): Promise<ProviderState> {
   const p = await providerConfig(app, id);
   if (!p) return { id, ok: false, why: 'unknown provider' };
   if (p.os && p.os !== OS()) return { id, ok: false, why: 'not on ' + OS() };
   if (p.off) return { id, ok: false, why: 'turned off' };
 
   if (p.kind === 'apple') {
-    let status = 'unsupported';
+    let status: TinyAiAvailability = 'unsupported';
     try { status = await app.macos.ai.availability(); } catch { /* older launcher */ }
     return {
       id, ok: status === 'available', status,
@@ -257,11 +473,11 @@ export async function providerState(app, id) {
 
 // Every provider's state at once — what the settings panel draws, and what
 // decides whether the AI parts of the app appear at all.
-export async function aiStatus(app) {
+export async function aiStatus(app: TinyApp): Promise<AiStatus> {
   const c = await aiConfig(app);
-  const rows = [];
+  const rows: ProviderRow[] = [];
   for (const id of providerIds()) {
-    const p = await providerConfig(app, id);
+    const p = (await providerConfig(app, id))!;      // every id here is a preset
     if (p.os && p.os !== OS()) continue;                 // don't offer what can't exist
     const st = await providerState(app, id);
     rows.push({
@@ -269,7 +485,7 @@ export async function aiStatus(app) {
       base: p.base, model: p.model, needsKey: !!p.needsKey, keyHint: p.keyHint || null,
       keyUrl: p.keyUrl || null, hasKey: p.needsKey ? !!(await getKey(app, id)) : false,
       off: p.off, tools: p.tools, approve: p.approve,
-      ...st,
+      ...(st as Omit<ProviderState, 'id'>),   // same id; the spread is the state
     });
   }
   return {
@@ -282,7 +498,7 @@ export async function aiStatus(app) {
 // The models a provider will admit to having. Worth asking for real rather
 // than shipping a list that goes stale in a month — and for Ollama it is the
 // only way to know what you have actually pulled.
-export async function listModels(app, id) {
+export async function listModels(app: TinyApp, id: string): Promise<{ models?: string[]; error?: string }> {
   const p = await providerConfig(app, id);
   if (!p) return { error: 'unknown provider' };
   if (p.kind === 'apple') return { models: ['on-device'] };
@@ -295,15 +511,15 @@ export async function listModels(app, id) {
     if (!r.ok) return { error: 'HTTP ' + r.status + ' from ' + p.base + '/models' };
     const j = await r.json();
     const arr = Array.isArray(j.data) ? j.data : Array.isArray(j.models) ? j.models : [];
-    const models = arr.map((m) => m.id || m.name).filter(Boolean).sort();
+    const models = arr.map((m: { id?: string; name?: string }) => m.id || m.name).filter(Boolean).sort();
     return { models };
   } catch (e) {
-    return { error: e.message || String(e) };
+    return { error: (e as Error).message || String(e) };
   }
 }
 
-function authHeaders(p, key) {
-  const h = { 'content-type': 'application/json' };
+function authHeaders(p: ProviderConfig, key: string | null): Record<string, string> {
+  const h: Record<string, string> = { 'content-type': 'application/json' };
   if (p.kind === 'anthropic') {
     if (key) h['x-api-key'] = key;
     h['anthropic-version'] = '2023-06-01';
@@ -320,14 +536,14 @@ function authHeaders(p, key) {
 // where `properties` is plain JSON Schema — which is, happily, exactly what
 // Apple's `parameters` already wants, so that adapter needs no conversion.
 
-const toApple = (t) => ({
+const toApple = (t: AiTool): TinyAiTool => ({
   name: t.name, description: t.description, parameters: t.properties || {}, run: t.run,
 });
-const toAnthropic = (t) => ({
+const toAnthropic = (t: AiTool) => ({
   name: t.name, description: t.description,
   input_schema: { type: 'object', properties: t.properties || {}, required: t.required || [] },
 });
-const toOpenAI = (t) => ({
+const toOpenAI = (t: AiTool) => ({
   type: 'function',
   function: {
     name: t.name, description: t.description,
@@ -338,7 +554,7 @@ const toOpenAI = (t) => ({
 // A tool that throws is not a failed request — the model is told what went
 // wrong and gets to try something else, which is usually the right answer
 // (a path that doesn't exist, a write that wasn't approved).
-async function callTool(tools, name, args, onEvent) {
+async function callTool(tools: AiTool[], name: string, args: Record<string, any>, onEvent?: (e: AiEvent) => void): Promise<{ text: string; error: boolean }> {
   const t = tools.find((x) => x.name === name);
   if (!t) return { text: 'no such tool: ' + name, error: true };
   if (onEvent) onEvent({ type: 'tool', name, args });
@@ -348,7 +564,7 @@ async function callTool(tools, name, args, onEvent) {
     if (onEvent) onEvent({ type: 'tool-done', name, ok: true, result: text });
     return { text, error: false };
   } catch (e) {
-    const text = 'error: ' + (e.message || String(e));
+    const text = 'error: ' + ((e as Error).message || String(e));
     if (onEvent) onEvent({ type: 'tool-done', name, ok: false, result: text });
     return { text, error: true };
   }
@@ -359,7 +575,9 @@ async function callTool(tools, name, args, onEvent) {
 // Both HTTP providers stream Server-Sent Events, and both send one JSON object
 // per `data:` line. Lines are buffered across chunk boundaries because a chunk
 // is a network artefact, not a message.
-async function* sseLines(res, cancel) {
+// Each yield is one event of the provider's wire format — network JSON, read
+// field by field by the adapter that asked.
+async function* sseLines(res: Response, cancel?: Cancel): AsyncGenerator<any, void, undefined> {
   if (!res.body || !res.body.getReader) throw new Error('no streaming body');
   const rd = res.body.getReader();
   let buf = '';
@@ -380,7 +598,7 @@ async function* sseLines(res, cancel) {
   }
 }
 
-async function httpError(res) {
+async function httpError(res: Response): Promise<Error> {
   let detail = '';
   try {
     const t = await res.text();
@@ -398,11 +616,11 @@ async function httpError(res) {
 // is produced; tool calls run here and the conversation goes round again until
 // the model stops asking (or `maxTurns` says enough — a model in a loop is a
 // real thing and it should cost a bounded number of requests, not a bill).
-export async function generate(app, {
+export async function generate(app: TinyApp, {
   provider, model, system, prompt, messages, tools = [],
   maxTurns, temperature, maxTokens = 4096,
   onDelta, onEvent, cancel = {},
-} = {}) {
+}: GenerateOptions = {}): Promise<GenerateResult> {
   const c = await aiConfig(app);
   const id = provider || c.provider;
   const p = await providerConfig(app, id);
@@ -411,11 +629,11 @@ export async function generate(app, {
   if (!st.ok) throw new Error(p.label + ': ' + st.why);
 
   const turns = Math.max(1, maxTurns || c.maxTurns || 8);
-  const msgs = messages && messages.length
+  const msgs: ChatMessage[] = messages && messages.length
     ? messages.slice()
     : [{ role: 'user', content: String(prompt || '') }];
   const chosen = String(model || p.model || '').trim();
-  const opts = { p, model: chosen, system, msgs, tools, turns, temperature, maxTokens,
+  const opts: AdapterOptions = { p, model: chosen, system, msgs, tools, turns, temperature, maxTokens,
     onDelta, onEvent, cancel, app };
 
   const r = p.kind === 'apple' ? await runApple(opts)
@@ -431,7 +649,7 @@ export async function generate(app, {
 // warning worth repeating from tinyjs's own docs — the prose CLAIMS tool calls
 // it silently skipped. `calls` is what happened; `text` is what it says
 // happened. Anything that matters is checked against `calls`.
-async function runApple({ app, system, msgs, tools, onDelta, onEvent, cancel }) {
+async function runApple({ app, system, msgs, tools, onDelta, onEvent, cancel }: AdapterOptions): Promise<AdapterResult> {
   const flat = msgs.map((m) => {
     const body = typeof m.content === 'string' ? m.content
       : (m.content || []).map((b) => b.text || '').join('\n');
@@ -444,10 +662,10 @@ async function runApple({ app, system, msgs, tools, onDelta, onEvent, cancel }) 
   // file" is not a call that succeeded, and the two are worth telling apart.
   // (It is equally authoritative about what ran — this function is only
   // reached when the model really does call the tool.)
-  const calls = [];
+  const calls: ToolCallRecord[] = [];
   const wrapped = tools.map((t) => toApple({
     ...t,
-    run: async (args) => {
+    run: async (args: Record<string, any>) => {
       if (cancel.stopped) throw new Error('stopped');
       const r = await callTool(tools, t.name, args, onEvent);
       calls.push({ name: t.name, arguments: args || {}, result: r.text, ok: !r.error });
@@ -455,22 +673,29 @@ async function runApple({ app, system, msgs, tools, onDelta, onEvent, cancel }) 
     },
   }));
 
-  const out = await app.macos.ai.generate(flat, {
+  // a string without tools, { text, calls } with them
+  const out = await (app.macos.ai.generate(flat, {
     instructions: system || undefined,
     tools: wrapped.length ? wrapped : undefined,
-  });
+  } as { instructions?: string; tools: TinyAiTool[] }) as Promise<string | { text: string; calls: TinyAiCall[] }>);
   const text = typeof out === 'string' ? out : (out.text || '');
   if (cancel.stopped) throw new Error('stopped');
   if (text && onDelta) onDelta(text);
   return { text, calls, usage: null, turns: 1 };
 }
 
+// A content block as it streams in: text, or a tool call whose JSON arrives
+// in pieces.
+interface TextBlock { type: 'text'; text: string }
+interface ToolUseBlock { type: 'tool_use'; id: string; name: string; json: string }
+type StreamBlock = TextBlock | ToolUseBlock;
+
 async function runAnthropic({ p, app, model, system, msgs, tools, turns, temperature,
-  maxTokens, onDelta, onEvent, cancel }) {
+  maxTokens, onDelta, onEvent, cancel }: AdapterOptions): Promise<AdapterResult> {
   const key = await getKey(app, p.id);
   let all = '';
-  const calls = [];
-  const usage = { input: 0, output: 0 };
+  const calls: ToolCallRecord[] = [];
+  const usage: Usage = { input: 0, output: 0 };
 
   for (let turn = 0; turn < turns; turn++) {
     if (cancel.stopped) throw new Error('stopped');
@@ -487,8 +712,8 @@ async function runAnthropic({ p, app, model, system, msgs, tools, turns, tempera
 
     // Blocks arrive interleaved: text streams as `text_delta`, a tool call
     // streams as a partial JSON string that only parses once it's whole.
-    const blocks = [];
-    let stop = null;
+    const blocks: StreamBlock[] = [];
+    let stop: string | null = null;
     for await (const ev of sseLines(res, cancel)) {
       if (ev.type === 'content_block_start') {
         blocks[ev.index] = ev.content_block.type === 'tool_use'
@@ -498,11 +723,11 @@ async function runAnthropic({ p, app, model, system, msgs, tools, turns, tempera
         const b = blocks[ev.index];
         if (!b) continue;
         if (ev.delta.type === 'text_delta') {
-          b.text += ev.delta.text;
+          (b as TextBlock).text += ev.delta.text;
           all += ev.delta.text;
           if (onDelta) onDelta(ev.delta.text);
         } else if (ev.delta.type === 'input_json_delta') {
-          b.json += ev.delta.partial_json;
+          (b as ToolUseBlock).json += ev.delta.partial_json;
         }
       } else if (ev.type === 'message_delta') {
         stop = ev.delta?.stop_reason || stop;
@@ -515,7 +740,7 @@ async function runAnthropic({ p, app, model, system, msgs, tools, turns, tempera
     }
     if (cancel.stopped) throw new Error('stopped');
 
-    const wants = blocks.filter((b) => b && b.type === 'tool_use');
+    const wants = blocks.filter((b): b is ToolUseBlock => b && b.type === 'tool_use');
     if (stop !== 'tool_use' || !wants.length) {
       return { text: all, calls, usage, turns: turn + 1 };
     }
@@ -526,7 +751,7 @@ async function runAnthropic({ p, app, model, system, msgs, tools, turns, tempera
         ? { type: 'text', text: b.text }
         : { type: 'tool_use', id: b.id, name: b.name, input: safeJson(b.json) })),
     });
-    const results = [];
+    const results: ContentBlock[] = [];
     for (const b of wants) {
       const args = safeJson(b.json);
       const r = await callTool(tools, b.name, args, onEvent);
@@ -541,12 +766,12 @@ async function runAnthropic({ p, app, model, system, msgs, tools, turns, tempera
 }
 
 async function runOpenAI({ p, app, model, system, msgs, tools, turns, temperature,
-  maxTokens, onDelta, onEvent, cancel }) {
+  maxTokens, onDelta, onEvent, cancel }: AdapterOptions): Promise<AdapterResult> {
   const key = await getKey(app, p.id);
-  const conv = system ? [{ role: 'system', content: system }, ...msgs] : msgs.slice();
+  const conv: ChatMessage[] = system ? [{ role: 'system', content: system }, ...msgs] : msgs.slice();
   let all = '';
-  const calls = [];
-  const usage = { input: 0, output: 0 };
+  const calls: ToolCallRecord[] = [];
+  const usage: Usage = { input: 0, output: 0 };
 
   for (let turn = 0; turn < turns; turn++) {
     if (cancel.stopped) throw new Error('stopped');
@@ -563,8 +788,8 @@ async function runOpenAI({ p, app, model, system, msgs, tools, turns, temperatur
     if (!res.ok) throw await httpError(res);
 
     let text = '';
-    let finish = null;
-    const wants = [];                 // by `index`, assembled across deltas
+    let finish: string | null = null;
+    const wants: { id: string; name: string; json: string }[] = [];                 // by `index`, assembled across deltas
     for await (const ev of sseLines(res, cancel)) {
       if (ev.usage) {
         usage.input += ev.usage.prompt_tokens || 0;
@@ -609,7 +834,7 @@ async function runOpenAI({ p, app, model, system, msgs, tools, turns, temperatur
 // A model that streams half a JSON object and then stops is a real failure
 // mode; an empty object is a better tool argument than a thrown parse error,
 // because the tool can say what it needed and the model can try again.
-function safeJson(s) {
+function safeJson(s: string): Record<string, any> {
   if (!s) return {};
   try { return JSON.parse(s); } catch { return {}; }
 }
@@ -619,7 +844,7 @@ function safeJson(s) {
 // No pricing table: they go stale and a wrong number is worse than none. What
 // the drawer shows is tokens, which are the honest unit — and for a local
 // provider it says so instead, because nothing was spent and nothing was sent.
-export function usageLine(r) {
+export function usageLine(r: GenerateResult | null | undefined): string {
   if (!r) return '';
   const p = PROVIDERS[r.provider];
   if (p && p.local) return 'on this machine · nothing sent';

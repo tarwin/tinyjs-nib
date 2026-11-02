@@ -18,9 +18,9 @@
 
 const STEPS = [0.75, 0.85, 1, 1.15, 1.3, 1.5, 1.75, 2];
 
-export const setupZoom = (initial) => {
-  const apply = (z) => tiny.win.setZoom(Math.max(STEPS[0],
-    Math.min(STEPS[STEPS.length - 1], +z || 1)));
+export const setupZoom = (initial: number | null | undefined): void => {
+  const apply = (z: unknown) => tiny.win.setZoom(Math.max(STEPS[0],
+    Math.min(STEPS[STEPS.length - 1], +(z as number) || 1)));
   apply(initial);
   tiny.api.on('ui-zoom', ({ zoom }) => apply(zoom));
   // The keys are handled here rather than as menu accelerators because

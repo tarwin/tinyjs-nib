@@ -11,7 +11,20 @@
 //
 // To add one: lucide.dev, copy the paths, keep the 24×24 viewBox.
 
-const ICONS = {
+/** An Iconify drawing the backend fetched and cached for an action's icon. */
+export interface NibIconSvg {
+  body: string;
+  width?: number;
+  height?: number;
+}
+
+/** Anything that carries an action-style icon: actions, commands, menu rows. */
+export interface NibIconed {
+  icon?: string | null;
+  iconSvg?: NibIconSvg | null;
+}
+
+const ICONS: Record<string, string> = {
   'panel-left': '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>',
   pencil: '<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/>',
   zap: '<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>',
@@ -35,11 +48,12 @@ const ICONS = {
   'align-right': '<path d="M21 12H9"/><path d="M21 18H7"/><path d="M21 6H3"/>',
 };
 
-export const nibIcon = function nibIcon(name, size) {
+export const nibIcon = function nibIcon(name: string, size?: number): SVGSVGElement {
   const el = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   el.setAttribute('viewBox', '0 0 24 24');
-  el.setAttribute('width', size || 15);
-  el.setAttribute('height', size || 15);
+  // setAttribute stringifies the number
+  el.setAttribute('width', (size || 15) as unknown as string);
+  el.setAttribute('height', (size || 15) as unknown as string);
   el.setAttribute('fill', 'none');
   el.setAttribute('stroke', 'currentColor');
   el.setAttribute('stroke-width', '2');
@@ -53,10 +67,10 @@ export const nibIcon = function nibIcon(name, size) {
 
 // Markup opts in with data-icon="name" (data-icon-size to override); the
 // svg is prepended so a button can also carry a caret or a label after it.
-export const nibIconsApply = function nibIconsApply(root) {
-  for (const el of (root || document).querySelectorAll('[data-icon]')) {
+export const nibIconsApply = function nibIconsApply(root?: ParentNode | null): void {
+  for (const el of (root || document).querySelectorAll<HTMLElement>('[data-icon]')) {
     if (el.querySelector(':scope > svg.icon')) continue;
-    el.prepend(nibIcon(el.dataset.icon, +el.dataset.iconSize || undefined));
+    el.prepend(nibIcon(el.dataset.icon!, +el.dataset.iconSize! || undefined));
   }
 };
 nibIconsApply();
@@ -68,15 +82,15 @@ nibIconsApply();
 // hasn't arrived — offline, or the first listing hasn't warmed the cache
 // yet — is NOTHING rather than the raw "mdi:rocket" text. Callers decide
 // what nothing looks like (usually: same as an action with no icon).
-export const nibIsIconName = (s) => typeof s === 'string' && /^[a-z0-9-]+:[a-z0-9-]+$/.test(s);
-export const nibActIcon = function nibActIcon(a) {   // {icon, iconSvg} — or a bare string
+export const nibIsIconName = (s: unknown): s is string => typeof s === 'string' && /^[a-z0-9-]+:[a-z0-9-]+$/.test(s);
+export const nibActIcon = function nibActIcon(a: NibIconed | string | null | undefined): SVGSVGElement | Text | null {   // {icon, iconSvg} — or a bare string
   const icon = typeof a === 'string' ? a : (a && a.icon);
   const svg = (a && typeof a === 'object' && a.iconSvg) || null;
   if (svg && svg.body) {
     const el = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     el.setAttribute('viewBox', '0 0 ' + (svg.width || 16) + ' ' + (svg.height || 16));
-    el.setAttribute('width', 15);
-    el.setAttribute('height', 15);
+    el.setAttribute('width', 15 as unknown as string);
+    el.setAttribute('height', 15 as unknown as string);
     el.setAttribute('aria-hidden', 'true');
     el.classList.add('icon', 'actico');   // bodies carry fill="currentColor"
     el.innerHTML = svg.body;
@@ -94,7 +108,7 @@ export const nibActIcon = function nibActIcon(a) {   // {icon, iconSvg} — or a
 // way a person reads it (⌘P, ⇧⌘S, ⌥⌘O — Ctrl+… off-mac). Lives here
 // because both the palette and Settings ▸ Shortcuts need the same answer.
 const MAC = /Mac/.test(navigator.platform || '');
-export const nibKey = function nibKey(k) {
+export const nibKey = function nibKey(k: string | null | undefined): string {
   if (!k) return '';
   let alt = false;
   if (k.startsWith('alt+')) { alt = true; k = k.slice(4); }

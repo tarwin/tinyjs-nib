@@ -1,0 +1,20 @@
+exports[`AsciiDoc → Markdown 1`] = `
+"# Title\\n\\n\\n## Section\\n\\nSome **bold** and _italic_ and \`mono\`.\\n\\n- one\\n  - two\\n1. first\\n\\n\\n\`\`\`js\\nconst a = 1;\\n\`\`\`\\n\\n> **Note:** A note.\\n\\nlink:[Example](https://example.com) and <<anchor,see>>.\\n"
+`;
+
+exports[`moving lines 1`] = `
+[
+  {
+    "text": "a\\nc\\n\\nb\\n\\nd\\n",
+    "line": 3
+  },
+  {
+    "text": "c\\nd\\n\\na\\nb\\n",
+    "line": 0
+  },
+  {
+    "text": "b\\nc\\nd\\n\\na\\n",
+    "line": 4
+  }
+]
+`;

@@ -13,8 +13,54 @@
 // a/b/c.md relative to a/x/y.md -> ../b/c.md
 
 import { nibActIcon, nibKey } from './icons.ts';
+import type { NibIconSvg } from './icons.ts';
+import type { SlashItem } from './slash.ts';
 
-function relativeTo(fromDir, target) {
+// ------------------------------------------------------------- the payload
+// The 'project' push, as main.ts's projectPayload builds it.
+
+export type FileKind = 'doc' | 'image' | 'other';
+export type PinKind = 'all' | 'docs' | 'images';
+
+/** A node of the tree: a folder (dir, kids) or a file (kind). */
+export interface TreeNode {
+  name: string;
+  path: string;
+  dir?: boolean;
+  kids?: TreeNode[];
+  kind?: FileKind;
+}
+
+/** The flat list of the folder's files, for the palettes and searches. */
+export interface ProjectFile {
+  name: string;
+  path: string;
+  /** relative to the project root */
+  rel: string;
+  kind: FileKind;
+}
+
+export interface Heading { level: number; text: string; slug: string; line: number }
+/** One file's entry in the heading index. */
+export interface HeadIndex { title: string | null; heads: Heading[] }
+
+export interface ProjectPayload {
+  root: string;
+  name: string;
+  tree: TreeNode[];
+  files: ProjectFile[];
+  truncated: boolean;
+  /** pinned folders, by path */
+  pins: Record<string, PinKind>;
+  /** the master switch: pins parked when false */
+  pinsOn: boolean;
+  /** rel -> headings; arrives a beat after the folder ('project-heads') */
+  heads: Record<string, HeadIndex> | null;
+  /** what a leading / means in links and images */
+  roots: { link: string; image: string };
+}
+
+function relativeTo(fromDir: string | null | undefined, target: string): string {
   if (!fromDir) return target;
   const a = fromDir.split('/').filter(Boolean);
   const b = target.split('/').filter(Boolean);
@@ -38,8 +84,8 @@ function relativeTo(fromDir, target) {
 // One term as a subsequence of `text`, starting at `from`. Greedy, which
 // never misses a match that exists — only, sometimes, the prettiest one; the
 // caller runs it twice and keeps the better. Returns null for no match.
-function subseq(text, lower, q, from) {
-  const hits = [];
+function subseq(text: string, lower: string, q: string, from: number) {
+  const hits: number[] = [];
   let i = from, s = 0, streak = 0;
   for (const ch of q) {
     const at = lower.indexOf(ch, i);
@@ -59,13 +105,16 @@ function subseq(text, lower, q, from) {
 // Every term has to match, and each is scored twice — over the whole path and
 // over the filename alone — because greedy matching from the left would
 // otherwise spend a term's letters in the folders and never reach the name.
-function scoreFile(f, terms) {
+/** What the scorer reads off anything it ranks. */
+interface Rankable { rel: string; name: string }
+
+function scoreFile(f: Rankable, terms: string[]) {
   const rel = f.rel, lower = rel.toLowerCase();
   const nameAt = rel.length - f.name.length;
   let total = 0;
-  const hits = [];
+  const hits: number[] = [];
   for (const t of terms) {
-    const weigh = (m) => {
+    const weigh = (m: { score: number; hits: number[] } | null) => {
       if (!m) return null;
       const all = m.hits.every((h) => h >= nameAt);
       return { hits: m.hits,
@@ -81,9 +130,9 @@ function scoreFile(f, terms) {
   return { score: total, hits: [...new Set(hits)].sort((x, y) => x - y) };
 }
 
-function rank(files, q, limit) {
+function rank<T extends Rankable>(files: T[], q: string, limit?: number) {
   const terms = q.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  const out = [];
+  const out: { f: T; score: number; hits: number[] }[] = [];
   for (const f of files) {
     const m = terms.length ? scoreFile(f, terms) : { score: 0, hits: [] };
     if (m) out.push({ f, score: m.score, hits: m.hits });
@@ -92,9 +141,9 @@ function rank(files, q, limit) {
   return out.slice(0, limit || 40);
 }
 
-const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+const esc = (s: string) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' } as Record<string, string>)[c]);
 
-function mark(text, hits) {
+function mark(text: string, hits: number[]) {
   let out = '', last = 0;
   for (const h of hits) {
     out += esc(text.slice(last, h)) + '<b>' + esc(text[h]) + '</b>';
@@ -113,21 +162,64 @@ function mark(text, hits) {
 // `showAll` is a live getter (View ▸ Show All Files in Folder): off, files
 // Nib can't open are left out of the tree entirely, with a one-line footer
 // saying how many — click it (or the menu) to bring them back.
-function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEscape, showAll, onShowAll, onPin }) {
+export interface FilesOptions {
+  /** the focusable listbox around the tree */
+  nav: HTMLElement;
+  /** the panel heading: the folder's name */
+  title: HTMLElement;
+  /** where the rows go */
+  tree: HTMLElement;
+  /** a file chosen: preview (one click, the arrows) or keep (double-click, ⌘⏎) */
+  onOpen: (n: TreeNode, how: { preview: boolean }) => unknown;
+  /** the empty state's Open Folder… */
+  onChoose?: () => unknown;
+  onRename?: (n: TreeNode, name: string) => unknown;
+  /** the context menu, at client coordinates */
+  onMenu?: (n: TreeNode, x: number, y: number) => unknown;
+  /** esc: hand the keyboard back */
+  onEscape?: () => unknown;
+  /** View ▸ Show All Files in Folder, live */
+  showAll?: () => boolean;
+  onShowAll?: () => unknown;
+  /** a pin badge clicked: what it should cover next (null = unpin) */
+  onPin?: (n: TreeNode, state: PinKind | null) => unknown;
+}
+
+export interface FileTree {
+  set(payload: ProjectPayload | null, showing?: string | null): void;
+  showing(path: string | null): void;
+  files(): ProjectFile[];
+  pins(): Record<string, PinKind>;
+  pinsOn(): boolean;
+  heads(): Record<string, HeadIndex>;
+  setHeads(h: Record<string, HeadIndex> | null): void;
+  roots(): { link: string; image: string };
+  root(): string | null;
+  has(): boolean;
+  node(): TreeNode | null;
+  rename(n?: TreeNode | null): void;
+  focus(): void;
+  paint(): void;
+}
+
+/** A visible row of the tree. */
+interface TreeRow { n: TreeNode; el: HTMLElement }
+
+function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEscape, showAll, onShowAll, onPin }: FilesOptions): FileTree {
   nav.tabIndex = 0;                // a listbox has to be focusable to be one
-  let data = null;                 // the project payload
-  let current = null;              // the path this window is showing
-  let cursor = null;               // the row with the keyboard cursor, by path
-  let rows = [];                   // what's visible right now, in order
-  let renaming = null;             // the path being renamed, while it is
-  let typed = null;                // what has been typed into that field
-  const open = new Set();          // expanded folders, by path
+  let data: ProjectPayload | null = null;   // the project payload
+  let current: string | null = null;              // the path this window is showing
+  let cursor: string | null = null;   // the row with the keyboard cursor, by path
+  let rows: TreeRow[] = [];                   // what's visible right now, in order
+  let renaming: string | null = null;             // the path being renamed, while it is
+  let typed: string | null = null;                // what has been typed into that field
+  const open = new Set<string>();          // expanded folders, by path
 
   // Moving the cursor with the arrow keys shows the file, but a held-down
   // arrow shouldn't open twenty documents on its way past them.
-  let previewTimer = null;
-  function previewSoon(n) {
-    clearTimeout(previewTimer);
+  let previewTimer: number | null = null;
+  function previewSoon(n: TreeNode | null) {
+    clearTimeout(previewTimer as number | undefined);
     if (!n || n.dir || n.kind === 'other') return;
     previewTimer = setTimeout(() => onOpen(n, { preview: true }), 170);
   }
@@ -162,11 +254,11 @@ function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEs
       return;
     }
     const all = !showAll || showAll();
-    const walk = (nodes, depth) => {
+    const walk = (nodes: TreeNode[], depth: number) => {
       for (const n of nodes) {
         if (!all && !n.dir && n.kind === 'other') continue;
         rows.push({ n, el: row(n, depth) });
-        if (n.dir && open.has(n.path)) walk(n.kids, depth + 1);
+        if (n.dir && open.has(n.path)) walk(n.kids!, depth + 1);
       }
     };
     walk(data.tree, 0);
@@ -186,7 +278,7 @@ function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEs
     }
   }
 
-  function row(n, depth) {
+  function row(n: TreeNode, depth: number) {
     // `.nib` at the top of the folder is NIB'S OWN — the settings and the
     // actions that travel with the folder, not something you put there. It
     // is in the tree because hiding the files the app tells you to edit only
@@ -213,7 +305,7 @@ function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEs
     // A pinned folder wears its pin, and the pin itself is the control:
     // each click narrows what it covers — everything, Markdown, pictures —
     // and the last click takes it off. Pinning starts in the context menu.
-    const pinned = n.dir && data.pins && data.pins[n.path];
+    const pinned = n.dir && data!.pins && data!.pins[n.path];
     if (pinned) {
       const pin = document.createElement('span');
       pin.className = 'tpin';
@@ -231,7 +323,7 @@ function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEs
       }[pinned];
       pin.onclick = (e) => {
         e.stopPropagation();
-        if (onPin) onPin(n, { all: 'docs', docs: 'images', images: null }[pinned]);
+        if (onPin) onPin(n, ({ all: 'docs', docs: 'images', images: null } as Record<PinKind, PinKind | null>)[pinned]);
       };
       el.appendChild(pin);
     }
@@ -276,7 +368,7 @@ function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEs
   //
   // In place, in the row itself — the extension is left out of the initial
   // selection because renaming `notes.md` almost never means renaming `.md`.
-  function editRow(n, el) {
+  function editRow(n: TreeNode, el: HTMLElement) {
     if (!el.isConnected) return;             // a repaint beat us to it
     const label = el.querySelector('.tn');
     if (!label) return;
@@ -287,7 +379,7 @@ function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEs
     // the tree under us — so the field is rebuilt mid-rename. What you have
     // typed is kept in `typed` and put back, rather than lost or reset.
     const fresh = typed === null;
-    input.value = fresh ? n.name : typed;
+    input.value = fresh ? n.name : typed!;
     input.spellcheck = false;
     label.replaceWith(input);
     input.focus();
@@ -297,7 +389,7 @@ function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEs
     input.oninput = () => { typed = input.value; };
 
     let done = false;
-    const finish = (commit) => {
+    const finish = (commit: boolean) => {
       if (done) return;
       done = true;
       renaming = null;
@@ -319,7 +411,7 @@ function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEs
     input.onblur = () => { if (input.isConnected) finish(true); };
   }
 
-  function startRename(n) {
+  function startRename(n: TreeNode | null) {
     if (!n) return;
     renaming = n.path;
     typed = null;
@@ -330,10 +422,10 @@ function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEs
 
   // Open every folder between the root and `p`. A file outside the folder
   // (a bare window's, or one opened from Finder) opens nothing.
-  function reveal(p) {
+  function reveal(p: string | null) {
     if (!data || !p || !p.startsWith(data.root + '/')) return;
     let dir = p.slice(0, p.lastIndexOf('/'));
-    while (dir.length > data.root.length) {
+    while (dir.length > data!.root.length) {
       open.add(dir);
       dir = dir.slice(0, dir.lastIndexOf('/'));
     }
@@ -343,12 +435,12 @@ function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEs
     if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
   }
 
-  function at(delta) {
+  function at(delta: number) {
     const i = rows.findIndex((r) => r.n.path === cursor);
     const next = rows[Math.min(rows.length - 1, Math.max(0, (i < 0 ? 0 : i + delta)))];
     return next || null;
   }
-  function moveTo(r, { preview = true } = {}) {
+  function moveTo(r: TreeRow | null | undefined, { preview = true }: { preview?: boolean } = {}) {
     if (!r) return;
     cursor = r.n.path;
     paint();
@@ -356,7 +448,7 @@ function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEs
     if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
     if (preview) previewSoon(r.n);
   }
-  const node = () => (rows.find((r) => r.n.path === cursor) || {}).n || null;
+  const node = () => (rows.find((r) => r.n.path === cursor) || ({} as Partial<TreeRow>)).n || null;
 
   nav.addEventListener('keydown', (e) => {
     if (renaming || !data) return;
@@ -379,7 +471,7 @@ function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEs
       }
     } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
-      clearTimeout(previewTimer);
+      clearTimeout(previewTimer as number | undefined);
       if (n && !n.dir && n.kind !== 'other') onOpen(n, { preview: false });
     } else if (e.key === 'Enter') {
       e.preventDefault();                    // ⏎ renames; ←/→ do the folders
@@ -389,7 +481,7 @@ function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEs
       if (n && !n.dir && n.kind !== 'other') onOpen(n, { preview: true });
     } else if (e.key === 'Escape') {
       e.preventDefault();
-      clearTimeout(previewTimer);
+      clearTimeout(previewTimer as number | undefined);
       if (onEscape) onEscape();              // hand the keyboard back
     }
   });
@@ -431,7 +523,7 @@ function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEs
     root: () => (data ? data.root : null),
     has: () => !!data,
     // the node under the cursor, for the menu and for Rename from elsewhere
-    node: () => (rows.find((r) => r.n.path === cursor) || {}).n || null,
+    node: () => (rows.find((r) => r.n.path === cursor) || ({} as Partial<TreeRow>)).n || null,
     rename: (n) => startRename(n || null),
     focus() {
       nav.focus();
@@ -443,11 +535,76 @@ function setupFiles({ nav, title, tree, onOpen, onChoose, onRename, onMenu, onEs
 
 // ---------------------------------------------------------------- palette
 
-function setupPalette({ box, input, list, hint }) {
-  let items = [], sel = 0, onPick = null, onCancel = null;
+/** A > command row (main.ts commandList), or the / menu's stand-in for one. */
+export interface PaletteCommand {
+  id?: string;
+  label: string;
+  /** the menu it lives in */
+  path?: string;
+  key?: string | null;
+  checked?: boolean;
+  icon?: string | null;
+  iconSvg?: NibIconSvg | null;
+}
+
+/** Anything the palette lists: a file, a heading in one, a command. */
+export interface PaletteEntry {
+  name: string;
+  /** what's matched — the path for a file */
+  rel: string;
+  path?: string;
+  kind?: string;
+  cmd?: PaletteCommand;
+  /** a heading row: the heading, and the file's own rel and name */
+  head?: Heading;
+  orel?: string;
+  oname?: string;
+  /** the / menu's catalogue row, riding along on its entry */
+  slash?: SlashItem;
+}
+
+export interface PaletteOpenOptions {
+  files: PaletteEntry[];
+  /** the heading index, for ⇥ and heading matches */
+  heads?: Record<string, HeadIndex> | null;
+  /** turns on > commands */
+  commands?: PaletteCommand[] | null;
+  placeholder?: string;
+  hintText?: string;
+  emptyText?: string;
+  /** open at the caret (its rect) rather than centred */
+  at?: { x: number; y: number; height: number } | null;
+  prefill?: string;
+  pick?: (f: PaletteEntry) => void;
+  /** byKey: esc rather than a click away */
+  cancel?: (byKey?: boolean) => void;
+  /** keep the given order while the query is empty */
+  ordered?: boolean;
+}
+
+export interface PaletteOptions {
+  box: HTMLElement;
+  input: HTMLInputElement;
+  list: HTMLElement;
+  hint: HTMLElement;
+}
+
+export interface Palette {
+  open(o: PaletteOpenOptions): void;
+  setQuery(q: string): void;
+  isOpen(): boolean;
+  close(cancelled?: boolean, byKey?: boolean): void;
+}
+
+/** A listed row: the entry, and which characters of its rel matched. */
+interface PaletteRow { f: PaletteEntry; hits: number[]; score?: number }
+
+function setupPalette({ box, input, list, hint }: PaletteOptions): Palette {
+  let items: PaletteRow[] = [], sel = 0, onPick: ((f: PaletteEntry) => void) | null | undefined = null,
+    onCancel: ((byKey?: boolean) => void) | null | undefined = null;
   // headings: the index (rel -> { title, heads }), and the descend state —
   // ⇥ on a file steps INTO its headings, esc steps back out
-  let headsMap = null, mode = 'files', headFile = null, keptQuery = '';
+  let headsMap: Record<string, HeadIndex> | null = null, mode = 'files', headFile: PaletteEntry | null = null, keptQuery = '';
   let openHint = '', openPlaceholder = '', openEmpty = 'No matching files';
   // a list whose ORDER means something (the / menu's catalogue) keeps it
   // while the query is empty, instead of being sorted by length
@@ -455,7 +612,7 @@ function setupPalette({ box, input, list, hint }) {
   // > turns the same box into the COMMAND palette: every menu item,
   // matched and run. The list arrives with open() so the box itself stays
   // dumb about where commands come from.
-  let commandsList = null;
+  let commandsList: PaletteCommand[] | null = null;
   const inCmd = () => mode === 'files' && commandsList
     && input.value.trimStart().startsWith('>');
 
@@ -463,7 +620,7 @@ function setupPalette({ box, input, list, hint }) {
   // go back to what I was doing" — the mention flow puts the caret back —
   // while a click-away blur means the person went somewhere else on
   // purpose, and yanking focus back would fight them.
-  const close = (cancelled, byKey) => {
+  const close = (cancelled?: boolean, byKey?: boolean) => {
     if (box.hidden) return;
     box.hidden = true;
     box.classList.remove('at-caret');
@@ -477,10 +634,10 @@ function setupPalette({ box, input, list, hint }) {
   // a heading as a rankable pseudo-file: the file's path and kind ride
   // along untouched, `head` marks it, rel/name are what the scorer sees —
   // and orel/oname keep the file's own, for descend and the pick handlers
-  const headEntry = (f, h, rel) =>
+  const headEntry = (f: PaletteEntry, h: Heading, rel: string): PaletteEntry =>
     ({ ...f, head: h, rel, name: h.text, orel: f.rel, oname: f.name });
 
-  function descend(f) {
+  function descend(f: PaletteEntry) {
     const hx = headsMap && headsMap[f.rel];
     if (!hx || !hx.heads.length) return;
     mode = 'heads';
@@ -552,7 +709,7 @@ function setupPalette({ box, input, list, hint }) {
     if (on && on.scrollIntoView) on.scrollIntoView({ block: 'nearest' });
   }
 
-  function pick(k) {
+  function pick(k: number) {
     const it = items[k];
     if (!it) return;
     const fn = onPick;
@@ -586,7 +743,7 @@ function setupPalette({ box, input, list, hint }) {
       const it = items[sel];
       if (it && headsMap && headsMap[it.f.rel] && headsMap[it.f.rel].heads.length) {
         e.preventDefault();
-        descend(it.f.head ? { ...it.f, head: undefined, rel: it.f.orel, name: it.f.oname } : it.f);
+        descend(it.f.head ? { ...it.f, head: undefined, rel: it.f.orel!, name: it.f.oname! } : it.f);
       } else if (e.key === 'Tab') e.preventDefault();   // the focus stays put
     } else if (mode === 'heads' && e.key === 'Backspace' && !input.value) {
       e.preventDefault();
@@ -595,14 +752,14 @@ function setupPalette({ box, input, list, hint }) {
   });
   input.addEventListener('blur', () => close(true));
 
-  let source = [], filter = '';
+  let source: PaletteEntry[] = [], filter = '';
   function refresh() {
     filter = input.value;
     if (inCmd()) {
       // > commands. An empty query keeps MENU order — the list reads as
       // the menus flattened — and a query ranks like everything else.
       const q = filter.trimStart().slice(1);
-      const entries = commandsList.map((c) => ({
+      const entries = commandsList!.map((c): PaletteEntry => ({
         cmd: c, name: c.label, kind: 'cmd',
         rel: (c.path ? c.path + ' › ' : '') + c.label,
       }));
@@ -611,8 +768,8 @@ function setupPalette({ box, input, list, hint }) {
         : entries.slice(0, 40).map((f) => ({ f, hits: [] }));
       hint.textContent = '⏎ runs the command · esc to dismiss';
     } else if (mode === 'heads') {
-      const hx = (headsMap && headsMap[headFile.rel]) || { heads: [] };
-      items = rank(hx.heads.map((h) => headEntry(headFile, h, h.text)), filter, 40);
+      const hx = (headsMap && headsMap[headFile!.rel]) || { heads: [] };
+      items = rank(hx.heads.map((h) => headEntry(headFile!, h, h.text)), filter, 40);
     } else {
       const entries = [...source];
       // headings ride along in the main list once there's a query — a file
@@ -635,7 +792,7 @@ function setupPalette({ box, input, list, hint }) {
 
   return {
     open({ files, heads, commands, placeholder, hintText, emptyText, at, prefill,
-      pick: onPickFn, cancel, ordered }) {
+      pick: onPickFn, cancel, ordered }: PaletteOpenOptions) {
       source = files;
       keepOrder = !!ordered;
       headsMap = heads || null;
@@ -672,7 +829,7 @@ function setupPalette({ box, input, list, hint }) {
       else input.select();
     },
     // the @-picker keeps typing in the document, so it feeds us the query
-    setQuery(q) { input.value = q; refresh(); },
+    setQuery(q: string) { input.value = q; refresh(); },
     isOpen: () => !box.hidden,
     close,
   };

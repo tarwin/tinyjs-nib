@@ -10,13 +10,50 @@
 // under the textarea: a <textarea> can't hold a highlight, and the backdrop has
 // its metrics exactly.
 
-const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+import type { PeerSync } from './sync.ts';
+
+/** The three switches both searches share. (A type, not an interface, so it
+ *  still fits a Record<string, unknown>.) */
+export type FindOptions = { regex: boolean; word: boolean; caseSensitive: boolean };
+
+/** A compiled query: what `new RegExp` and the backend's buildRe take. */
+export interface FindPattern { source: string; flags: string }
+
+/** One match in a file, as findInFolder sends it (main.ts scanText). */
+export interface FindHit {
+  /** 0-based */
+  line: number;
+  col: number;
+  len: number;
+  /** the line's text (clipped) */
+  text: string;
+}
+
+/** findInFolder's answer. */
+interface FolderResults {
+  error?: string;
+  files: { path: string; rel: string; name: string; hits: FindHit[] }[];
+  total: number;
+  truncated?: boolean;
+  /** the pinned folders the search was narrowed to */
+  pinned?: string[] | null;
+}
+
+/** replaceInFolder's answer. */
+interface FolderReplace {
+  error?: string;
+  changed: number;
+  total: number;
+  skipped?: string[];
+}
+
+const esc = (s: string) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' } as Record<string, string>)[c]);
 const RE_SPECIAL = /[.*+?^${}()|[\]\\]/g;
 
 // What you typed -> what gets matched. `null` means the query can't compile,
 // which only happens in regex mode and is shown as such rather than silently
 // finding nothing.
-function pattern(query, { regex, word, caseSensitive }) {
+function pattern(query: string, { regex, word, caseSensitive }: FindOptions): FindPattern | null {
   if (!query) return null;
   let src = regex ? query : query.replace(RE_SPECIAL, '\\$&');
   if (word) src = '\\b(?:' + src + ')\\b';
@@ -27,9 +64,9 @@ function pattern(query, { regex, word, caseSensitive }) {
 
 // A replacement is a template in regex mode ($1, $&) and literal text
 // otherwise — where a bare $ has to be spelled $$ or it eats the next char.
-const replacementFor = (text, regex) => (regex ? text : text.replace(/\$/g, '$$$$'));
+const replacementFor = (text: string, regex: boolean) => (regex ? text : text.replace(/\$/g, '$$$$'));
 
-function markLine(text, col, len) {
+function markLine(text: string, col: number, len: number): string {
   return esc(text.slice(0, col)) + '<b>' + esc(text.substr(col, len)) + '</b>'
        + esc(text.slice(col + len));
 }
@@ -38,11 +75,36 @@ function markLine(text, col, len) {
 
 // opts: { bar, ed, peer, onEdit, canFind, docKind } — onEdit is called after
 // the text is changed from here, so the window can re-render and re-sync.
-function setupFindBar({ bar, ed, peer, onEdit, onFolder, scrollTo }) {
-  const $ = (id) => document.getElementById(id);
-  const q = $('findInput'), rep = $('replaceInput'), count = $('findCount');
-  const opts = { regex: false, word: false, caseSensitive: false };
-  let spans = [];                 // [from, to] for every match, in order
+export interface FindBarOptions {
+  bar: HTMLElement;
+  ed: HTMLTextAreaElement;
+  peer: PeerSync;
+  /** puts a source offset on screen in the editor */
+  scrollTo: (off: number) => void;
+  /** the text was changed from here: re-render, re-sync */
+  onEdit: () => void;
+  /** the bar's folder button: search the project for this */
+  onFolder: (query: string, opts: FindOptions) => void;
+}
+
+export interface FindBar {
+  open(o?: { replace?: boolean; seed?: string | null }): void;
+  close(): void;
+  showing(): boolean;
+  toggleReplace(): void;
+  next(): void;
+  prev(): void;
+  query(): string;
+  options(): FindOptions;
+  refresh(): void;
+  repaint(): void;
+}
+
+function setupFindBar({ bar, ed, peer, onEdit, onFolder, scrollTo }: FindBarOptions): FindBar {
+  const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
+  const q = $<HTMLInputElement>('findInput'), rep = $<HTMLInputElement>('replaceInput'), count = $('findCount');
+  const opts: FindOptions = { regex: false, word: false, caseSensitive: false };
+  let spans: [number, number][] = [];                 // [from, to] for every match, in order
   let at = -1;                    // which one is current
   let replacing = false;
 
@@ -56,7 +118,7 @@ function setupFindBar({ bar, ed, peer, onEdit, onFolder, scrollTo }) {
 
   // Re-run the search over the current text. Keeps you on the match nearest
   // to where you already were, so typing another letter doesn't jump.
-  function search({ keepAt } = {}) {
+  function search({ keepAt }: { keepAt?: boolean } = {}) {
     const anchor = at >= 0 && spans[at] ? spans[at][0] : ed.selectionStart;
     spans = [];
     const p = compile();
@@ -96,7 +158,7 @@ function setupFindBar({ bar, ed, peer, onEdit, onFolder, scrollTo }) {
   // preview scrolls that pane on every letter. The full ceremony — editor
   // selection (what Replace acts on), preview follow — is for deliberate
   // steps: ⏎, ⌘G, opening the bar.
-  function reveal({ focusEditor, live } = {}) {
+  function reveal({ focusEditor, live }: { focusEditor?: boolean; live?: boolean } = {}) {
     const s = spans[at];
     if (!s) return;
     scrollTo(s[0]);
@@ -108,7 +170,7 @@ function setupFindBar({ bar, ed, peer, onEdit, onFolder, scrollTo }) {
     if (focusEditor) ed.focus();
   }
 
-  function step(d) {
+  function step(d: number) {
     // ⌘G with the bar closed brings it back with the last query, rather
     // than doing nothing at all
     if (!showing()) { open(); return; }
@@ -170,7 +232,7 @@ function setupFindBar({ bar, ed, peer, onEdit, onFolder, scrollTo }) {
     else if (e.key === 'Escape') { e.preventDefault(); close(); }
   });
 
-  for (const [id, key] of [['findCase', 'caseSensitive'], ['findWord', 'word'], ['findRe', 'regex']]) {
+  for (const [id, key] of [['findCase', 'caseSensitive'], ['findWord', 'word'], ['findRe', 'regex']] as [string, keyof FindOptions][]) {
     $(id).onclick = () => {
       opts[key] = !opts[key];
       $(id).classList.toggle('on', opts[key]);
@@ -187,7 +249,7 @@ function setupFindBar({ bar, ed, peer, onEdit, onFolder, scrollTo }) {
   $('findFolder').onclick = () => onFolder(q.value, opts);
   $('findToggle').onclick = () => setReplacing(!replacing);
 
-  function setReplacing(on) {
+  function setReplacing(on: boolean) {
     replacing = on;
     bar.classList.toggle('rep', on);
     $('findReplaceRow').hidden = !on;
@@ -195,7 +257,7 @@ function setupFindBar({ bar, ed, peer, onEdit, onFolder, scrollTo }) {
     $('findToggle').title = on ? 'Hide Replace' : 'Replace (⌥⌘F)';
   }
 
-  function open({ replace, seed } = {}) {
+  function open({ replace, seed }: { replace?: boolean; seed?: string | null } = {}) {
     const wasOpen = showing();
     bar.hidden = false;
     document.body.classList.add('finding');
@@ -238,14 +300,30 @@ function setupFindBar({ bar, ed, peer, onEdit, onFolder, scrollTo }) {
 // The sidebar's other face: one search over every text file in the project,
 // grouped by file, and a Replace All that goes through the backend in one
 // call. opts.onOpen(hit, { preview }) is how a result becomes a document.
-function setupSearchPanel({ panel, onOpen, onClose }) {
-  const $ = (id) => document.getElementById(id);
-  const q = $('sfInput'), rep = $('sfReplace'), list = $('sfResults'), note = $('sfNote');
-  const opts = { regex: false, word: false, caseSensitive: false };
-  let data = null;                 // the last answer from the backend
-  let timer = null;
-  let cursor = null;               // 'rel:line:col' of the row you're on
-  const collapsed = new Set();
+export interface SearchPanelOptions {
+  panel: HTMLElement;
+  /** a result picked: one click previews, a double-click keeps */
+  onOpen: (hit: FindHit & { path: string }, how: { preview: boolean }) => void;
+  onClose: () => void;
+}
+
+export interface SearchPanel {
+  showing(): boolean;
+  focus(): void;
+  seed(query: string | null | undefined, from?: Partial<Record<keyof FindOptions, unknown>> | null): void;
+  run(): Promise<void>;
+  refresh(): void;
+  clear(): void;
+}
+
+function setupSearchPanel({ panel, onOpen, onClose }: SearchPanelOptions): SearchPanel {
+  const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
+  const q = $<HTMLInputElement>('sfInput'), rep = $<HTMLInputElement>('sfReplace'), list = $('sfResults'), note = $('sfNote');
+  const opts: FindOptions = { regex: false, word: false, caseSensitive: false };
+  let data: FolderResults | null = null;                 // the last answer from the backend
+  let timer: number | null = null;
+  let cursor: string | null = null;               // 'rel:line:col' of the row you're on
+  const collapsed = new Set<string>();
 
   const showing = () => !panel.hidden;
 
@@ -263,7 +341,7 @@ function setupSearchPanel({ panel, onOpen, onClose }) {
       list.textContent = '';
       return;
     }
-    const r = await tiny.api.call('findInFolder', { pattern: p.source, flags: p.flags });
+    const r: FolderResults | null = await tiny.api.call('findInFolder', { pattern: p.source, flags: p.flags });
     if (!r || r.error) {
       data = null;
       note.textContent = (r && r.error) || 'Search failed';
@@ -281,7 +359,7 @@ function setupSearchPanel({ panel, onOpen, onClose }) {
     paint();
   }
 
-  const soon = () => { clearTimeout(timer); timer = setTimeout(run, 180); };
+  const soon = () => { clearTimeout(timer as number | undefined); timer = setTimeout(run, 180); };
 
   function paint() {
     list.textContent = '';
@@ -323,7 +401,7 @@ function setupSearchPanel({ panel, onOpen, onClose }) {
           + 'document with ⌘Z, but not in the ones that aren’t open.',
         ok: 'Replace All' });
     if (!go) return;
-    const r = await tiny.api.call('replaceInFolder', {
+    const r: FolderReplace | null = await tiny.api.call('replaceInFolder', {
       pattern: p.source, flags: p.flags, replace: replacementFor(rep.value, opts.regex) });
     if (!r || r.error) { note.textContent = (r && r.error) || 'Replace failed'; return; }
     await run();
@@ -334,13 +412,13 @@ function setupSearchPanel({ panel, onOpen, onClose }) {
 
   q.addEventListener('input', soon);
   q.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); clearTimeout(timer); run(); }
+    if (e.key === 'Enter') { e.preventDefault(); clearTimeout(timer as number | undefined); run(); }
     else if (e.key === 'Escape') { e.preventDefault(); onClose(); }
   });
   rep.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { e.preventDefault(); onClose(); }
   });
-  for (const [id, key] of [['sfCase', 'caseSensitive'], ['sfWord', 'word'], ['sfRe', 'regex']]) {
+  for (const [id, key] of [['sfCase', 'caseSensitive'], ['sfWord', 'word'], ['sfRe', 'regex']] as [string, keyof FindOptions][]) {
     $(id).onclick = () => {
       opts[key] = !opts[key];
       $(id).classList.toggle('on', opts[key]);
@@ -356,9 +434,9 @@ function setupSearchPanel({ panel, onOpen, onClose }) {
     seed(query, from) {
       if (query != null) q.value = query;
       if (from) {
-        for (const [id, key] of [['sfCase', 'caseSensitive'], ['sfWord', 'word'], ['sfRe', 'regex']]) {
+        for (const [id, key] of [['sfCase', 'caseSensitive'], ['sfWord', 'word'], ['sfRe', 'regex']] as [string, keyof FindOptions][]) {
           opts[key] = !!from[key];
-          document.getElementById(id).classList.toggle('on', opts[key]);
+          document.getElementById(id)!.classList.toggle('on', opts[key]);
         }
       }
     },
