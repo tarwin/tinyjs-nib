@@ -519,7 +519,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
   // has no caret position after it, so typing there keeps extending the
   // code. Give it the same U+200B perch the input rules leave (unmd strips
   // it) and step onto it, and typing carries on in plain text.
-  function onArrowOut(e: KeyboardEvent) {
+  function onArrowPastCode(e: KeyboardEvent) {
     if (!editing() || e.key !== 'ArrowRight'
         || e.shiftKey || e.metaKey || e.altKey || e.ctrlKey) return;
     const sel = window.getSelection();
@@ -710,7 +710,7 @@ function setupLiveEditing({ preview, bubble, more, moreBtn, changed, mark, link,
   preview.addEventListener('input', rules);
   preview.addEventListener('keydown', onTab);
   preview.addEventListener('keydown', onKey);
-  preview.addEventListener('keydown', onArrowOut);
+  preview.addEventListener('keydown', onArrowPastCode);
   preview.addEventListener('keydown', onArrowOut);
   document.addEventListener('selectionchange', watchPre);
   preview.addEventListener('keydown', onDelete);

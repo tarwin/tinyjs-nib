@@ -656,10 +656,7 @@ function setupActions({
     if (alertLive) { tiny.api.call('actionAnswer', { askId: alertLive, value: true }); alertLive = null; }
   };
   document.getElementById('alertCopy')!.onclick = () => {
-    // NOTE: tiny.clipboard has no writeText (only write({ text })) — this
-    // throws at runtime. Left as it was; the cast only names what it expects.
-    (tiny.clipboard as unknown as { writeText(text: string): unknown })
-      .writeText(document.getElementById('alertBody')!.textContent!);
+    tiny.clipboard.write({ text: document.getElementById('alertBody')!.textContent! });
     toast('Copied');
   };
 

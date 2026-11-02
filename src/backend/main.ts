@@ -4530,7 +4530,7 @@ export function onMenu(id: string, app: TinyApp) {
     } else {
       api.actionRun({ scope, id: key, ctx: {} }, app, {}).then((r) => {
         if (r && r.needsTrust) {
-          app.push('toast', { text: 'Open a document to approve “' + (r as { label?: string }).label + '”' });
+          app.push('toast', { text: 'Open a document to approve “' + r.needsTrust.label + '”' });
         } else if (r && r.error) app.push('toast', { text: r.error });
       });
     }
