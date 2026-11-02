@@ -27,12 +27,19 @@
    archives on the release, uploads one `manifest.json` covering every
    platform, and checks each url answers. Apps look for it at
    `releases/latest/download/manifest.json` (tinyjs.json `update.url`).
-6. Shelf + old installs: `node scripts/shelf.mjs`. Copies the release's
+6. Docs: `sh scripts/publish-docs.sh`. Builds the user guide (`guide/`,
+   VitePress) into the microsite repo (`../tarwin-apps-microsites`, or set
+   `MICROSITE`) at `nib/docs/`, commits and pushes, so
+   apps.tarwin.art/nib/docs/ matches this version; Help ▸ Nib Guide opens
+   it. The microsite must have no uncommitted changes. Update the guide for
+   anything new first — preview with `pnpm docs:dev`.
+7. Shelf + old installs: `node scripts/shelf.mjs`. Copies the release's
    downloads to tinyjsapp-examples' `nib-v<version>` release (Shelf only
    downloads from there), writes Nib's catalog entry, and copies this
    release's `manifest.json` to tinyjsapp-examples' `_builds/nib/manifest.json`
    — the address every Nib up to 0.7.0 checks for updates. Commits and pushes
    there; that repo must have no uncommitted changes.
 
-The microsite (apps.tarwin.art/nib, repo `tarwin-apps-microsites`) reads the
-latest release from the GitHub API, so it needs no change per release.
+The microsite's Nib page (apps.tarwin.art/nib, repo `tarwin-apps-microsites`)
+reads the latest release from the GitHub API, so it needs no change per
+release; only its docs/ folder does (step 6).

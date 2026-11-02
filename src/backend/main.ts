@@ -309,6 +309,7 @@ const FILE_MANAGER = IS_MAC ? 'Finder'
   : tjs.env.OS === 'Windows_NT' ? 'File Explorer' : 'the file manager';
 const FOLDER_MAX = 5;
 
+const GUIDE_URL = 'https://apps.tarwin.art/nib/docs/';
 const HELP_WIN = 'help';  // the Markdown reference window (one, shared)
 const SET_WIN = 'settings';  // Settings — one, shared, and its own window
 let helpOpen = false;
@@ -4454,6 +4455,8 @@ export function onMenu(id: string, app: TinyApp) {
   // the macOS app menu's own About Nib ("about": "menu" in tinyjs.json)
   if (id === 'about') api.openHelp({ at: 'about' }, app);
   if (id === 'help:example') api.openExample(null, app);
+  // the user guide (guide/), published with each release
+  if (id === 'help:guide') app.shell.open(GUIDE_URL);
   if (id.startsWith('appear:')) api.setAppearance({ appearance: id.slice(7) }, app);
   if (id.startsWith('pw:')) api.setPref({ key: 'width', value: id.slice(3) }, app);
   if (id === 'opt:edWidth') api.setPref({ key: 'edWidth', value: !effPrefs(appScopeBare()).edWidth }, app);
@@ -4917,6 +4920,7 @@ function menuSpec(): TinyMenu[] {
     { title: 'Help', items: [
       { id: 'help:markdown', label: 'Introduction to Nib', key: keyOf('help:markdown') },
       { id: 'help:example', label: 'Open Example Document' },
+      { id: 'help:guide', label: 'Nib Guide' },
       { separator: true },
       { id: 'help:about', label: 'About Nib' },
       { id: 'check-updates', label: 'Check for Updates…' },

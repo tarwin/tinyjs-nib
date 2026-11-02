@@ -19,6 +19,9 @@ Strict TypeScript, no runtime dependencies (pnpm brings build tools only).
 - Relative imports carry the `.ts` extension (Node's test runner needs it).
 - `pnpm check` = typecheck (tsc -b) + tests (node --test, snapshots in
   tests/; `pnpm test:update` after a deliberate rendering change).
+- `guide/` is the user guide (VitePress; `pnpm docs:dev`), published to
+  apps.tarwin.art/nib/docs/ by scripts/publish-docs.sh at release time and
+  opened by Help ▸ Nib Guide. Keep it in step with what the app does.
 - `pnpm smoke` opens every kind of window in a real `tinyjs dev` run and
   fails if a page throws. Webview consoles don't reach the terminal, so run
   it after any frontend change.
