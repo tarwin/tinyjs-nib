@@ -24,7 +24,8 @@ Strict TypeScript, no runtime dependencies (pnpm brings build tools only).
   opened by Help ▸ Nib Guide. Keep it in step with what the app does.
   Its screenshots: `sh scripts/screenshots.sh` (macOS; src/backend/tour.ts
   drives the app over the demo project in scripts/tour/demo, your own Nib
-  data set aside meanwhile), then `sh scripts/web-shots.sh`.
+  data set aside meanwhile), then `sh scripts/web-shots.sh` (also refreshes
+  the microsite carousel's copies, in its nib/shots/).
 - `pnpm smoke` opens every kind of window in a real `tinyjs dev` run and
   fails if a page throws. Webview consoles don't reach the terminal, so run
   it after any frontend change.
