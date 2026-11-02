@@ -74,6 +74,7 @@
     background: var(--panel); border: 1px solid var(--accent); border-radius: 10px;
     font-size: 12px;
   }
+  #draftCard[hidden] { display: none; }   /* display:flex beats the UA's [hidden] */
   #draftCard b { font-weight: 600; }
   #draftCard .flex { flex: 1; }
   #draftCard button {
