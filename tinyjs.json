@@ -3,7 +3,7 @@
   "title": "Nib",
   "size": "560x468",
   "id": "art.tarwin.nib",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "minTinyjsVersion": "0.57.0",
   "backend": "src/backend/main.js",
   "update": {
