@@ -3,3 +3,5 @@ dist
 .DS_Store
 # release builds (scripts/release-mac.sh)
 release
+node_modules
+web-dist

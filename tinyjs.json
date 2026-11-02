@@ -5,7 +5,13 @@
   "id": "art.tarwin.nib",
   "version": "0.8.0",
   "minTinyjsVersion": "0.57.0",
-  "backend": "src/backend/main.js",
+  "backend": "src/backend/main.ts",
+  "frontend": {
+    "build": "pnpm run build",
+    "dist": "web-dist",
+    "dev": "pnpm run dev",
+    "devUrl": "http://127.0.0.1:5173"
+  },
   "update": {
     "url": "https://github.com/tarwin/tinyjs-nib/releases/latest/download/manifest.json",
     "auto": "daily"

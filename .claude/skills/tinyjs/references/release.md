@@ -58,6 +58,22 @@ const exe = (await app.paths()).executables + '/my-cli' + (tjs.env.OS === 'Windo
 const p = tjs.spawn([exe, '--version'], { stdout: 'pipe' });
 ```
 
+## Download extras
+
+`extras/` holds files for the person downloading: a README, a licence,
+install notes. They ship BESIDE the app, never inside it: at the root of the
+macOS dmg (so only with `--dmg`, or from `notarize --dmg`), and in the
+Windows/Linux app folder beside the exe (`dist/` and the publish archive).
+A Linux update replaces the folder; a Windows update overwrites by name, so
+an extra you drop or rename stays behind there. The .app and the macOS
+update zip never carry them.
+No list: the top level plus `extras/<os>/`, which replaces a file by name;
+folders ship whole, exec bits are kept. `"extras": [...]` lists paths inside
+it, each landing by its own name; per-OS blocks replace the list. A name the
+build writes there (`launcher.exe`, `<name>.exe`, `resources`, the .app,
+`Applications`) fails the build, case-insensitively. For anything needed
+AFTER install, use the app instead (Credits, a help book, a Help menu item).
+
 ## macOS
 
 ```sh
@@ -84,12 +100,16 @@ tinyjs notarize --dmg   # submit + staple + REBUILD the dmg from the stapled app
 ## Windows
 
 ```sh
-tinyjs publish     # dist/publish/<name>-<ver>-win.zip + manifest fragment
+tinyjs publish     # dist/publish/<name>-<ver>-win.zip (x64) or -win-arm64.zip + manifest fragment
 ```
 
 Portable folder in a zip: `<name>.exe` + `launcher.exe` + `frontend/`. No
-codesigning step — https + the manifest's sha256 is the update trust anchor.
-Built and packaged ON Windows (use `tinyjs.cmd`).
+codesigning step — https + the manifest's sha256 is the update trust anchor
+(or a signed manifest: `update.publicKey`). Built and packaged ON Windows
+(use `tinyjs.cmd`). The build's CPU is the tinyjs install's: publish once
+with an x64 tinyjs and once with an arm64 one, from the same project, and
+both land in one manifest's `"win"` block (x64 also in `win.url`, which
+older installs read). Windows on ARM can run both installs.
 
 ## Linux — the glibc floor rule (learned the hard way)
 

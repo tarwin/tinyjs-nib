@@ -1,4 +1,4 @@
-# The tiny.* / app API — full tour (current as of tinyjs 0.44.0)
+# The tiny.* / app API — full tour (current as of tinyjs 0.70.1)
 
 The `tiny` global is injected into every page automatically (no script tag);
 TypeScript definitions ship in types/tiny.d.ts. Backend handlers receive the
@@ -83,6 +83,11 @@ tiny.win.setChrome({ frame: false, windowControls: false, transparent: false,
 // squareCorners: macOS borderless (square, no titlebar; keep data-tiny-drag).
 // acceptsFirstMouse: the click that focuses an unfocused window also reaches
 //   the page (palettes/toolbars).
+// panel (mac, OPEN-TIME only: tinyjs.json "chrome" / win.open chrome, never
+//   setChrome): non-activating NSPanel — show() gives it the keyboard WITHOUT
+//   activating the app, so with setAllSpaces(true) a palette opens over a
+//   full-screen app instead of switching Spaces. hide() just orders it out.
+//   No app menu bar while it's key; not in Window menu / cmd-` cycling.
 // Startup chrome belongs in tinyjs.json "chrome" / win.open options — applied
 // BEFORE first paint; a late setChrome flashes the default window.
 // Windows: transparent MAIN window must be declared in tinyjs.json, and
@@ -127,6 +132,9 @@ tiny.win.open('settings', { page: 'settings.html', title: 'Settings',
 // parent: stays above THAT window (not other apps, unlike setLevel), hides/
 // minimizes/closes with it; no taskbar entry on Windows; macOS also moves it
 // with the parent. Open-time only.
+// show: false — built, placed (rememberWindows too) and loaded but hidden
+// until tiny.win.show() / app.window(id).show(): fill it, then reveal it.
+// Don't fake this with size '1x1' — a remembered size overrides it.
 // page: an http(s) URL or a file INSIDE the frontend dir — from a page,
 // anything else (../ walks, other absolute paths, file:) is refused;
 // backend app.win.open takes any path.
@@ -176,6 +184,9 @@ tiny.menu.set([
                                              // alone means ⌘⇧
     { id: 'mute', label: 'Mute', checked: true },
     { id: 'no', label: 'Nope', enabled: false },
+    { id: 'hi', label: 'Hi', icon: 'emoji:👋' },    // icon: png path, 'sf:<symbol>'
+                                             // (macOS) or 'emoji:<glyph>'; label
+                                             // only where it can't draw (Linux tray)
     { separator: true },
     { id: 'more', label: 'More', submenu: [{ id: 'a', label: 'Sub' }] },
   ]}]);
@@ -214,6 +225,11 @@ tiny.menu.onContext((id) => ...);       // backend: export onContextMenu
 
 ## Dialogs (native, application-modal, all three OSes)
 
+The backend has the same seven calls on `app.dialog`, with the same
+arguments and results. They work in async `init`/`onTray`/`onMenu` handlers
+and with `"mainWindow": false`, without creating a WebView. Page calls keep
+their `dialog.*` origin gate; backend calls are trusted app code.
+
 ```js
 await tiny.dialog.openFile();     // path | null       openFiles() -> paths[] | null
 await tiny.dialog.pickFolder();   // path | null       saveFile() -> path|null
@@ -227,9 +243,11 @@ await tiny.dialog.openFile({ types: ['md', 'markdown', 'txt'] });
 // saveFile({ name }) pre-fills the file name field (a name, not a path;
 // any folder part is dropped). The extension rule above still applies.
 await tiny.dialog.saveFile({ types: ['docx'], name: 'report' });
-await tiny.dialog.alert(message, detail);
-await tiny.dialog.confirm(message, { detail, ok, cancel });   // true | false
+await tiny.dialog.alert(message, { detail, ok });             // or (message, detail)
+await tiny.dialog.confirm(message, { detail, ok, cancel });   // true | false; or (message, detail)
 await tiny.dialog.prompt(message, { default, ok, cancel });   // string | null
+// Bare window.confirm() etc. are the browser primitives: one argument,
+// origin/app-name headline, OK/Cancel.
 ```
 
 ## Site wrappers: navigation / downloads / popups / find
@@ -247,8 +265,9 @@ await tiny.win.stopFind();
 tiny.api.on('navigate', (e) => {});   // { window, kind, url, error? }
 tiny.api.on('download', (d) => {});   // { id, url, filename, path, state, bytes?, total? }
 tiny.api.on('popup', (p) => {});      // { window, url, action }
-const caps = await tiny.system.capabilities();
-caps.api;                             // { gated, denied: [...] } for THIS origin
+await tiny.capabilities.ready;         // then sync, for THIS origin:
+tiny.capabilities.can('clipboard.read');   // false under "wrapper"
+tiny.capabilities.get('clipboard.read');   // { ok:false, why:'gate', needs:['clip.read'] }
 ```
 
 ```js
@@ -282,6 +301,42 @@ export const api = { save: async (p, app, meta) => meta.origin };
 Per-engine caveats live in platforms.md; they matter if you promise a
 behaviour to a user (e.g. a denied navigation has still made its request on
 Linux).
+
+### Cookies (backend only)
+
+`app.cookies` is the webview's own jar: every window and the wrapped site
+share it, and it includes HttpOnly cookies, which `document.cookie` can't
+see. There's no page-side API, on purpose: a page that could read the jar
+could read every site's session. If a page needs a cookie, hand it over
+from your own `api` handler.
+
+```js
+// BACKEND — keep a site's login, restore it on a later launch, log out
+const [sid] = await app.cookies.get({ url: 'https://app.example.com', name: 'sid' });
+// -> { name, value, domain, path, expires (ms | null = session),
+//      secure, httpOnly, sameSite: 'lax' | 'strict' | 'none' }
+await app.secrets.set('sid', JSON.stringify(sid));      // tokens: secrets, never store
+await app.cookies.set({ url: 'https://app.example.com', ...JSON.parse(await app.secrets.get('sid')) });
+await app.cookies.remove({ url: 'https://app.example.com' });   // -> number removed
+```
+
+- `get({ url?, name?, domain?, path? })`: with `url`, you get what a request
+  to that URL would carry (domain, path and secure all match). Linux needs
+  WebKitGTK 2.42+ for `get()` without a `url`.
+- `set({ url | domain, name, value, path = '/', expires?, secure?,
+  httpOnly?, sameSite = 'lax' })` replaces a cookie with the same
+  name/domain/path. `url` alone makes it host-only; `domain:
+  '.example.com'` covers subdomains. `expires` is a Date or ms; leave it
+  out for a session cookie.
+- `remove(cookieFromGet)` deletes that exact cookie; `remove({ url, name? })`
+  deletes everything `get` would return for it.
+- Names or values with `;` or control characters are refused.
+- **sameSite:** `set()` defaults to `'lax'` everywhere. `get()` reports what
+  the engine enforces, so a cookie the SITE set without SameSite reads as
+  that engine's default: `'none'` on macOS, `'lax'` on Windows, and either on
+  Linux depending on the WebKitGTK version. Don't hard-code a value for
+  site cookies. Passing a `get()` result straight back to `set()` keeps it
+  behaving the same. `'none'` generally needs `secure: true`.
 
 ## Tray
 
@@ -393,13 +448,15 @@ audio.src = tiny.fileURL(path);  // file:// URL for a disk path — ALWAYS this,
 // "readAccess": true | "/path" in tinyjs.json.
 await tiny.app.paths();   // { home, data, cache, logs, temp, downloads,
                           //   desktop, documents, resources, executables } — per-OS correct; backend
-                          //   twin: await app.paths() (same shape)
+                          //   twin: await app.paths() (same shape). data/cache/logs
+                          //   are created before it resolves — write straight into them
 // resources: the project's resources/ folder in dev, its bundled copy in
 // builds, null without one. Backend: (await app.paths()).resources.
 // executables: this OS's sidecars from executables/, flat (.build/executables
 // in dev, a .app's Contents/Helpers in builds), null without any — tjs.spawn
 // (await app.paths()).executables + '/<name>'.
 await tiny.app.shell.open('https://x.com');  // URL or path; resolves true/rejects
+   // from a page the app didn't ship (a wrapped site): http(s)/mailto only
 await tiny.app.shell.reveal(path); await tiny.app.shell.trash(path);
 await tiny.app.thumbnail(path, size?);  // png for ANY path (macOS/Windows:
    // preview or document/folder icon — never fails on type; Linux:
@@ -410,6 +467,9 @@ await tiny.app.thumbnail(path, size?);  // png for ANY path (macOS/Windows:
 
 ```js
 await tiny.store.set('key', anyJsonValue); await tiny.store.get('key');
+// set/delete resolve false (never reject) when the disk write fails; the value
+// stays in memory and the next good save writes it. Retry = set the same
+// value again, NOT redo a read-modify-write (that applies the change twice).
 await tiny.store.delete('key'); await tiny.store.all();
 // per-app data dir; fine for settings. Query-shaped data -> sqlite (BACKEND
 // ONLY: the page has no tjs global / tjs:* imports; expose api functions):
@@ -445,6 +505,16 @@ const caps = await tiny.system.capabilities();
 // 'page' — informational, don't branch); caps.ai reflects the BUILD (needs
 // a launcher compiled against FoundationModels) plus macOS 26 at runtime.
 
+// Per CALL instead (page only): OS + Linux session + the "api" gate at once.
+await tiny.capabilities.ready;              // once; can/get/list are sync
+tiny.capabilities.can('app.badge');         // 'tray.*' = any tray call works
+tiny.capabilities.get('win.setPosition');   // { ok:false, why:'session', feature:'windowPosition' }
+tiny.capabilities.list();                   // every working path, sorted
+tiny.capabilities.onChange(({ added, removed }) => {});  // fires on first answer too
+// why: 'gate' (needs: names to enable) | 'platform' | 'session' | 'unknown' | 'pending'
+// ready resolves within 3s even with no answer (never hangs); a late one fires onChange.
+// Informational — the backend gate still decides. Doesn't cover the app's own api methods.
+
 // requirements — turn "missing system pieces" into an actionable prompt
 await tiny.system.requirements(ids?, { refresh: true });
 // -> [{ id, ok, feature, detail, install: { manager, packages, command } }]
@@ -461,7 +531,8 @@ await tiny.system.locale();  // { language, languages, system, region, timeZone 
 // txiki has no Intl and LANG is wrong/absent. languages = filtered to bundle
 // localizations, system = raw user preference (differ for an English-only
 // app on a French Mac). macOS only; 'locale' page event on change.
-await tiny.system.battery(); await tiny.system.wifi();  // mac (wifi: ssid→Location perm)
+await tiny.system.battery(); await tiny.system.wifi();  // mac (wifi: ssid→'location' perm,
+                                // declared in permissions + request('location'))
 await tiny.system.idleTime();   // seconds since last input (linux: GNOME)
 
 await tiny.theme.get();         // { dark } | null
@@ -471,9 +542,17 @@ tiny.api.on('sleep', fn); tiny.api.on('wake', fn);  // backend: export onSystem
 await tiny.app.power.preventSleep('reason', { display: false });
 await tiny.app.power.allowSleep();   // auto-released on exit/crash
 
-tiny.hotkey.register('boss', 'cmd+shift+k'); tiny.hotkey.on((id) => ...);
+await tiny.hotkey.register('boss', 'cmd+shift+k'); // true once the OS has it;
+// false = invalid combo or another app holds it (reason logged) — check it.
+tiny.hotkey.on((id) => ...);
 tiny.hotkey.unregister('boss');   // system-wide; cmd = Ctrl on win/linux;
-// linux: XGrabKey on X11, GlobalShortcuts portal on Wayland (one approval)
+// linux: XGrabKey on X11, GlobalShortcuts portal on Wayland (one approval;
+// capabilities().globalHotkeys is false without the portal).
+// Combos (hotkeys AND keystroke): modifiers in any order + exactly ONE key,
+// else refused. Same key names on every OS: letters, digits, f1–f24, enter,
+// esc, tab, space, home/end/pageup/pagedown, minus/slash/quote…, or the
+// punctuation itself ('cmd+,'). `delete` = Backspace everywhere;
+// `forwarddelete` = the Delete key. win/super = ⌘ on macOS.
 
 await tiny.app.keystroke('cmd+v');   // native CGEvent -> { ok, trusted };
 await tiny.app.paste();              // = keystroke('cmd+v'); hide() first to
@@ -481,9 +560,19 @@ await tiny.app.paste();              // = keystroke('cmd+v'); hide() first to
                                      // Linux: X11/XWayland only (XTest).
 await tiny.app.frontmostApp();  // { name, bundleId, pid } | null (mac/win)
 
-await tiny.app.screens();  // [{ id, name, x, y, width, height, scale,
-                           //    visible: {...}, primary }] — same coords as
-                           //    win.setPosition
+await tiny.app.screens();  // [{ id, uid, name, x, y, width, height, scale,
+                           //    visible: {...}, primary, internal,
+                           //    pixels: { width, height, visible } }] — same
+                           //    coords as win.setPosition. Persist uid, not id.
+tiny.win.setPosition(x, y, { screen, units: 'px' }); // screen-local; px needs screen
+tiny.win.setSize(w, h, { units: 'px' });             // pixels of the window's screen
+tiny.win.setFullscreen(true, { screen });            // works on Wayland too
+await tiny.app.screenAt(x, y); await tiny.app.screenFor(rect);
+await tiny.app.foregroundScreen();  // focused window of ANY app; null on Wayland
+await tiny.app.matchScreen(saved);  // saved screen -> connected one, or null
+tiny.app.onScreensChanged(fn);      // backend: onSystem('screens')
+// "rememberWindows": true in tinyjs.json restores every window's place per
+// screen layout (main shown once restored) — don't hand-roll it.
 await tiny.app.mousePosition();  // { x, y, window: { x, y, inside }, screen }
 // Linux: X11 only — pure Wayland hides the global pointer (capabilities()
 // says so; "windowPlacement": true forces XWayland, or use mouseTracking):
@@ -530,7 +619,7 @@ await tiny.app.permissions.check('accessibility');   // 'granted'|'denied'|
                                                      // 'undetermined'|'unsupported'
 await tiny.app.permissions.request('accessibility'); // prompts / opens Settings
 // names: accessibility | screen | notifications | microphone | camera |
-//        automation[:<bundle-id>]
+//        location | automation[:<bundle-id>]
 ```
 
 - Off macOS, `granted` usually means "not gated here", not "consent given".
@@ -549,6 +638,10 @@ await tiny.app.permissions.request('accessibility'); // prompts / opens Settings
 - speech-to-text: the page's `webkitSpeechRecognition` (WebKit AND WebView2
   have it) needs BOTH `microphone` and `speechRecognition` usage strings in
   a built app — missing the second = `service-not-allowed` with no prompt.
+- location (macOS; `system.wifi()` ssid/bssid on 14+): declare
+  `"permissions": { "location": "why" }`, then `request('location')` in a
+  BUILT app. Without the string — and always in dev — request resolves
+  `'undetermined'` with no prompt. Windows/Linux: `'unsupported'`.
 - dev-mode: TCC grants attach to the SHARED dev launcher binary — all dev
   apps share them; packaged apps get their own.
 
@@ -571,7 +664,8 @@ tiny.app.onOpenFiles((paths) => ...);  // "fileExtensions": ["md"]; also argv
 tiny.api.on('update-available', ({ current, latest, notes }) => ...);
 // backend: export onUpdateAvailable(info, app)
 const { available, latest } = await tiny.app.update.check();
-await tiny.app.update.install();   // verify sha256 + swap + relaunch
+await tiny.app.update.install();   // verify sha256 + swap + relaunch; rejects
+   // unless check() found a newer build for THIS OS + CPU
 ```
 
 Full packaging/manifests: references/release.md.

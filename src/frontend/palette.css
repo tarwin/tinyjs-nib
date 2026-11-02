@@ -6,7 +6,7 @@
  * and help.html each carried a seven-variable subset of their own. Changing
  * --accent meant finding four places and getting all four right.
  *
- * The media-query copy is gone entirely. `appearance.js` runs in <head>,
+ * The media-query copy is gone entirely. `bootPage()` (boot.ts) runs in <head>,
  * before first paint, and always stamps a concrete data-appearance — so the
  * CSS never has to ask the OS a question the page has already answered. That
  * is what makes ADDING one cheap: a new variant is a new block here plus a

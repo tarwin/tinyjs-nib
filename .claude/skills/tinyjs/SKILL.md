@@ -17,9 +17,9 @@ app's own pages and the origins `"api"` trusts: `tiny.proxyURL`'s
 `tiny-media://` proxy (cross-origin http(s) reads, macOS + Linux;
 `media.proxy`) and mic/camera (`media.microphone` / `media.camera`).
 
-Current release: 0.50.1. App floors: macOS 15+ — a default build opens only
+Current release: 0.70.1. App floors: macOS 15+ — a default build opens only
 on the build Mac's CPU (`build --arch arm64|x86_64` or `--universal` for the
-other); Windows 10/11 (WebView2); Linux glibc 2.35+ (Ubuntu 22.04 / Debian 12
+other); Windows 10/11 (WebView2), x64 or arm64 per the tinyjs install; Linux glibc 2.35+ (Ubuntu 22.04 / Debian 12
 / Mint 21 and up).
 
 ## Read the reference for the job at hand
@@ -32,6 +32,12 @@ other); Windows 10/11 (WebView2); Linux glibc 2.35+ (Ubuntu 22.04 / Debian 12
 | shipping: build/sign/notarize, per-OS packaging, auto-update manifests | references/release.md |
 | porting from Electron (API map, what won't work) | references/electron-migration.md |
 | deciding where code runs, wire/binary payloads, throttling, memory | references/performance.md |
+
+Exact signatures are in the project's `types/tiny.d.ts` (page and `app`)
+and `types/tjs.d.ts` (txiki.js). For detail the references leave out, the
+docs are online as markdown: https://tinyjs.app/llms.txt indexes every
+page (`https://tinyjs.app/docs/<page>.md`), and
+https://tinyjs.app/llms-full.txt is all of them in one file.
 
 ## Commands
 
@@ -57,7 +63,12 @@ tinyjs build        # dist/<name> binary + dist/<Name>.app (codesigned)
 tinyjs publish      # build + dist/publish/<name>-<ver>.zip|tarball + manifest
 tinyjs notarize     # macOS: notarytool submit + staple (--dmg re-makes dmg)
                     # publish/notarize take --arch too — repeat the build's
+tinyjs doctor       # find why tinyjs or the project won't run (read-only;
+                    #   exit 1 on any FAIL) — run it first when things break
 tinyjs update       # update tinyjs itself (--check); also: uninstall, version
+tinyjs update-project  # then, in the project: refresh THIS skill and the
+                    #   types from the installed tinyjs (names every file
+                    #   it changes; overwrites edits to them)
 TINYJS_DEBUG=1 tinyjs dev   # trace every bridge message
 ```
 
@@ -103,7 +114,8 @@ tinyjs.json          { name, title, size, id, version, icon?,
                        inject?: "src/shim.js",        // document-start, every page
                        downloads?: "auto" | "ask" | "deny",
                        popups?: "external" | "window" | "deny",
-                       api?: "wrapper" | { disable?, enable?, origins? },
+                       api?: "wrapper" | "none" | [...allowed] | { disable?, enable?, origins? },
+                                      // false/"" = "none"; { enable } alone = only those
                        macos?/windows?/linux?: { …merged on top per OS }
                                       // macos.helpBook: "My Help" = folder in assets/ }
 assets/              files the OS reads, by name: icon.png (1024×1024 app
@@ -116,6 +128,9 @@ executables/         sidecar binaries → (await app.paths()).executables (flat)
                      this OS's binaries from the top, overridden by name from
                      <os>/ then <os>-arm64|-x86_64/; signed into
                      Contents/Helpers on macOS
+extras/              README, licence… for the person downloading: shipped
+                     BESIDE the app (macOS dmg root, Windows/Linux app
+                     folder), never inside it. Top level + <os>/ overrides
 src/backend/main.js  backend
 src/frontend/        index.html + assets — served as real files (file://),
                      so relative paths just work
@@ -173,7 +188,7 @@ tiny.win.open('settings', { page: 'settings.html', size: '420x300',
 
 Everything else — windows/chrome/state events, menus (in every window),
 dialogs, tray, notifications, clipboard, hotkeys, audio (sampler / filters /
-audioTap / proxyURL), store/secrets, permissions, deep links, auto-update,
+audioTap / proxyURL), store/secrets, cookies, permissions, deep links, auto-update,
 `tiny.macos.*` — is in references/api.md with signatures and gotchas.
 
 ## Cross-platform rules
@@ -185,6 +200,10 @@ audioTap / proxyURL), store/secrets, permissions, deep links, auto-update,
   fire-and-forget ones no-op — but `tiny.macos.*` off macOS REJECTS.
   `caps.sampler` is a string ('native'|'page') — informational, don't
   branch.
+- From a PAGE, prefer `tiny.capabilities.can('app.badge')` (sync after
+  `await tiny.capabilities.ready`): keyed by the tiny.* path, it folds the
+  OS, the Linux session AND the tinyjs.json "api" gate into one boolean;
+  `.get(path)` says why not (`gate` + `needs`, `platform`, `session`).
 - Use `app.paths` / `tiny.app.paths()` — never hardcode `~/Library` or
   `%APPDATA%`; join with '/' (works everywhere).
 - `tiny.system.os()/isMacOS()/isWindows()/isLinux()` are synchronous;

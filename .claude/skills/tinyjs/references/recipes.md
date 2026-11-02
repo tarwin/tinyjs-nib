@@ -118,12 +118,20 @@ the site's own JavaScript holds an RPC channel to a backend with full
 filesystem and process access — strictly worse than what Electron gives you.
 `"api"` is enforced in the backend (the page-side object is attacker-editable
 on a hostile origin, so page-side gating is decoration). Shapes:
-`"api": "wrapper"` (a sane preset), `{ "disable": ["*"], "enable": [...] }`
-(**enable wins over disable**), or per-origin keyholes as above — keyed off
+`"api": "wrapper"` (a sane preset), `"none"` (also what `false`/`""`
+mean), a list of allowed calls, `{ "disable": ["*"], "enable": [...] }`
+(**enable wins over disable**; `{ "enable": [...] }` alone means only
+those), or per-origin keyholes as above — keyed off
 the calling frame's origin as the ENGINE reports it, not as the page claims.
 With `origins` present, an origin matching no key gets nothing, so a redirect
 to an unlisted domain inherits no access. Denied calls reject with a readable
-reason, and `capabilities().api.denied` lets the page hide UI it can't use.
+reason, and `tiny.capabilities.can('notify')` (sync after `await
+tiny.capabilities.ready`) lets the page hide UI it can't use — always
+allowed, even under `"none"`; `get(path).needs` names what to enable.
+Events are gated too: a page the app didn't ship hears tinyjs's own events
+only as their calls allow (`menu.*`, `win.*`… — the `"wrapper"` preset
+keeps menu, tray, window, theme and notification events), and an event
+your backend pushes reaches it only if the rules grant `event.<name>`.
 
 What a wrapped site gets that a local-page app never needed:
 - `alert`/`confirm`/`prompt` → native panels headlined by the page's origin.
@@ -144,7 +152,10 @@ Other notes:
   (`"windows": { "userAgent": … }`), or branch on `(await
   tiny.system.info()).os`. Some SaaS apps feature-detect embedded
   webviews and refuse regardless; nothing to do about that.
-- Cookies/logins persist in the webview's default store per app id.
+- Cookies/logins live in the webview's default store per app id. The
+  backend can read them (HttpOnly included), set them and remove them with
+  `app.cookies` — e.g. keep a site's session in `app.secrets` and restore
+  it on a later launch. See api.md → Cookies.
 - Per-engine caveats worth knowing before you promise a behaviour (a denied
   navigation has already made its request on Linux; an asked POST re-issues
   as a GET on Windows): platforms.md.

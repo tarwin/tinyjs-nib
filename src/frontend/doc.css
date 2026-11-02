@@ -1,5 +1,5 @@
 /* Chrome for a document window: toolbar, outline, editor, splitter, preview,
-   status bar. The PREVIEW's look comes from themes.js (injected as a <style>
+   status bar. The PREVIEW's look comes from themes.ts (injected as a <style>
    tag); everything here is the app around it.
 
    Appearance (View ▸ Appearance) is Light / Dark / System. The page resolves
@@ -31,7 +31,7 @@ body {
   padding: 7px 12px; border-bottom: 1px solid var(--line);
   flex: none;
 }
-/* the bar's buttons carry inline SVG icons (icons.js) — flex keeps an icon,
+/* the bar's buttons carry inline SVG icons (icons.ts) — flex keeps an icon,
    a label and a caret on one centreline whatever the mix */
 #bar button { display: inline-flex; align-items: center; justify-content: center; gap: 4px; }
 #bar button svg.icon { display: block; }
@@ -377,7 +377,7 @@ body:not([data-outline]) #outlineGrip { display: none; }
    stacked read as mud. Closing the bar hands the selection look back. */
 body.finding #ed::selection { background: transparent; }
 
-/* Find's colours run on variables set by doc.js (paintFindColors): the
+/* Find's colours run on variables set by doc.ts (paintFindColors): the
    default derives from the accent, tuned to the theme's darkness; Find ▸
    Find Highlight swaps in the deliberately loud sets. Both panes, one pair. */
 ::highlight(nib-find) { background-color: var(--find-hi, color-mix(in srgb, var(--accent) 34%, transparent)); }
@@ -386,7 +386,7 @@ body.finding #ed::selection { background: transparent; }
 /* View ▸ High Contrast. The chrome and the source colours largely run on
    --dim and --line, so most of it is two overrides; the preview's text is
    forced to full black-or-white against ITS OWN background (the theme may be
-   dark while the app is light), which doc.js works out (--md-hc-fg). */
+   dark while the app is light), which doc.ts works out (--md-hc-fg). */
 body[data-hc] { --dim: var(--fg); --line: color-mix(in srgb, var(--fg) 55%, transparent); }
 body[data-hc] .md { color: var(--md-hc-fg, inherit); }
 body[data-hc] .md a { text-decoration: underline; }
@@ -489,7 +489,7 @@ body[data-edpw] #edBack, body[data-edpw] #ed {
 #ed::selection { background: var(--sel); }
 #ed::placeholder { color: var(--dim); }
 /* ⌥ held, and the pointer is over a link in the backdrop underneath: the
-   textarea borrows a browser's hand for as long as that's true (doc.js
+   textarea borrows a browser's hand for as long as that's true (doc.ts
    hit-tests the .tk-a boxes, since a textarea has nothing to hover) */
 #ed.linkish { cursor: pointer; }
 
@@ -528,12 +528,12 @@ body.alt #preview a { cursor: pointer; text-decoration: underline; text-underlin
 .tk-cbtype { color: var(--tk-cb); font-weight: 700; }
 .tk-cbtitle { color: var(--tk-cb); }
 .tk-key { color: var(--tk-cb); }
-/* json.js: something the parser couldn't place — an unquoted key, a stray
+/* json.ts: something the parser couldn't place — an unquoted key, a stray
    character, an unterminated string. Marked while you type, before any save
    has a chance to refuse. */
 .tk-bad { color: var(--bad); text-decoration: underline wavy; text-underline-offset: 3px; }
 
-/* --pw is Preview ▸ Page Width (themes.js PAGE_WIDTH). The article is centred
+/* --pw is Preview ▸ Page Width (themes.ts PAGE_WIDTH). The article is centred
    inside the pane, which keeps the themed background edge to edge. */
 #preview {
   padding: 26px 34px 40vh; min-height: 100%;
@@ -545,7 +545,7 @@ body.alt #preview a { cursor: pointer; text-decoration: underline; text-underlin
 /* Preview ▸ Page View — the preview as sheets of paper on a desk.
    The article's DOM is untouched (sync, Live editing and restamp never
    notice): it goes transparent, and the paper is #sheets behind it — one
-   absolutely placed card per page, laid out by layoutSheets (doc.js) from
+   absolutely placed card per page, laid out by layoutSheets (doc.ts) from
    where the page breaks fall. So every page has its own corners and its own
    shadow, and a break is simply a gap with desk in it. (It used to be one
    long sheet with a desk-coloured strip painted across it, and the strip's
@@ -623,7 +623,7 @@ body[data-paged] #preview .pgbrk > span { display: none; }
 
 /* -------------------------------------------------------------- editable
    Preview-as-editor (the ✎ Editable toggle, ⌘⇧L). The article itself becomes
-   contenteditable; doc.js serializes it back to Markdown on every idle
+   contenteditable; doc.ts serializes it back to Markdown on every idle
    keystroke, so in Split you can type into either half. */
 
 #preview[contenteditable="true"] { outline: none; caret-color: var(--accent); }
@@ -896,11 +896,11 @@ body:not([data-editable]) #liveNote { display: none; }
 }
 
 /* ------------------------------------------------------------- the bubble
-   Floats over a selection in the editable preview (live.js positions it). */
+   Floats over a selection in the editable preview (live.ts positions it). */
 
 #bubble[hidden] { display: none !important; }
 /* The code-block language picker: a quiet pill on the block's top-right
-   while the caret is inside it (live.js watchPre). Fixed like the bubble —
+   while the caret is inside it (live.ts watchPre). Fixed like the bubble —
    both are positioned from viewport rects. */
 #langPop { position: fixed; z-index: 70; }
 #langPop[hidden] { display: none; }
@@ -956,7 +956,7 @@ body:not([data-editable]) #liveNote { display: none; }
 #imageAlt:focus { background: rgba(127, 127, 127, .45); border-color: var(--accent); }
 #imageAlt::placeholder { color: var(--bg); opacity: .45; }
 /* an image you can act on should look like one */
-/* The islands (doc.js ISLAND): rendered from source the preview can't
+/* The islands (doc.ts ISLAND): rendered from source the preview can't
    rewrite. On hover, a dashed outline and a label saying where they ARE
    edited; a click takes you there. Screen-only — this sheet never reaches
    export or print. A nested island defers to the one around it. */
@@ -990,7 +990,7 @@ body[data-editable] #preview :is(.rawhtml, .mblock, .mm, .toc, .oemb, .footnotes
 
 /* ---------------------------------------------------------------- palette
    Open Quickly (⌘P) floats near the top of the window; the @-picker anchors
-   itself at the caret instead (doc.js moves it), so the two share everything
+   itself at the caret instead (doc.ts moves it), so the two share everything
    but their position. */
 
 #palette[hidden] { display: none !important; }
@@ -1728,7 +1728,7 @@ body[data-editable] #preview :is(.rawhtml, .mblock, .mm, .toc, .oemb, .footnotes
 }
 #bubbleActsMenu button:hover, #bubbleMore button:hover { background: var(--accent); color: var(--on-accent); }
 
-/* Table grips (tables.js): a pill over the hovered column and one beside its
+/* Table grips (tables.ts): a pill over the hovered column and one beside its
    row, each dropping a menu. Fixed, like the bubble — placed from rects. */
 .tgrip[hidden], #tableMenu[hidden] { display: none !important; }
 .tgrip {
@@ -1760,7 +1760,7 @@ body[data-editable] #preview :is(.rawhtml, .mblock, .mm, .toc, .oemb, .footnotes
 #tableMenu .tmsep { height: 1px; margin: 3px 6px; background: var(--line); }
 
 /* the bubble's ⋯: rarer formats, then "Turn into" with a ✓ on what the
-   block already is (live.js openMore) */
+   block already is (live.ts openMore) */
 #bubbleMore button { gap: 12px; padding-left: 22px; position: relative; }
 #bubbleMore button span { flex: 1; }
 #bubbleMore button kbd { font: 11px -apple-system, sans-serif; opacity: .6; }

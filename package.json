@@ -1,0 +1,19 @@
+{
+  "name": "nib",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.1.2",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5173 --strictPort",
+    "build": "vite build",
+    "typecheck": "tsc -b",
+    "test": "node --test 'tests/*.test.ts'",
+    "smoke": "NIB_SMOKE=1 tinyjs dev",
+    "check": "pnpm typecheck && pnpm test"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  }
+}

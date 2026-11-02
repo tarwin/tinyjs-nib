@@ -1,0 +1,13 @@
+{
+  // txiki.js has the web platform's fetch, TextEncoder, timers, crypto and
+  // streams; the DOM lib is how TypeScript knows them (as tinyjs's own TS
+  // template does). There is no document or window here, so don't use them.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "tsBuildInfoFile": "../../node_modules/.tmp/backend.tsbuildinfo",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": []
+  },
+  "include": ["./**/*.ts", "../shared/**/*.ts", "../../types/tiny.d.ts", "../../types/tjs.d.ts"]
+}
