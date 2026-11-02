@@ -12,7 +12,7 @@ Nib checks for updates once a day and tells you when one is ready. **Help ▸ Ch
 
 ## The Welcome window
 
-<!-- shot: the Welcome window with a few recent files and folders -->
+![The Welcome window](/shots/welcome.webp)
 
 When Nib starts you see the Welcome window. It has buttons for **New Document**, **Open…**, **Open Folder…** and **Example**, and lists the files and folders you opened recently. Drop a `.md` file anywhere on it to open it.
 

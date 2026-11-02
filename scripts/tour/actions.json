@@ -1,0 +1,44 @@
+{
+  // The tour's stand-in for your own actions.json (scripts/screenshots.sh)
+  "actions": [
+    {
+      "id": "word-count",
+      "label": "Word count",
+      "icon": "🔢",
+      "description": "How long this page is.",
+      "toolbar": true,
+      "type": "js",
+      "script": "const t = await ctx.read(ctx.file);\nreturn t.split(/\\s+/).filter(Boolean).length + ' words';",
+      "needs": "file",
+      "output": "alert"
+    },
+    {
+      "id": "build-site",
+      "label": "Build the site",
+      "icon": "🏗️",
+      "description": "Runs the docs build in the folder.",
+      "run": ["npm", "run", "docs:build"],
+      "needs": "folder",
+      "output": "panel"
+    },
+    {
+      "id": "pandoc-pdf",
+      "label": "PDF with Pandoc",
+      "icon": "📄",
+      "description": "Writes <name>.pdf beside the document.",
+      "run": ["pandoc", "{file}", "-o", "{stem}.pdf"],
+      "needs": "file",
+      "match": "*.md",
+      "output": "notify"
+    },
+    {
+      "id": "tidy-prose",
+      "label": "Tighten this paragraph",
+      "icon": "✂️",
+      "type": "ai",
+      "prompt": "Make this shorter without losing anything:\n\n{sel}",
+      "needs": "selection",
+      "output": "replace"
+    }
+  ]
+}

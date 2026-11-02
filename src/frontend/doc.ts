@@ -5504,3 +5504,7 @@ updateStatus();
 booted = true;
 if (pendingSheet) { const s = pendingSheet; pendingSheet = null; loadSheet(s); }
 if (kind === 'doc') { if (editing()) preview.focus(); else ed.focus(); }
+
+// The screenshot tour's handle on this page (scripts/screenshots.sh). Only a
+// page served for the tour has it: a release build drops the whole line.
+if (import.meta.env.VITE_NIB_TOUR) (window as unknown as { nibTour: unknown }).nibTour = { menuAct, ed, preview, openOptimizer };

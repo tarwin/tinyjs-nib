@@ -21,7 +21,7 @@ A Markdown table pasted into either pane arrives as a real table, not a paragrap
 
 ## Editing in the preview
 
-<!-- shot: a table in the editable preview with the column grip menu open -->
+![A table in the editable preview, with the column menu open](/shots/tables.webp)
 
 Click into any cell and type.
 

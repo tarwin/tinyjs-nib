@@ -6,7 +6,7 @@ Nib's AI features are [actions](./actions): a prompt with a name, in the ⚡ men
 
 Open **Settings ▸ AI** (or **Actions ▸ AI Settings…**) and tick **Use AI in Nib**.
 
-<!-- shot: Settings ▸ AI with the provider list -->
+![Settings ▸ AI: Use AI in Nib and the provider list](/shots/settings-ai.webp)
 
 ### Providers
 

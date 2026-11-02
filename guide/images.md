@@ -15,7 +15,7 @@ If a file name has spaces or brackets in it, Nib writes the path in angle bracke
 
 **Format ▸ Image & Path Settings…** opens the **Images & Paths** section of [Settings](./settings). It also shows itself once, the first time you paste into a folder. It shows the exact path the next paste will write.
 
-<!-- shot: the Images & Paths settings section with a sample path showing -->
+![Settings ▸ Images & Paths](/shots/settings-images.webp)
 
 ### Where it goes
 
@@ -76,7 +76,7 @@ With **✎ Editable** on, click a picture for a small bar with **replace**, **al
 
 Right-click a picture in the file tree and choose **Optimize Picture…**, or right-click a folder for **Optimize N Pictures Here…**.
 
-<!-- shot: the Optimize Picture bench with the split divider -->
+![Optimize Picture: drag the divider to compare with the original](/shots/optimize.webp)
 
 The preview is the re-encoded picture, split against the original under a divider you can drag. Set the format, quality and maximum width, and the file size shows underneath. Once the first picture looks right, **This + the Rest** runs the same settings over the others without stopping. **Skip** passes one by. A re-encode that comes out bigger is skipped.
 

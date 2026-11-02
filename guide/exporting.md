@@ -37,6 +37,6 @@ The **/** menu in the [editable preview](./editable-preview#slash-menu) has **Pa
 
 **Preview ▸ Page View** shows the preview as sheets of paper on a desk. Each page break starts a new sheet. Set **Preview ▸ Page Width** to **A4** or **US Letter** so the sheet is the size of real paper.
 
-<!-- shot: Page View with A4 width, two sheets and a page break between them -->
+![Page View: a page break starts a new sheet](/shots/page-view.webp)
 
 You can keep editing in Page View, including in the editable preview.

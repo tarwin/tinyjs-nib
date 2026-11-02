@@ -2,7 +2,7 @@
 
 A document window has the Markdown source on the left and the rendered page on the right. The source is the document; the preview shows what it becomes.
 
-<!-- shot: a document window in Split view, outline open on the right -->
+![Split view with the outline open on the right](/shots/editor-and-preview.webp)
 
 ## Three views
 
@@ -59,6 +59,8 @@ The **Preview** menu decides how the page reads. These settings apply to every o
 | **Click Image to Zoom** | A click opens the picture full size; <kbd>esc</kbd> closes it |
 | **Link Tabs** | Tab groups with the same tab title switch together: pick "macOS" once and every group shows its macOS tab |
 | **"---" as Page Break** | Every `---` rule becomes a page break. `***` and `___` stay rules |
+
+![The Night theme, with Nib in dark mode](/shots/dark.webp)
 
 **Preview ▸ Markdown Flavor** decides which extras render. See [Markdown in Nib](./markdown).
 

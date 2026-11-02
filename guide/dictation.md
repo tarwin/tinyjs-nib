@@ -22,6 +22,4 @@ Dictation isn't available on Linux. The web engine Nib uses there has no speech 
 3. Speak. Words that are still being recognized show in a small pill above the document, not in the text.
 4. Click **🎙** again, press the same keys, or press <kbd>esc</kbd> to stop.
 
-<!-- shot: the dictation pill above a document with interim words -->
-
 Nib adds the spacing between words and a capital letter after a full stop, based on the text already before the caret.

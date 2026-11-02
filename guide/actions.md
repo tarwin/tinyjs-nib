@@ -2,7 +2,7 @@
 
 An action is a button that runs something: a build, a deploy, a formatter, the shell one-liner you keep retyping. Actions can also run a small script, or send a prompt to an [AI model](./ai).
 
-<!-- shot: the ⚡ menu open in a document window, with a few actions listed -->
+![The ⚡ menu, with actions that can’t run right now greyed out and the reason beside them](/shots/actions-menu.webp)
 
 ## Running an action
 
@@ -41,7 +41,7 @@ A script action runs inside Nib. One that loops forever freezes the app. Read a 
 
 **Actions ▸ Manage Actions…** (<kbd>⌥</kbd><kbd>⌘</kbd><kbd>A</kbd>) opens the editor: your actions down the left, the selected one's settings on the right. With a folder open, a switch at the top moves between your actions and the folder's.
 
-<!-- shot: the Manage Actions sheet with a command action selected -->
+![Manage Actions with a command action selected](/shots/manage-actions.webp)
 
 Click **+ New Action**, give it a **Name**, and choose what it **Does**:
 

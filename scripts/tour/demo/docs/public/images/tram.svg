@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="450" viewBox="0 0 800 450">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f6c99a"/><stop offset="1" stop-color="#f3e3c4"/></linearGradient>
+  </defs>
+  <rect width="800" height="450" fill="url(#sky)"/>
+  <circle cx="620" cy="110" r="48" fill="#fbe3b8"/>
+  <path d="M0 300 L120 250 L210 270 L330 210 L460 240 L560 190 L680 230 L800 200 L800 450 L0 450Z" fill="#d9a77e"/>
+  <g fill="#e9d2b0" stroke="#b9875e" stroke-width="2">
+    <rect x="40" y="200" width="90" height="120"/><rect x="140" y="180" width="70" height="140"/>
+    <rect x="560" y="170" width="100" height="150"/><rect x="670" y="195" width="90" height="125"/>
+  </g>
+  <g fill="#9b6a45"><rect x="58" y="220" width="14" height="20"/><rect x="92" y="220" width="14" height="20"/><rect x="58" y="260" width="14" height="20"/><rect x="92" y="260" width="14" height="20"/><rect x="580" y="190" width="16" height="22"/><rect x="620" y="190" width="16" height="22"/><rect x="580" y="235" width="16" height="22"/><rect x="620" y="235" width="16" height="22"/></g>
+  <path d="M0 330 L800 300" stroke="#6f5543" stroke-width="3"/>
+  <path d="M0 360 L800 330" stroke="#6f5543" stroke-width="3"/>
+  <g transform="translate(250 220) rotate(-2)">
+    <rect x="0" y="40" width="300" height="110" rx="14" fill="#f2c230"/>
+    <rect x="0" y="118" width="300" height="32" rx="6" fill="#e2e2dc"/>
+    <g fill="#fdf3d0" stroke="#7a5b1c" stroke-width="3"><rect x="20" y="58" width="44" height="44" rx="4"/><rect x="76" y="58" width="44" height="44" rx="4"/><rect x="132" y="58" width="44" height="44" rx="4"/><rect x="188" y="58" width="44" height="44" rx="4"/><rect x="244" y="58" width="40" height="44" rx="4"/></g>
+    <rect x="110" y="18" width="80" height="22" rx="4" fill="#3c3a36"/>
+    <text x="150" y="35" font-family="Helvetica, Arial" font-size="16" font-weight="700" fill="#f2c230" text-anchor="middle">28</text>
+    <line x1="150" y1="18" x2="190" y2="-60" stroke="#3c3a36" stroke-width="4"/>
+    <circle cx="60" cy="158" r="14" fill="#3c3a36"/><circle cx="240" cy="158" r="14" fill="#3c3a36"/>
+  </g>
+</svg>

@@ -34,6 +34,7 @@ import { oembedGet } from './oembed.ts';
 import { readSites, editMenu } from './menus.ts';
 import type { EditResult, MenuOp, Site as MenuSite } from './menus.ts';
 import { smokeOn, smokeApi, runSmoke } from './smoke.ts';
+import { tourDir, runTour } from './tour.ts';
 import {
   LAYER_NAMES, readPath, writePath, clearPath, effective, resolveAll,
 } from './layers.ts';
@@ -5066,4 +5067,5 @@ export async function init(app: TinyApp) {
   warmActionIcons(app);          // never awaited — boot doesn't wait on a CDN
   await refreshMenu(app);
   if (smokeOn) runSmoke(app, api);
+  if (tourDir) runTour(app, { api, openDoc, onMenu });
 }

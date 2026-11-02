@@ -2,7 +2,7 @@
 
 Turn on **✎ Editable** and the rendered page takes a caret. Type into it, select text to format it, tick checkboxes, paste pictures. Every time you pause, Nib writes the page back out as Markdown into the source. The Markdown file is still the document; the preview is a second way in, for anyone who would rather fix a sentence than think about asterisks.
 
-<!-- shot: Split view with Editable on, the format bubble showing over a selection -->
+![The editable preview with the format bubble over a selection](/shots/editable-preview.webp)
 
 ## Turning it on
 

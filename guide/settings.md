@@ -6,7 +6,7 @@ Nothing applies until you click **Save** (<kbd>⌘</kbd><kbd>S</kbd>). **Cancel*
 
 Most settings are also in the menus. The menu and the Settings window always agree, since they change the same thing.
 
-<!-- shot: the Settings window on the Project tab with a "set here" row -->
+![The Project tab: Math is set here, the rest comes from Mine](/shots/settings.webp)
 
 ## Mine and Project {#mine-and-project}
 

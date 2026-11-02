@@ -6,7 +6,7 @@ Linking is most of the work in a folder of documentation, so Nib makes it quick 
 
 Type `@` anywhere in a document, in either pane, and a file picker comes up at the caret. Pick a file and Nib writes a link to it. Pick a picture and it inserts the picture.
 
-<!-- shot: the @ picker open under the caret, with a heading match showing -->
+![The @ picker: typing finds files and headings](/shots/link-picker.webp)
 
 - The link text is the file's real name: its front matter `title:` if it has one, otherwise its first highest-level heading, otherwise its file name.
 - Press <kbd>⇥</kbd> on a file to step into its headings and link a section, such as `[Second steps](notes/a.md#second-steps)`. <kbd>esc</kbd> steps back out.
@@ -54,7 +54,7 @@ When you rename a file in the tree, Nib offers to update the links to it. See [R
 
 Pin a folder and every file search (<kbd>⌘</kbd><kbd>P</kbd>, the `@` picker and Find in Folder) looks only inside it. This keeps a big tree manageable, and it's how Nib handles translated docs: pin `en/` and `fr/`, and each language only finds its own pages.
 
-<!-- shot: the file tree with two pinned folders and the pin/eye switches at the top -->
+![Two pinned folders: guide/ for documents, public/ for pictures](/shots/pins.webp)
 
 To pin a folder, right-click it in the tree and choose to pin it for search. A 📌 badge appears on its row. Click the badge to narrow what the pin covers: everything, then Markdown only, then pictures only. One more click unpins it.
 

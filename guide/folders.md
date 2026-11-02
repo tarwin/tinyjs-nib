@@ -2,7 +2,7 @@
 
 Open a folder and Nib treats it as a project: its files get a tree down the left of the window, every file you open becomes a tab, and searches cover the whole folder.
 
-<!-- shot: a project window with the file tree, two tabs and a document in Split view -->
+![A folder open: the file tree, tabs, and a document in Split view](/shots/folders.webp)
 
 ## Opening a folder
 

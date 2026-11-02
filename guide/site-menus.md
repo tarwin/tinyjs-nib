@@ -2,7 +2,7 @@
 
 A docs site has a menu, the sidebar readers click through, and it's usually written somewhere other than the pages. When the open folder is a docs site, Nib reads that menu and shows it the way the site will draw it. For most site generators you can also edit it there.
 
-<!-- shot: the ☰ Menu panel with the current page marked, a red dead entry and the "Not in any menu" list -->
+![The ☰ Menu panel: the current page marked, a dead entry in red, and “Not in any menu” at the bottom](/shots/site-menu.webp)
 
 ## Opening the menu
 

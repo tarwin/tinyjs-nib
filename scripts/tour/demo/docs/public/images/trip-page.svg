@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="420" viewBox="0 0 800 420">
+  <rect width="800" height="420" rx="16" fill="#f4efe6"/>
+  <rect x="24" y="24" width="752" height="372" rx="10" fill="#fffdf8" stroke="#e3dccd"/>
+  <text x="56" y="80" font-family="Georgia, serif" font-size="30" fill="#2f2a24">Three days in Lisbon</text>
+  <text x="56" y="108" font-family="Helvetica, Arial" font-size="14" fill="#8a8072">14 May 2026 · Lisbon, Portugal</text>
+  <rect x="56" y="130" width="420" height="230" rx="6" fill="#e9b98a"/>
+  <path d="M56 300 L160 240 L250 270 L360 200 L476 250 L476 360 L56 360Z" fill="#c98f5f"/>
+  <circle cx="400" cy="175" r="26" fill="#f8deb4"/>
+  <rect x="500" y="130" width="244" height="110" rx="6" fill="#9fb7c4"/>
+  <rect x="500" y="250" width="244" height="110" rx="6" fill="#c7d3b5"/>
+  <circle cx="620" cy="300" r="7" fill="#d2553f"/>
+  <path d="M520 330 Q 580 280 620 300 T 720 280" fill="none" stroke="#6f8a5b" stroke-width="3" stroke-dasharray="6 6"/>
+</svg>

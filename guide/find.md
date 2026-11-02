@@ -4,7 +4,7 @@
 
 **Find ▸ Find…** (<kbd>⌘</kbd><kbd>F</kbd>) opens a bar over the document. It isn't a dialog, so the text stays where it is while you search.
 
-<!-- shot: the find bar with Replace unfolded and a match count -->
+![The find bar with Replace unfolded](/shots/find.webp)
 
 - Every match is highlighted at once, with the current one picked out. The count beside the field says where you are.
 - <kbd>⏎</kbd> and <kbd>⇧</kbd><kbd>⏎</kbd> step forward and back through the matches. <kbd>⌘</kbd><kbd>G</kbd> and <kbd>⇧</kbd><kbd>⌘</kbd><kbd>G</kbd> do the same from anywhere.
@@ -34,7 +34,7 @@ Both go into the document's undo history, so <kbd>⌘</kbd><kbd>Z</kbd> takes ba
 
 **Find ▸ Find in Folder…** (<kbd>⌘</kbd><kbd>⇧</kbd><kbd>F</kbd>), or **In Folder** on the find bar, runs the same search over every text file in the project. It needs a [folder](./folders) open.
 
-<!-- shot: the Find in Folder results panel grouped by file -->
+![Find in Folder: the results, grouped by file](/shots/find-in-folder.webp)
 
 The file tree's panel turns into the results, grouped by file, with a line number and the matching line for each hit. Click a hit to preview it, or double-click to keep the tab. Either way the editor lands on the match. The **✕** at the top goes back to the file tree.
 
